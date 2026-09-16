@@ -60,7 +60,11 @@ require_commands() {
     if ! command -v curl >/dev/null 2>&1 && ! command -v fetch >/dev/null 2>&1; then
         missing="$missing curl-or-fetch"
     fi
-    [ -n "$missing" ] && { err "缺少依赖命令:$missing"; return 1; }
+    if [ -n "$missing" ]; then
+        err "缺少依赖命令:$missing"
+        return 1
+    fi
+    return 0
 }
 
 check_platform() {
@@ -75,7 +79,7 @@ fetch_text() {
     if command -v curl >/dev/null 2>&1; then
         curl -fsSL --connect-timeout 15 --max-time 60 "$url"
     else
-        fetch -qo - "$url"
+        fetch -T 15 -qo - "$url"
     fi
 }
 
@@ -85,7 +89,7 @@ download_file() {
     if command -v curl >/dev/null 2>&1; then
         curl -fL --connect-timeout 15 --max-time 900 "$url" -o "$target"
     else
-        fetch -o "$target" "$url"
+        fetch -T 15 -o "$target" "$url"
     fi
 }
 
@@ -515,6 +519,7 @@ install_service() {
     [ ! -e "$BIN_PATH" ] && [ ! -e "$CONFIG_PATH" ] || {
         err "检测到已有安装目录: $WORK_DIR，请使用管理菜单或先备份"; return 1;
     }
+    say '[信息] 正在查询 Volto 最新 Release，请稍候...'
     version=$(latest_version) || { err '获取 Volto 最新 Release 失败'; return 1; }
     [ -n "$version" ] || { err '无法解析 Volto Release 版本'; return 1; }
     build_release "$version" || return 1
@@ -555,6 +560,7 @@ install_service() {
 
 update_service() {
     [ -x "$BIN_PATH" ] || { err '尚未安装 Volto'; return 1; }
+    say '[信息] 正在查询 Volto 最新 Release，请稍候...'
     latest=$(latest_version) || { err '获取最新版本失败'; return 1; }
     current=$(installed_version 2>/dev/null || true)
     [ -n "$latest" ] || return 1
@@ -629,6 +635,7 @@ EOF
 
 main() {
     case "${1:-}" in -h|--help) usage; return 0;; esac
+    say '[信息] Volto Serv00 管理脚本启动中...'
     require_commands || return 1
     check_platform || return 1
     case "${1:-}" in
