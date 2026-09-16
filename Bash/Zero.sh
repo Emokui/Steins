@@ -9520,6 +9520,1014 @@ warpstack_menu() {
     done
 }
 
+# BEGIN ZERO_VOLTO_MODULE
+# 完整内置 Volto 管理器；子进程隔离函数、变量、锁和退出清理。
+volto_emit_manager_script() {
+    cat <<'__ZERO_VOLTO_MANAGER_SCRIPT_V1__'
+#!/usr/bin/env bash
+# Volto.sh — 独立 MASQUE 服务管理，菜单参照 Zero.sh 选项 12。
+# Debian / Ubuntu + systemd，x86_64 / aarch64。仅在 main 中修改系统。
+# 上游：https://github.com/vcarus/volto
+# Surge：https://manual.nssurge.com/policies/masque.html
+# jq 表达式使用自己的变量；保持单引号，禁止 Shell 提前展开。
+# shellcheck disable=SC2016
+
+VOLTO_MANAGER_VERSION="1.0.2"
+VOLTO_DIR="/etc/volto"
+VOLTO_BIN="/usr/local/bin/volto"
+VOLTO_MANAGER="/usr/local/sbin/volto-manager"
+VOLTO_SERVICE="volto.service"
+VOLTO_UNIT="/etc/systemd/system/volto.service"
+VOLTO_BACKUP_ROOT="/var/backups/volto-manager"
+VOLTO_USER="volto"
+VOLTO_API="https://api.github.com/repos/vcarus/volto/releases"
+VOLTO_MARKER="volto-manager-v1"
+VOLTO_WORK=""
+VOLTO_NEW=""
+VOLTO_INSTALLING=0
+VOLTO_VERSION=""
+VOLTO_ASSET=""
+VOLTO_URL=""
+VOLTO_DIGEST=""
+VOLTO_SUMS_URL=""
+RED='' GREEN='' YELLOW='' BLUE='' PLAIN=''
+
+info() { printf '%b%s%b\n' "$BLUE" "$*" "$PLAIN" >&2; }
+ok() { printf '%b%s%b\n' "$GREEN" "$*" "$PLAIN" >&2; }
+warn() { printf '%b%s%b\n' "$YELLOW" "$*" "$PLAIN" >&2; }
+error() { printf '%b%s%b\n' "$RED" "$*" "$PLAIN" >&2; return 1; }
+# 菜单沿用 Zero.sh：蓝色标题/提示、绿色编号、默认色正文。
+menu_title() { printf '%b%s%b\n' "$BLUE" "$1" "$PLAIN"; }
+menu_items() {
+    local item
+    for item in "$@"; do
+        printf '%b  %s.%b%s\n' "$GREEN" "${item%%.*}" "$PLAIN" "${item#*. }"
+    done
+}
+prompt_text() { printf '%b%s%b' "$BLUE" "$1" "$PLAIN"; }
+
+pause_menu() { read -r -p "$(prompt_text '按回车返回...')" _ || return 0; }
+screen() { [[ -t 1 && -n "${TERM:-}" ]] && clear; return 0; }
+ask_yes() { local answer; read -r -p "$(prompt_text "$1 [y/N]: ")" answer || return 1; [[ "$answer" =~ ^[Yy]$ ]]; }
+
+usage() {
+    printf '%s\n' \
+        "Volto.sh ${VOLTO_MANAGER_VERSION} — volto / Surge 管理脚本" \
+        '使用：sudo bash Volto.sh' \
+        '安装后：sudo volto-manager' \
+        '命令：--status  --show-surge  --check  --renew-cert  --help  --version' \
+        '支持 Debian/Ubuntu、systemd、Linux x86_64/ARM64。' \
+        'Surge iOS 5.22.0+ / Mac 6.9.0+；服务端使用 UDP。'
+}
+
+is_managed() {
+    [[ -f "$VOLTO_DIR/.managed" && ! -L "$VOLTO_DIR" ]] &&
+        [[ "$(<"$VOLTO_DIR/.managed")" == "$VOLTO_MARKER" ]]
+}
+
+managed_revision() {
+    # 链接目标必须是本脚本创建的一层目录，拒绝跳出管理范围。
+    local path="$1" tail
+    [[ "$path" == "$VOLTO_DIR/revisions/"* ]] || return 1
+    tail="${path#"$VOLTO_DIR/revisions/"}"
+    [[ "$tail" =~ ^rev\.[A-Za-z0-9]+$ && -d "$path" && ! -L "$path" ]]
+}
+
+current_revision() {
+    local path
+    is_managed && [[ -L "$VOLTO_DIR/current" ]] || return 1
+    path=$(readlink "$VOLTO_DIR/current") || return 1
+    managed_revision "$path" || return 1
+    printf '%s\n' "$path"
+}
+
+require_install() {
+    current_revision >/dev/null && [[ -x "$VOLTO_BIN" && -f "$VOLTO_UNIT" ]] ||
+        error '未找到本脚本的完整安装，请先安装服务。'
+}
+
+atomic_install() {
+    local source="$1" target="$2" mode="$3" group="${4:-root}" tmp
+    [[ ! -L "$target" ]] || { error "拒绝覆盖符号链接：$target"; return 1; }
+    tmp=$(mktemp "${target}.tmp.XXXXXX") || return 1
+    if install -o root -g "$group" -m "$mode" "$source" "$tmp" && mv -fT "$tmp" "$target"; then
+        return 0
+    fi
+    rm -f -- "$tmp"
+    return 1
+}
+
+atomic_link() {
+    local target="$1" tmp
+    managed_revision "$target" || return 1
+    tmp=$(mktemp "$VOLTO_DIR/.link.XXXXXX") || return 1
+    rm -f -- "$tmp" || return 1
+    if ln -s "$target" "$tmp" && mv -fT "$tmp" "$VOLTO_DIR/current"; then return 0; fi
+    rm -f -- "$tmp"
+    return 1
+}
+
+valid_port() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
+valid_user() { [[ "$1" =~ ^[A-Za-z0-9_.-]{1,32}$ ]]; }
+valid_password() { [[ "$1" =~ ^[A-Za-z0-9]{8,128}$ ]]; }
+
+valid_domain() {
+    local name="$1" label
+    local -a labels
+    [[ ${#name} -le 253 && "$name" == *.* && "$name" != *..* && "$name" != *. ]] || return 1
+    [[ "$name" =~ [A-Za-z] && "$name" =~ ^[A-Za-z0-9.-]+$ ]] || return 1
+    IFS='.' read -r -a labels <<< "$name"
+    for label in "${labels[@]}"; do
+        [[ ${#label} -ge 1 && ${#label} -le 63 && "$label" != -* && "$label" != *- ]] || return 1
+    done
+}
+
+valid_ipv4() {
+    local part
+    local -a parts
+    [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+    IFS='.' read -r -a parts <<< "$1"
+    for part in "${parts[@]}"; do
+        (( 10#$part <= 255 )) || return 1
+        [[ "$part" == 0 || "$part" != 0* ]] || return 1
+    done
+}
+
+valid_ipv6() {
+    local value="$1" rest group count=0 compressed=0 suffix
+    local -a groups
+    [[ "$value" == *:* && "$value" != *:::* && "$value" =~ ^[0-9A-Fa-f:.]+$ ]] || return 1
+    if [[ "$value" == *.* ]]; then
+        suffix="${value##*:}"
+        valid_ipv4 "$suffix" || return 1
+        value="${value%:*}:0:0"
+    fi
+    if [[ "$value" == *::* ]]; then
+        compressed=1; rest="${value#*::}"
+        [[ "$rest" != *::* ]] || return 1
+        [[ "$value" != :* || "$value" == ::* ]] || return 1
+        [[ "$value" != *: || "$value" == *:: ]] || return 1
+    else
+        [[ "$value" != :* && "$value" != *: ]] || return 1
+    fi
+    IFS=':' read -r -a groups <<< "$value"
+    for group in "${groups[@]}"; do
+        [[ -n "$group" ]] || continue
+        [[ "$group" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+        count=$((count + 1))
+    done
+    if (( compressed )); then (( count < 8 )); else (( count == 8 )); fi
+}
+
+valid_endpoint() { valid_ipv4 "$1" || valid_ipv6 "$1" || valid_domain "$1"; }
+
+random_password() {
+    local value
+    value=$(openssl rand -base64 32 | tr -dc 'A-Za-z0-9') || return 1
+    value="${value:0:16}"
+    [[ "$value" =~ ^[A-Za-z0-9]{16}$ ]] || return 1
+    printf '%s' "$value"
+}
+
+prompt_value() {
+    local label="$1" default="$2" validator="$3" value
+    while true; do
+        read -r -p "$(prompt_text "$label${default:+ (默认: $default)}: ")" value || return 1
+        value="${value:-$default}"
+        if "$validator" "$value"; then printf '%s' "$value"; return 0; fi
+        warn '输入格式无效，请重试。'
+    done
+}
+
+prompt_password() {
+    local value
+    while true; do
+        read -r -s -p "$(prompt_text '密码 (8–128 位字母数字，回车随机生成 16 位): ')" value || return 1
+        printf '\n' >&2
+        [[ -n "$value" ]] || value=$(random_password) || return 1
+        if valid_password "$value"; then printf '%s' "$value"; return 0; fi
+        warn '密码仅允许 8–128 位大小写字母和数字。'
+    done
+}
+
+port_free() {
+    local output
+    output=$(ss -H -lun "sport = :$1") || { error '无法检查 UDP 端口。'; return 1; }
+    [[ -z "$output" ]] || { error "UDP $1 已被占用。"; return 1; }
+}
+
+prompt_port() {
+    local old="${1:-}" value
+    while true; do
+        value=$(prompt_value '监听 UDP 端口' "${old:-443}" valid_port) || return 1
+        value=$((10#$value))
+        if [[ "$value" == "$old" ]] || port_free "$value"; then printf '%s' "$value"; return 0; fi
+    done
+}
+
+get_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64) printf 'x86_64' ;;
+        aarch64|arm64) printf 'aarch64' ;;
+        *) error '仅支持 Linux x86_64 和 ARM64。' ;;
+    esac
+}
+
+curl_get() { curl -fsSL --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 180 --retry 2 "$@"; }
+
+prepare_release() {
+    local channel="$1" release arch tag
+    arch=$(get_arch) || return 1
+    case "$channel" in
+        release) release=$(curl_get "$VOLTO_API/latest") || return 1 ;;
+        beta) release=$(curl_get "$VOLTO_API?per_page=30" | jq -ce '[.[] | select(.draft == false and .prerelease == true)][0] // empty') || {
+            error '未找到已发布的测试版，或 GitHub 请求失败。'; return 1;
+        } ;;
+        *) return 1 ;;
+    esac
+    tag=$(jq -er '.tag_name | select(type == "string")' <<< "$release") || return 1
+    [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { error '上游版本号格式异常。'; return 1; }
+    VOLTO_VERSION="${tag#v}"
+    VOLTO_ASSET="volto-${VOLTO_VERSION}-${arch}-unknown-linux-musl.tar.gz"
+    VOLTO_URL=$(jq -er --arg name "$VOLTO_ASSET" '[.assets[] | select(.name == $name)] | select(length == 1) | .[0].browser_download_url' <<< "$release") || {
+        error "未找到架构对应的发布包：$VOLTO_ASSET"; return 1;
+    }
+    VOLTO_DIGEST=$(jq -r --arg name "$VOLTO_ASSET" '.assets[] | select(.name == $name) | .digest // ""' <<< "$release") || return 1
+    VOLTO_DIGEST="${VOLTO_DIGEST#sha256:}"
+    VOLTO_SUMS_URL=$(jq -er '[.assets[] | select(.name == "SHA256SUMS")] | select(length == 1) | .[0].browser_download_url' <<< "$release") || return 1
+    [[ "$VOLTO_URL" == "https://github.com/vcarus/volto/releases/download/$tag/$VOLTO_ASSET" &&
+       "$VOLTO_SUMS_URL" == "https://github.com/vcarus/volto/releases/download/$tag/SHA256SUMS" ]] || {
+        error '上游下载地址异常。'; return 1;
+    }
+}
+
+download_release() {
+    local stage="$VOLTO_WORK/release" expected actual member kind version
+    mkdir -p "$stage" || return 1
+    info "正在下载 volto $VOLTO_VERSION ($VOLTO_ASSET)..."
+    curl_get "$VOLTO_URL" -o "$stage/archive.tar.gz" &&
+        curl_get "$VOLTO_SUMS_URL" -o "$stage/SHA256SUMS" || return 1
+    expected=$(awk -v name="$VOLTO_ASSET" '$2 == name || $2 == "*" name {n++; digest=$1} END {if(n==1) print tolower(digest); else exit 1}' "$stage/SHA256SUMS") || return 1
+    [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || { error 'SHA256SUMS 中没有有效的 SHA-256。'; return 1; }
+    actual=$(sha256sum "$stage/archive.tar.gz" | awk '{print $1}') || return 1
+    [[ "$actual" == "$expected" ]] || { error '发布包 SHA-256 校验失败。'; return 1; }
+    if [[ -n "$VOLTO_DIGEST" && "$VOLTO_DIGEST" != "$actual" ]]; then
+        error '发布包与 GitHub 提供的摘要不一致。'; return 1
+    fi
+    # 仅提取精确命名的普通文件；不执行压缩包内的安装脚本。
+    member="${VOLTO_ASSET%.tar.gz}/volto"
+    kind=$(tar -tvzf "$stage/archive.tar.gz" -- "$member") || return 1
+    [[ "$kind" == -* && "$kind" != *$'\n'* ]] || { error '发布包中的 volto 不是唯一普通文件。'; return 1; }
+    tar -xOzf "$stage/archive.tar.gz" -- "$member" > "$stage/volto" && chmod 700 "$stage/volto" || return 1
+    version=$(binary_version "$stage/volto") || return 1
+    [[ "$version" == "$VOLTO_VERSION" ]] || { error '下载的内核版本与 Release 不匹配。'; return 1; }
+    ok "发布包校验通过：$version"
+}
+
+binary_version() {
+    local output
+    output=$("$1" --version) || return 1
+    [[ "$output" =~ ^volto[[:space:]]([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)$ ]] || return 1
+    printf '%s' "${BASH_REMATCH[1]}"
+}
+
+version_newer() {
+    local next="${1#v}" current="${2#v}" prerelease='~'
+    next="${next/-/$prerelease}"; current="${current/-/$prerelease}"
+    dpkg --compare-versions "$next" gt "$current"
+}
+
+refresh_manager() {
+    local source="${BASH_SOURCE[0]}" installed
+    require_install >/dev/null 2>&1 || return 0
+    [[ "$source" != "$VOLTO_MANAGER" ]] || return 0
+    if [[ -e "$VOLTO_MANAGER" ]]; then
+        installed=$("$VOLTO_MANAGER" --version) || return 1
+        [[ "$installed" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            error '无法识别已安装的管理脚本版本。'; return 1;
+        }
+        version_newer "$VOLTO_MANAGER_VERSION" "$installed" || return 0
+    fi
+    atomic_install "$source" "$VOLTO_MANAGER" 755 || return 1
+    ok "volto-manager 已同步到 ${VOLTO_MANAGER_VERSION}。"
+}
+
+choose_channel() {
+    local option
+    menu_items '1. 正式版' '2. 测试版 (仅已发布的 Release)' >&2
+    read -r -p "$(prompt_text '选择版本 [默认 1]: ')" option || return 1
+    case "${option:-1}" in 1) printf 'release';; 2) printf 'beta';; *) return 1;; esac
+}
+
+json_edit() {
+    local file="$1" tmp
+    shift
+    tmp=$(mktemp "$VOLTO_WORK/json.XXXXXX") || return 1
+    if jq "$@" "$file" > "$tmp" && install -m 600 "$tmp" "$file"; then
+        rm -f -- "$tmp"; return 0
+    fi
+    rm -f -- "$tmp"; return 1
+}
+
+validate_settings() {
+    local file="$1" endpoint sni
+    jq -e '
+        .schema == 1 and (.port | type == "number" and floor == . and . >= 1 and . <= 65535) and
+        (.listen_address == "0.0.0.0" or .listen_address == "[::]") and
+        (.verify_mode == "pin" or .verify_mode == "ca") and
+        (.certificate_mode == "selfsigned" or .certificate_mode == "import") and
+        (.certificate_mode != "selfsigned" or .verify_mode == "pin") and
+        (.sni | type == "string") and (.endpoint | type == "string") and
+        (.cert_source | type == "string") and (.key_source | type == "string") and
+        (.congestion_control == "bbr" or .congestion_control == "cubic" or .congestion_control == "newreno") and
+        (.ip_family_preference == "ipv4" or .ip_family_preference == "ipv6" or .ip_family_preference == "system") and
+        (.max_connections | type == "number" and floor == . and . >= 1 and . <= 256) and
+        (.users | type == "array" and length >= 1 and length <= 100) and
+        all(.users[]; (.username | type == "string" and test("\\A[A-Za-z0-9_.-]{1,32}\\z")) and
+                     (.password | type == "string" and test("\\A[A-Za-z0-9]{8,128}\\z"))) and
+        ([.users[].username] | length == (unique | length))
+    ' "$file" >/dev/null || { error '配置参数无效，至少保留一个有效账号。'; return 1; }
+    endpoint=$(jq -r '.endpoint' "$file") && sni=$(jq -r '.sni' "$file") || return 1
+    if ! valid_endpoint "$endpoint" || ! valid_domain "$sni"; then
+        error '公网地址或 SNI 无效。'; return 1
+    fi
+}
+
+check_listener() {
+    if [[ "$(jq -r '.listen_address' "$1/settings.json")" == '[::]' && -f /proc/sys/net/ipv6/bindv6only ]] &&
+        [[ "$(</proc/sys/net/ipv6/bindv6only)" != 0 ]]; then
+        error '当前 bindv6only=1，[::] 无法同时接收 IPv4；请选择 IPv4 监听。'; return 1
+    fi
+    return 0
+}
+
+render_config() {
+    local settings="$1" revision="$2"
+    validate_settings "$settings" || return 1
+    jq -r --arg dir "$revision" '
+        "# 由 Volto.sh 生成，请通过 volto-manager 修改。",
+        "[server]",
+        ("listen = " + ((.listen_address + ":" + (.port|tostring)) | @json)),
+        ("cert = " + (($dir + "/cert.pem") | @json)),
+        ("key = " + (($dir + "/key.pem") | @json)),
+        "alpn = [\"h3\"]", "shutdown_grace = 5", "",
+        "[auth]", "users = [",
+        (.users[] | "  { username = " + (.username|@json) + ", password = " + (.password|@json) + " },"),
+        "]", "", "[limits]",
+        ("congestion_control = " + (.congestion_control|@json)),
+        ("ip_family_preference = " + (.ip_family_preference|@json)),
+        ("max_connections = " + (.max_connections|tostring)),
+        "max_targets_per_conn = 256", "max_streams_bidi = 1024",
+        "initial_mtu = 1200", "mtu_upper_bound = 1452", "mtu_discovery = true",
+        "max_idle_timeout = 60", "keep_alive_interval = 20", "",
+        "[security]", "allow_private_networks = false", "denied_ports = [25]", "",
+        "[log]", "level = \"info\"", "keylog = false"
+    ' "$settings"
+}
+
+new_revision() {
+    local old
+    VOLTO_NEW=$(mktemp -d "$VOLTO_DIR/revisions/rev.XXXXXXXX") || return 1
+    if old=$(current_revision); then
+        cp -- "$old/settings.json" "$old/cert.pem" "$old/key.pem" "$VOLTO_NEW/" || return 1
+    fi
+}
+
+choose_certificate() {
+    local file="$1" option sni cert key selected i
+    local -a files=()
+    menu_items '1. 生成自签名证书 + Surge 指纹固定 (无需域名)' \
+        '2. 使用已有域名证书 + CA 验证' '3. 使用已有证书 + Surge 指纹固定' >&2
+    read -r -p "$(prompt_text '证书方式 [默认 1]: ')" option || return 1
+    option="${option:-1}"
+    case "$option" in 1|2|3) ;; *) error '无效选项。'; return 1;; esac
+    sni=$(prompt_value '证书域名 / SNI' "$([[ "$option" == 1 ]] && printf 'volto.internal')" valid_domain) || return 1
+    if [[ "$option" == 1 ]]; then
+        json_edit "$file" --arg sni "$sni" '.sni=$sni | .certificate_mode="selfsigned" | .verify_mode="pin" | .cert_source="" | .key_source=""'
+        return
+    fi
+    for cert in /etc/cert/*.crt; do [[ -f "$cert" ]] && files+=("$cert"); done
+    for ((i=0; i<${#files[@]}; i++)); do menu_items "$((i+1)). ${files[$i]}" >&2; done
+    menu_items '0. 自定义证书路径' >&2
+    read -r -p "$(prompt_text '选择已有证书 [默认 0]: ')" selected || return 1
+    selected="${selected:-0}"
+    if [[ "$selected" == 0 ]]; then
+        read -r -p "$(prompt_text '完整证书链 PEM 路径: ')" cert || return 1
+        read -r -p "$(prompt_text '私钥 PEM 路径: ')" key || return 1
+    elif [[ "$selected" =~ ^[1-9][0-9]{0,3}$ ]] && (( selected <= ${#files[@]} )); then
+        cert="${files[$((selected-1))]}"; key="${cert%.crt}.key"
+    else error '无效选项。'; return 1
+    fi
+    [[ "$cert" == /* && "$key" == /* && -r "$cert" && -r "$key" ]] || {
+        error '需要存在且可读的绝对路径。'; return 1;
+    }
+    # 来源不能指向会随切换改变的内部证书。
+    [[ "$cert" != "$VOLTO_DIR/"* && "$key" != "$VOLTO_DIR/"* ]] || {
+        error '请选择 /etc/volto 以外的原始证书路径。'; return 1;
+    }
+    json_edit "$file" --arg sni "$sni" --arg cert "$cert" --arg key "$key" \
+        --arg mode "$([[ "$option" == 2 ]] && printf ca || printf pin)" \
+        '.sni=$sni | .certificate_mode="import" | .verify_mode=$mode | .cert_source=$cert | .key_source=$key'
+}
+
+make_certificate() {
+    local revision="$1" file="$1/settings.json" sni cert key mode
+    sni=$(jq -er '.sni' "$file") && mode=$(jq -er '.certificate_mode' "$file") || return 1
+    valid_domain "$sni" || return 1
+    if [[ "$mode" == selfsigned ]]; then
+        openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+            -nodes -days 3650 -subj "/CN=$sni" -addext "subjectAltName=DNS:$sni" \
+            -addext 'basicConstraints=critical,CA:FALSE' -addext 'extendedKeyUsage=serverAuth' \
+            -keyout "$revision/key.pem" -out "$revision/cert.pem" >/dev/null 2>&1 || {
+            error '自签名证书生成失败。'; return 1;
+        }
+    elif [[ "$mode" == import ]]; then
+        cert=$(jq -er '.cert_source' "$file") && key=$(jq -er '.key_source' "$file") || return 1
+        [[ "$cert" == /* && "$key" == /* && -f "$cert" && -f "$key" ]] || return 1
+        cp -- "$cert" "$revision/cert.pem" && cp -- "$key" "$revision/key.pem" || return 1
+    else return 1
+    fi
+    chmod 600 "$revision/cert.pem" "$revision/key.pem"
+}
+
+check_certificate() {
+    local revision="$1" sni mode a b
+    local -a verify_args
+    sni=$(jq -er '.sni' "$revision/settings.json") && mode=$(jq -er '.verify_mode' "$revision/settings.json") || return 1
+    verify_args=(-purpose sslserver -verify_hostname "$sni")
+    case "$mode" in
+        pin) verify_args+=(-trusted "$revision/cert.pem" -partial_chain);;
+        ca) verify_args+=(-untrusted "$revision/cert.pem");;
+        *) error '未知证书验证方式。'; return 1;;
+    esac
+    # verify 同时检查有效期、用途和主机名；x509 -checkhost 的退出码不适合判断匹配。
+    if ! openssl verify "${verify_args[@]}" "$revision/cert.pem" >/dev/null; then
+        error '证书有效期、用途、SNI 或信任链验证失败。'; return 1;
+    fi
+    a=$(openssl x509 -in "$revision/cert.pem" -pubkey -noout | openssl pkey -pubin -outform DER | openssl dgst -sha256) || return 1
+    b=$(openssl pkey -in "$revision/key.pem" -passin pass: -pubout -outform DER | openssl dgst -sha256) || return 1
+    [[ "$a" == "$b" ]] || { error '证书与私钥不匹配。'; return 1; }
+}
+
+fingerprint() {
+    local fp
+    fp=$(openssl x509 -in "$1" -noout -fingerprint -sha256) || return 1
+    fp="${fp#*=}"; fp="${fp//:/}"
+    [[ "$fp" =~ ^[0-9A-Fa-f]{64}$ ]] || return 1
+    printf '%s' "$fp"
+}
+
+surge_config() {
+    local revision="$1" fp=''
+    validate_settings "$revision/settings.json" || return 1
+    if [[ "$(jq -r '.verify_mode' "$revision/settings.json")" == pin ]]; then
+        fp=$(fingerprint "$revision/cert.pem") || return 1
+    fi
+    # Surge 的 host、port 是独立字段；IPv6 host 不能加 URL 风格的方括号。
+    jq -r --arg fp "$fp" '
+        . as $s | "[Proxy]",
+        (.users[] | "Volto-" + .username + " = masque, " +
+        $s.endpoint +
+        ", " + ($s.port|tostring) + ", sni=" + $s.sni +
+        (if $s.verify_mode == "pin" then ", server-cert-fingerprint-sha256=" + $fp
+         else ", server-cert-verify-name=" + $s.sni end) +
+        ", username=" + .username + ", password=" + .password)
+    ' "$revision/settings.json"
+}
+
+seal_revision() {
+    local revision="$1" binary="$2"
+    render_config "$revision/settings.json" "$revision" > "$revision/config.toml" || return 1
+    check_listener "$revision" && check_certificate "$revision" || return 1
+    "$binary" --check-config --config "$revision/config.toml" || return 1
+    surge_config "$revision" > "$revision/surge.conf" || return 1
+    chown root:"$VOLTO_USER" "$revision" "$revision/config.toml" "$revision/cert.pem" "$revision/key.pem" &&
+        chmod 750 "$revision" && chmod 640 "$revision/config.toml" "$revision/cert.pem" "$revision/key.pem" &&
+        chown root:root "$revision/settings.json" "$revision/surge.conf" &&
+        chmod 600 "$revision/settings.json" "$revision/surge.conf"
+}
+
+config_consistent() {
+    local revision="$1"
+    render_config "$revision/settings.json" "$revision" > "$VOLTO_WORK/expected.toml" || return 1
+    cmp -s "$VOLTO_WORK/expected.toml" "$revision/config.toml" || {
+        error '检测到手动修改 config.toml。请先保存改动，并使其与 settings.json 一致后再管理。'; return 1;
+    }
+}
+
+service_healthy() {
+    local revision="$1" port pid sockets i previous_pid='' stable=0
+    port=$(jq -er '.port' "$revision/settings.json") || return 1
+    # 允许启动延迟；必须是同一进程连续四次持有所选 UDP 端口。
+    for ((i=0; i<12; i++)); do
+        sleep 1
+        if systemctl is-active --quiet "$VOLTO_SERVICE" &&
+            pid=$(systemctl show -p MainPID --value "$VOLTO_SERVICE") &&
+            [[ "$pid" =~ ^[1-9][0-9]*$ ]] &&
+            sockets=$(ss -H -lunp "sport = :$port") && [[ "$sockets" == *"pid=$pid,"* ]]; then
+            if [[ "$pid" == "$previous_pid" ]]; then stable=$((stable + 1)); else stable=1; fi
+            previous_pid="$pid"
+            (( stable >= 4 )) && return 0
+        else
+            previous_pid=''; stable=0
+        fi
+    done
+    return 1
+}
+
+service_hint() {
+    warn "请查看：journalctl -u $VOLTO_SERVICE -n 50 --no-pager"
+}
+
+recover_transaction() {
+    local tx="$VOLTO_DIR/.transaction" old active
+    [[ -f "$tx/ready" ]] || return 0
+    is_managed || return 1
+    old=$(<"$tx/old_revision"); active=$(<"$tx/was_active")
+    managed_revision "$old" && [[ "$active" == 0 || "$active" == 1 ]] || return 1
+    warn '正在恢复上一次操作前的内核和配置...'
+    systemctl stop "$VOLTO_SERVICE" || return 1
+    if [[ -f "$tx/volto" ]]; then atomic_install "$tx/volto" "$VOLTO_BIN" 755 || return 1; fi
+    atomic_link "$old" || return 1
+    systemctl reset-failed "$VOLTO_SERVICE" >/dev/null 2>&1 || true
+    if [[ "$active" == 1 ]]; then
+        if ! systemctl start "$VOLTO_SERVICE" || ! service_healthy "$old"; then
+            error "恢复失败，备份保留在 $tx"; service_hint; return 1;
+        fi
+    fi
+    rm -rf -- "$tx" || return 1
+    ok '已恢复之前的版本及服务启停状态。'
+}
+
+apply_revision() {
+    local revision="$1" binary="${2:-$VOLTO_BIN}" old active=0 tx="$VOLTO_DIR/.transaction"
+    old=$(current_revision) || return 1
+    config_consistent "$old" && seal_revision "$revision" "$binary" || return 1
+    [[ ! -e "$tx" ]] || { error "存在未完成的事务：$tx"; return 1; }
+    if [[ "$binary" == "$VOLTO_BIN" ]] && cmp -s "$old/settings.json" "$revision/settings.json" &&
+        cmp -s "$old/cert.pem" "$revision/cert.pem" && cmp -s "$old/key.pem" "$revision/key.pem"; then
+        discard_revision || return 1
+        ok '配置没有变化，无需重启。'; return 0
+    fi
+    systemctl is-active --quiet "$VOLTO_SERVICE" && active=1
+    mkdir -m 700 "$tx" || return 1
+    if ! printf '%s\n' "$old" > "$tx/old_revision" || ! printf '%s\n' "$active" > "$tx/was_active"; then
+        rm -rf -- "$tx"; return 1
+    fi
+    if [[ "$binary" != "$VOLTO_BIN" ]] && ! cp -- "$VOLTO_BIN" "$tx/volto"; then rm -rf -- "$tx"; return 1; fi
+    # ready 之前不动当前安装；EXIT/INT/TERM 或下次执行负责恢复未提交事务。
+    touch "$tx/ready" || { rm -rf -- "$tx"; return 1; }
+    if [[ "$binary" != "$VOLTO_BIN" ]] && ! atomic_install "$binary" "$VOLTO_BIN" 755; then
+        recover_transaction; return 1
+    fi
+    if ! atomic_link "$revision"; then recover_transaction; return 1; fi
+    if (( active )) && ! { systemctl restart "$VOLTO_SERVICE" && service_healthy "$revision"; }; then
+        error '应用后服务未正常监听，回滚本次变更。'
+        recover_transaction; return 1
+    fi
+    # 删除 ready 即为提交点，历史 revision 仍保留。
+    rm -f -- "$tx/ready" || return 1
+    rm -rf -- "$tx" || return 1
+    VOLTO_NEW=''
+    if (( active )); then ok '配置已生效。'; else ok '配置已保存，服务保持停止状态。'; fi
+}
+
+write_unit() {
+    local file="$1"
+    cat > "$file" <<EOF
+[Unit]
+Description=volto MASQUE proxy managed by Volto.sh
+Documentation=https://github.com/vcarus/volto
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$VOLTO_USER
+Group=$VOLTO_USER
+UMask=0077
+ExecStart=$VOLTO_BIN --config $VOLTO_DIR/current/config.toml
+ExecReload=/bin/kill -HUP \$MAINPID
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=45
+LimitNOFILE=131072
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadOnlyPaths=$VOLTO_DIR
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+firewall_hint() {
+    local port="$1"
+    warn "请在系统防火墙和服务商安全组放行 UDP ${port}。"
+    if command -v ufw >/dev/null 2>&1 && ufw status | grep -q '^Status: active'; then
+        info "当前 UFW 已启用，可执行：sudo ufw allow $port/udp"
+    fi
+}
+
+install_service() {
+    local channel port endpoint username password family listen='0.0.0.0' load
+    if [[ -e "$VOLTO_DIR" || -L "$VOLTO_DIR" || -e "$VOLTO_BIN" || -L "$VOLTO_BIN" ||
+          -e "$VOLTO_UNIT" || -L "$VOLTO_UNIT" || -e "$VOLTO_MANAGER" || -L "$VOLTO_MANAGER" ]]; then
+        error '检测到已有 volto 文件，请使用原管理方式或先备份卸载。'; return 1
+    fi
+    load=$(systemctl show -p LoadState --value "$VOLTO_SERVICE") || return 1
+    [[ "$load" == 'not-found' ]] || { error '已存在同名 systemd 服务，已取消安装。'; return 1; }
+    if getent passwd "$VOLTO_USER" >/dev/null || getent group "$VOLTO_USER" >/dev/null; then
+        error '已存在 volto 用户或组，已取消安装以避免共用身份。'; return 1
+    fi
+    channel=$(choose_channel) && prepare_release "$channel" && download_release || return 1
+    port=$(prompt_port) || return 1
+    endpoint=$(prompt_value 'Surge 连接的公网 IP / 域名 (IPv6 不加方括号)' '' valid_endpoint) || return 1
+    menu_items '1. IPv4 监听' '2. IPv4 + IPv6 监听 (需系统开启 IPv6)' >&2
+    read -r -p "$(prompt_text '监听方式 [默认 1]: ')" family || return 1
+    case "${family:-1}" in 1) ;; 2) listen='[::]';; *) return 1;; esac
+    username=$(prompt_value '用户名' 'surge' valid_user) && password=$(prompt_password) || return 1
+    printf '%s' "$password" > "$VOLTO_WORK/password" || return 1
+    jq -n --argjson port "$port" --arg endpoint "$endpoint" --arg listen "$listen" \
+        --arg username "$username" --rawfile password "$VOLTO_WORK/password" \
+        '{schema:1,port:$port,endpoint:$endpoint,listen_address:$listen,
+          sni:"volto.internal",certificate_mode:"selfsigned",verify_mode:"pin",cert_source:"",key_source:"",
+          users:[{username:$username,password:$password}],congestion_control:"bbr",ip_family_preference:"ipv4",max_connections:32}' \
+        > "$VOLTO_WORK/settings.json" || return 1
+    choose_certificate "$VOLTO_WORK/settings.json" || return 1
+    # 交互完成后再创建本脚本管理的系统资源。
+    install -d -m 750 "$VOLTO_DIR" || return 1
+    printf '%s\n' "$VOLTO_MARKER" > "$VOLTO_DIR/.managed" || return 1
+    VOLTO_INSTALLING=1
+    useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$VOLTO_USER" || return 1
+    chown root:"$VOLTO_USER" "$VOLTO_DIR" && install -d -o root -g "$VOLTO_USER" -m 750 "$VOLTO_DIR/revisions" || return 1
+    new_revision && install -m 600 "$VOLTO_WORK/settings.json" "$VOLTO_NEW/settings.json" &&
+        make_certificate "$VOLTO_NEW" && seal_revision "$VOLTO_NEW" "$VOLTO_WORK/release/volto" || return 1
+    write_unit "$VOLTO_WORK/volto.service" &&
+        atomic_install "$VOLTO_WORK/release/volto" "$VOLTO_BIN" 755 &&
+        atomic_install "$VOLTO_WORK/volto.service" "$VOLTO_UNIT" 644 &&
+        atomic_install "${BASH_SOURCE[0]}" "$VOLTO_MANAGER" 755 && atomic_link "$VOLTO_NEW" || return 1
+    if ! systemctl daemon-reload || ! systemctl enable "$VOLTO_SERVICE" ||
+        ! systemctl start "$VOLTO_SERVICE" || ! service_healthy "$VOLTO_NEW"; then
+        error '安装后服务启动失败。'; service_hint; return 1;
+    fi
+    VOLTO_INSTALLING=0; VOLTO_NEW=''
+    ok "volto $VOLTO_VERSION 安装完成。以后执行：sudo volto-manager"
+    firewall_hint "$port"
+    show_surge
+}
+
+cleanup_install() {
+    (( VOLTO_INSTALLING )) || return 0
+    is_managed || return 1
+    warn '撤销未完成的首次安装...'
+    if [[ -f "$VOLTO_UNIT" ]]; then
+        systemctl stop "$VOLTO_SERVICE" && systemctl disable "$VOLTO_SERVICE" || return 1
+    fi
+    rm -f -- "$VOLTO_UNIT" "$VOLTO_BIN" "$VOLTO_MANAGER" || return 1
+    systemctl daemon-reload || return 1
+    if getent passwd "$VOLTO_USER" >/dev/null; then userdel "$VOLTO_USER" || return 1; fi
+    if getent group "$VOLTO_USER" >/dev/null; then groupdel "$VOLTO_USER" || return 1; fi
+    rm -rf -- "$VOLTO_DIR" || return 1
+    VOLTO_INSTALLING=0; VOLTO_NEW=''
+}
+
+show_surge() {
+    local revision
+    require_install && revision=$(current_revision) && config_consistent "$revision" || return 1
+    info '复制下面的节点行到现有 [Proxy]，再将节点名加入你的策略组：'
+    surge_config "$revision" || return 1
+    info "完整片段：$revision/surge.conf (含密码，仅 root 可读)"
+}
+
+show_status() {
+    local revision
+    require_install && revision=$(current_revision) || return 1
+    systemctl --no-pager --full status "$VOLTO_SERVICE" || true
+    printf '\n内核：'; binary_version "$VOLTO_BIN"; printf '\n'
+    jq 'del(.users[].password)' "$revision/settings.json" || return 1
+    openssl x509 -in "$revision/cert.pem" -noout -enddate
+}
+
+check_install() {
+    local revision
+    require_install && revision=$(current_revision) && config_consistent "$revision" &&
+        check_listener "$revision" && check_certificate "$revision" &&
+        "$VOLTO_BIN" --check-config --config "$revision/config.toml" || return 1
+    ok '配置与证书检查通过。'
+}
+
+modify_port() {
+    local old port
+    old=$(current_revision) || return 1
+    port=$(prompt_port "$(jq -r '.port' "$old/settings.json")") || return 1
+    new_revision && json_edit "$VOLTO_NEW/settings.json" --argjson port "$port" '.port=$port' &&
+        apply_revision "$VOLTO_NEW" || return 1
+    firewall_hint "$port"; show_surge
+}
+
+modify_endpoint() {
+    local old endpoint
+    old=$(current_revision) || return 1
+    endpoint=$(prompt_value 'Surge 连接地址' "$(jq -r '.endpoint' "$old/settings.json")" valid_endpoint) || return 1
+    new_revision && json_edit "$VOLTO_NEW/settings.json" --arg value "$endpoint" '.endpoint=$value' &&
+        apply_revision "$VOLTO_NEW" && show_surge
+}
+
+manage_users() {
+    local old file option username password count
+    old=$(current_revision) || return 1
+    file="$old/settings.json"
+    printf '\n当前账号：\n'; jq -r '.users[].username' "$file"
+    menu_items '1. 新增账号' '2. 修改密码' '3. 删除账号' '0. 返回'
+    read -r -p "$(prompt_text '选择: ')" option || return 1
+    [[ "$option" == 0 ]] && return 0
+    case "$option" in 1|2|3) ;; *) return 1;; esac
+    username=$(prompt_value '用户名' '' valid_user) || return 1
+    count=$(jq --arg user "$username" '[.users[] | select(.username==$user)] | length' "$file") || return 1
+    if [[ "$option" == 1 && "$count" != 0 ]]; then error '账号已存在。'; return 1; fi
+    if [[ "$option" != 1 && "$count" != 1 ]]; then error '账号不存在。'; return 1; fi
+    if [[ "$option" == 3 ]]; then
+        [[ "$(jq '.users|length' "$file")" -gt 1 ]] || { error '不能删除最后一个账号。'; return 1; }
+        ask_yes "删除账号 $username?" || return 0
+    else
+        password=$(prompt_password) || return 1
+        printf '%s' "$password" > "$VOLTO_WORK/password" || return 1
+    fi
+    new_revision || return 1
+    case "$option" in
+        1) json_edit "$VOLTO_NEW/settings.json" --arg u "$username" --rawfile p "$VOLTO_WORK/password" '.users += [{username:$u,password:$p}]' || return 1 ;;
+        2) json_edit "$VOLTO_NEW/settings.json" --arg u "$username" --rawfile p "$VOLTO_WORK/password" '(.users[] | select(.username==$u) | .password)=$p' || return 1 ;;
+        3) json_edit "$VOLTO_NEW/settings.json" --arg u "$username" '.users |= map(select(.username!=$u))' || return 1 ;;
+    esac
+    # 运行中的服务重启以撤销旧连接上的凭据，避免 reload 保留旧账号。
+    apply_revision "$VOLTO_NEW" && show_surge
+}
+
+modify_certificate() {
+    new_revision && choose_certificate "$VOLTO_NEW/settings.json" && make_certificate "$VOLTO_NEW" &&
+        apply_revision "$VOLTO_NEW" || return 1
+    warn '证书发生变化，请更新 Surge 中的节点配置。'
+    show_surge
+}
+
+renew_certificate() {
+    local old mode
+    require_install && old=$(current_revision) || return 1
+    mode=$(jq -r '.certificate_mode' "$old/settings.json") || return 1
+    [[ "$mode" == import ]] || { error '当前为自签名证书，请在“更换证书”中重新生成。'; return 1; }
+    new_revision && make_certificate "$VOLTO_NEW" || return 1
+    if cmp -s "$old/cert.pem" "$VOLTO_NEW/cert.pem" && cmp -s "$old/key.pem" "$VOLTO_NEW/key.pem"; then
+        config_consistent "$old" && check_certificate "$old" && discard_revision || return 1
+        ok '来源证书没有变化。'; return 0
+    fi
+    apply_revision "$VOLTO_NEW" || return 1
+    if [[ "$(jq -r '.verify_mode' "$old/settings.json")" == pin ]]; then
+        warn '证书指纹已变化，请执行 volto-manager --show-surge 更新客户端。'
+    fi
+}
+
+modify_transport() {
+    local congestion family max listen option
+    menu_items '1. BBR' '2. Cubic' '3. NewReno'
+    read -r -p "$(prompt_text '拥塞控制 [默认 1]: ')" option || return 1
+    case "${option:-1}" in 1) congestion=bbr;; 2) congestion=cubic;; 3) congestion=newreno;; *) return 1;; esac
+    menu_items '1. 出站优先 IPv4' '2. 出站优先 IPv6' '3. 使用系统顺序'
+    read -r -p "$(prompt_text '出站偏好 [默认 1]: ')" option || return 1
+    case "${option:-1}" in 1) family=ipv4;; 2) family=ipv6;; 3) family=system;; *) return 1;; esac
+    menu_items '1. IPv4 监听' '2. IPv4 + IPv6 监听'
+    read -r -p "$(prompt_text '监听方式 [默认 1]: ')" option || return 1
+    case "${option:-1}" in 1) listen='0.0.0.0';; 2) listen='[::]';; *) return 1;; esac
+    read -r -p "$(prompt_text '最大 QUIC 连接数 [1–256，默认 32]: ')" max || return 1
+    max="${max:-32}"
+    [[ "$max" =~ ^[1-9][0-9]{0,2}$ ]] && (( max <= 256 )) || return 1
+    new_revision && json_edit "$VOLTO_NEW/settings.json" --arg cc "$congestion" --arg family "$family" \
+        --arg listen "$listen" --argjson max "$max" \
+        '.congestion_control=$cc | .ip_family_preference=$family | .listen_address=$listen | .max_connections=$max' &&
+        apply_revision "$VOLTO_NEW"
+}
+
+service_action() {
+    local action="$1" revision
+    require_install && revision=$(current_revision) || return 1
+    if [[ "$action" == stop ]]; then systemctl stop "$VOLTO_SERVICE" && ok '服务已停止。'; return; fi
+    check_install && systemctl "$action" "$VOLTO_SERVICE" && service_healthy "$revision" && ok '服务正常运行。'
+}
+
+update_core() {
+    local channel current
+    require_install && current=$(binary_version "$VOLTO_BIN") && channel=$(choose_channel) && prepare_release "$channel" || return 1
+    info "当前：${current}；上游：$VOLTO_VERSION"
+    if ! version_newer "$VOLTO_VERSION" "$current"; then ok '无需更新，不会自动降级。'; return 0; fi
+    ask_yes "更新到 $VOLTO_VERSION?" || return 0
+    download_release && new_revision && apply_revision "$VOLTO_NEW" "$VOLTO_WORK/release/volto" || return 1
+    ok "内核已更新到 ${VOLTO_VERSION}。"
+}
+
+uninstall_service() {
+    local backup active=0
+    require_install || return 1
+    ask_yes '卸载 volto、配置和管理脚本? 卸载前会保存完整备份' || return 0
+    install -d -m 700 "$VOLTO_BACKUP_ROOT" || return 1
+    backup=$(mktemp -d "$VOLTO_BACKUP_ROOT/uninstall.XXXXXXXX") || return 1
+    if ! cp -a -- "$VOLTO_DIR" "$backup/config" ||
+        ! cp -a -- "$VOLTO_BIN" "$VOLTO_UNIT" "$VOLTO_MANAGER" "$backup/"; then
+        error "备份失败，已取消卸载：$backup"; return 1;
+    fi
+    systemctl is-active --quiet "$VOLTO_SERVICE" && active=1
+    systemctl stop "$VOLTO_SERVICE" || return 1
+    if ! systemctl disable "$VOLTO_SERVICE"; then
+        (( active )) && systemctl start "$VOLTO_SERVICE"
+        error '禁用服务失败，已取消卸载。'; return 1
+    fi
+    if ! rm -f -- "$VOLTO_UNIT" "$VOLTO_BIN" "$VOLTO_MANAGER" ||
+        ! rm -rf -- "$VOLTO_DIR" || ! systemctl daemon-reload; then
+        error "卸载未完成，备份：$backup"; return 1;
+    fi
+    systemctl reset-failed "$VOLTO_SERVICE" >/dev/null 2>&1 || true
+    userdel "$VOLTO_USER" || warn '系统用户未移除，请检查是否有其他进程使用。'
+    if getent group "$VOLTO_USER" >/dev/null; then groupdel "$VOLTO_USER" || true; fi
+    ok "已卸载。配置、证书、内核及管理脚本的备份保留在：$backup"
+    warn '备份含密码和私钥。手动创建的防火墙规则请按需移除。'
+}
+
+discard_revision() {
+    local current=''
+    [[ -n "$VOLTO_NEW" ]] || return 0
+    current=$(current_revision) || true
+    if [[ "$VOLTO_NEW" != "$current" && ! -f "$VOLTO_DIR/.transaction/ready" ]] && managed_revision "$VOLTO_NEW"; then
+        rm -rf -- "$VOLTO_NEW" || return 1
+    fi
+    VOLTO_NEW=''
+}
+
+after_action() {
+    local result="$1"
+    if (( VOLTO_INSTALLING )); then
+        cleanup_install || { error '首次安装未能完全撤销，已停止后续操作，请检查 /etc/volto。'; exit 1; }
+    fi
+    if [[ -f "$VOLTO_DIR/.transaction/ready" ]]; then
+        recover_transaction || { error '自动恢复未成功，停止后续操作并保留备份。'; exit 1; }
+    fi
+    discard_revision
+    (( result == 0 )) || warn '本次操作未完成。'
+    pause_menu
+}
+
+config_menu() {
+    local option
+    while true; do
+        screen
+        menu_title '✦ Volto 配置管理 ✦'
+        menu_items '1. 修改 UDP 端口' '2. 账号管理' \
+            '3. 更换证书 / SNI' '4. 修改 Surge 连接地址' '5. 拥塞控制 / IPv4、IPv6 / 连接数' \
+            '6. 从原路径同步已续期证书' '0. 返回上级'
+        read -r -p "$(prompt_text '✦ Steins Gate ✦ : ')" option || return 0
+        case "$option" in
+            1) modify_port;; 2) manage_users;; 3) modify_certificate;; 4) modify_endpoint;;
+            5) modify_transport;; 6) renew_certificate;; 0) return 0;; *) warn '无效选项。'; continue;;
+        esac
+        after_action "$?"
+    done
+}
+
+service_menu() {
+    local option
+    require_install || return 1
+    while true; do
+        screen
+        menu_title '✦ Volto 服务管理 ✦'
+        menu_items '1. 查看状态 / 配置 (密码隐藏)' '2. 修改配置' \
+            '3. 停止服务' '4. 重启服务' '5. 启动服务' '6. 查看 Surge 节点' \
+            '7. 查看最近日志' '8. 检查配置及证书' '0. 返回主页'
+        read -r -p "$(prompt_text '✦ Steins Gate ✦ : ')" option || return 0
+        case "$option" in
+            1) show_status;; 2) config_menu; continue;; 3) service_action stop;;
+            4) service_action restart;; 5) service_action start;; 6) show_surge;;
+            7) journalctl -u "$VOLTO_SERVICE" -n 80 --no-pager;; 8) check_install;;
+            0) return 0;; *) warn '无效选项。'; continue;;
+        esac
+        after_action "$?"
+    done
+}
+
+main_menu() {
+    local option
+    while true; do
+        screen
+        menu_title "✦ Volto_Ver.${VOLTO_MANAGER_VERSION} ✦"
+        menu_items '1. 安装服务' '2. 管理服务' '3. 更新内核' '4. 删除服务' "${VOLTO_EXIT_TEXT:-0. 退出脚本}"
+        read -r -p "$(prompt_text '✦ Steins Gate ✦ : ')" option || return 0
+        case "$option" in
+            1) install_service;;
+            2) if require_install; then service_menu; continue; fi; false;;
+            3) update_core;;
+            4) uninstall_service;; 0) return 0;; *) warn '无效选项。'; continue;;
+        esac
+        after_action "$?"
+    done
+}
+
+dependencies() {
+    local command package
+    local -a missing=()
+    for command in curl jq openssl tar sha256sum ss flock useradd; do
+        command -v "$command" >/dev/null 2>&1 && continue
+        case "$command" in sha256sum) package=coreutils;; ss) package=iproute2;; flock) package=util-linux;; useradd) package=passwd;; *) package="$command";; esac
+        missing+=("$package")
+    done
+    [[ -s /etc/ssl/certs/ca-certificates.crt ]] || missing+=(ca-certificates)
+    (( ${#missing[@]} )) || return 0
+    info "安装依赖：${missing[*]}"
+    apt-get update && apt-get install -y --no-install-recommends "${missing[@]}"
+}
+
+finish() {
+    local result=$?
+    trap - EXIT INT TERM HUP
+    if (( VOLTO_INSTALLING )); then cleanup_install || result=1; fi
+    if [[ -f "$VOLTO_DIR/.transaction/ready" ]]; then recover_transaction || result=1; fi
+    if (( VOLTO_INSTALLING == 0 )); then discard_revision || result=1; fi
+    if [[ "$VOLTO_WORK" == /tmp/volto-manager.* && -d "$VOLTO_WORK" && ! -L "$VOLTO_WORK" ]]; then
+        rm -rf -- "$VOLTO_WORK"
+    fi
+    exit "$result"
+}
+
+main() {
+    local action="${1:---menu}"
+    case "$action" in
+        --help|-h) usage; return 0;; --version) printf '%s\n' "$VOLTO_MANAGER_VERSION"; return 0;;
+        --menu|--status|--show-surge|--check|--renew-cert) ;; *) usage; return 1;;
+    esac
+    (( $# <= 1 )) || { usage; return 1; }
+    [[ "$(uname -s)" == Linux && "$EUID" -eq 0 ]] || { error '请在 Linux 服务器以 root 或 sudo 运行。'; return 1; }
+    command -v apt-get >/dev/null && command -v systemctl >/dev/null && [[ -d /run/systemd/system ]] || {
+        error '需要 Debian/Ubuntu 和运行中的 systemd。'; return 1;
+    }
+    get_arch >/dev/null || return 1
+    umask 077
+    set -o pipefail
+    export LC_ALL=C.UTF-8
+    if [[ -t 2 ]]; then RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[0;33m'; BLUE=$'\033[0;34m'; PLAIN=$'\033[0m'; fi
+    dependencies || return 1
+    # Linux /run/lock 由 root 管理；文件锁随进程退出释放，不删除锁文件。
+    [[ ! -L /run/lock/volto-manager.lock ]] || return 1
+    exec 9>/run/lock/volto-manager.lock || return 1
+    flock -n 9 || { error '另一个管理操作正在运行，请稍后再试。'; return 1; }
+    VOLTO_WORK=$(mktemp -d /tmp/volto-manager.XXXXXXXX) || return 1
+    trap finish EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+    if is_managed && [[ -d "$VOLTO_DIR/.transaction" ]]; then
+        if [[ -f "$VOLTO_DIR/.transaction/ready" ]]; then recover_transaction || return 1
+        else rm -rf -- "$VOLTO_DIR/.transaction" || return 1
+        fi
+    fi
+    refresh_manager || return 1
+    case "$action" in
+        --menu) main_menu;; --status) show_status;; --show-surge) show_surge;;
+        --check) check_install;; --renew-cert) renew_certificate;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi
+__ZERO_VOLTO_MANAGER_SCRIPT_V1__
+}
+
+configure_volto() {
+    local rc
+    (
+        local volto_stage
+        umask 077
+        volto_stage=$(mktemp -d /tmp/zero-volto.XXXXXXXX) || exit 1
+        trap 'rm -f -- "$volto_stage/Volto.sh"; rmdir -- "$volto_stage"' EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        trap 'exit 129' HUP
+        volto_emit_manager_script > "$volto_stage/Volto.sh" || exit 1
+        VOLTO_EXIT_TEXT='0. 返回主页' bash "$volto_stage/Volto.sh" --menu
+    )
+    rc=$?
+    (( rc == 0 )) || press_any_key_to_continue "Volto 已退出，按任意键返回菜单..."
+    return 0
+}
+# END ZERO_VOLTO_MODULE
+
 reinstall_system_menu() { reinstall_menu; }
 reboot_system()         { echo "系统将在 3 秒后重新启动..."; sleep 3; reboot_vps; }
 configure_mihomo()      { mihomo_menu; }
@@ -10780,6 +11788,7 @@ show_main_menu() {
     echo -e "${GREEN}  13.${PLAIN}配置FireWall"
     echo -e "${GREEN}  14.${PLAIN}配置WireProxy"
     echo -e "${GREEN}  15.${PLAIN}配置WarpStack"
+    echo -e "${GREEN}  16.${PLAIN}配置Volto"
     echo -e "${GREEN}   0.${PLAIN}退出ByeBye"
 }
 
@@ -10800,6 +11809,7 @@ handle_main_menu_choice() {
         13) configure_firewall ;;
         14) configure_wireproxy ;;
         15) configure_warpstack ;;
+        16) configure_volto ;;
         0)
             clear
             echo -e "${BLUE}「命运石之扉の选择,El Psy Kongroo」${PLAIN}"
@@ -10820,7 +11830,7 @@ main_menu() {
 
     while true; do
         show_main_menu
-        choice=$(read_menu_choice "✦ Choice [0-15] ✦ : ")
+        choice=$(read_menu_choice "✦ Choice [0-16] ✦ : ")
         handle_main_menu_choice "$choice" || break
     done
 }
