@@ -11783,12 +11783,12 @@ show_main_menu() {
     echo -e "${GREEN}  08.${PLAIN}配置SSH"
     echo -e "${GREEN}  09.${PLAIN}重启VPS"
     echo -e "${GREEN}  10.${PLAIN}配置ACME"
-    echo -e "${GREEN}  11.${PLAIN}配置Mihomo"
-    echo -e "${GREEN}  12.${PLAIN}配置SingBox"
-    echo -e "${GREEN}  13.${PLAIN}配置FireWall"
-    echo -e "${GREEN}  14.${PLAIN}配置WireProxy"
-    echo -e "${GREEN}  15.${PLAIN}配置WarpStack"
-    echo -e "${GREEN}  16.${PLAIN}配置Volto"
+    echo -e "${GREEN}  11.${PLAIN}配置Volto"
+    echo -e "${GREEN}  12.${PLAIN}配置Mihomo"
+    echo -e "${GREEN}  13.${PLAIN}配置SingBox"
+    echo -e "${GREEN}  14.${PLAIN}配置FireWall"
+    echo -e "${GREEN}  15.${PLAIN}配置WireProxy"
+    echo -e "${GREEN}  16.${PLAIN}配置WarpStack"
     echo -e "${GREEN}   0.${PLAIN}退出ByeBye"
 }
 
@@ -11804,12 +11804,12 @@ handle_main_menu_choice() {
         8)  ssh_config_menu ;;
         9)  reboot_system ;;
         10) acme_menu ;;
-        11) configure_mihomo ;;
-        12) configure_singbox ;;
-        13) configure_firewall ;;
-        14) configure_wireproxy ;;
-        15) configure_warpstack ;;
-        16) configure_volto ;;
+        11) configure_volto ;;
+        12) configure_mihomo ;;
+        13) configure_singbox ;;
+        14) configure_firewall ;;
+        15) configure_wireproxy ;;
+        16) configure_warpstack ;;
         0)
             clear
             echo -e "${BLUE}「命运石之扉の选择,El Psy Kongroo」${PLAIN}"
