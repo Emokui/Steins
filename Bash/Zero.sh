@@ -9532,7 +9532,7 @@ volto_emit_manager_script() {
 # jq 表达式使用自己的变量；保持单引号，禁止 Shell 提前展开。
 # shellcheck disable=SC2016
 
-VOLTO_MANAGER_VERSION="1.0.2"
+VOLTO_MANAGER_VERSION="1.0.5"
 VOLTO_DIR="/etc/volto"
 VOLTO_BIN="/usr/local/bin/volto"
 VOLTO_MANAGER="/usr/local/sbin/volto-manager"
@@ -9736,15 +9736,12 @@ get_arch() {
 curl_get() { curl -fsSL --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 180 --retry 2 "$@"; }
 
 prepare_release() {
-    local channel="$1" release arch tag
+    local release arch tag
     arch=$(get_arch) || return 1
-    case "$channel" in
-        release) release=$(curl_get "$VOLTO_API/latest") || return 1 ;;
-        beta) release=$(curl_get "$VOLTO_API?per_page=30" | jq -ce '[.[] | select(.draft == false and .prerelease == true)][0] // empty') || {
-            error '未找到已发布的测试版，或 GitHub 请求失败。'; return 1;
-        } ;;
-        *) return 1 ;;
-    esac
+    release=$(curl_get "$VOLTO_API/latest") || return 1
+    jq -e '.draft == false and .prerelease == false' <<< "$release" >/dev/null || {
+        error '上游未返回有效的正式版发布信息。'; return 1;
+    }
     tag=$(jq -er '.tag_name | select(type == "string")' <<< "$release") || return 1
     [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { error '上游版本号格式异常。'; return 1; }
     VOLTO_VERSION="${tag#v}"
@@ -9812,13 +9809,6 @@ refresh_manager() {
     ok "volto-manager 已同步到 ${VOLTO_MANAGER_VERSION}。"
 }
 
-choose_channel() {
-    local option
-    menu_items '1. 正式版' '2. 测试版 (仅已发布的 Release)' >&2
-    read -r -p "$(prompt_text '选择版本 [默认 1]: ')" option || return 1
-    case "${option:-1}" in 1) printf 'release';; 2) printf 'beta';; *) return 1;; esac
-}
-
 json_edit() {
     local file="$1" tmp
     shift
@@ -9839,7 +9829,7 @@ validate_settings() {
         (.certificate_mode != "selfsigned" or .verify_mode == "pin") and
         (.sni | type == "string") and (.endpoint | type == "string") and
         (.cert_source | type == "string") and (.key_source | type == "string") and
-        (.congestion_control == "bbr" or .congestion_control == "cubic" or .congestion_control == "newreno") and
+        (.congestion_control == "bbr" or .congestion_control == "bbr-capped" or .congestion_control == "cubic" or .congestion_control == "newreno") and
         (.ip_family_preference == "ipv4" or .ip_family_preference == "ipv6" or .ip_family_preference == "system") and
         (.max_connections | type == "number" and floor == . and . >= 1 and . <= 256) and
         (.users | type == "array" and length >= 1 and length <= 100) and
@@ -10143,7 +10133,7 @@ firewall_hint() {
 }
 
 install_service() {
-    local channel port endpoint username password family listen='0.0.0.0' load
+    local port endpoint username password family congestion listen='0.0.0.0' load
     if [[ -e "$VOLTO_DIR" || -L "$VOLTO_DIR" || -e "$VOLTO_BIN" || -L "$VOLTO_BIN" ||
           -e "$VOLTO_UNIT" || -L "$VOLTO_UNIT" || -e "$VOLTO_MANAGER" || -L "$VOLTO_MANAGER" ]]; then
         error '检测到已有 volto 文件，请使用原管理方式或先备份卸载。'; return 1
@@ -10153,19 +10143,20 @@ install_service() {
     if getent passwd "$VOLTO_USER" >/dev/null || getent group "$VOLTO_USER" >/dev/null; then
         error '已存在 volto 用户或组，已取消安装以避免共用身份。'; return 1
     fi
-    channel=$(choose_channel) && prepare_release "$channel" && download_release || return 1
+    prepare_release && download_release || return 1
     port=$(prompt_port) || return 1
     endpoint=$(prompt_value 'Surge 连接的公网 IP / 域名 (IPv6 不加方括号)' '' valid_endpoint) || return 1
     menu_items '1. IPv4 监听' '2. IPv4 + IPv6 监听 (需系统开启 IPv6)' >&2
     read -r -p "$(prompt_text '监听方式 [默认 1]: ')" family || return 1
     case "${family:-1}" in 1) ;; 2) listen='[::]';; *) return 1;; esac
+    congestion=$(choose_congestion bbr "$VOLTO_WORK/release/volto") || return 1
     username=$(prompt_value '用户名' 'surge' valid_user) && password=$(prompt_password) || return 1
     printf '%s' "$password" > "$VOLTO_WORK/password" || return 1
     jq -n --argjson port "$port" --arg endpoint "$endpoint" --arg listen "$listen" \
-        --arg username "$username" --rawfile password "$VOLTO_WORK/password" \
+        --arg username "$username" --arg cc "$congestion" --rawfile password "$VOLTO_WORK/password" \
         '{schema:1,port:$port,endpoint:$endpoint,listen_address:$listen,
           sni:"volto.internal",certificate_mode:"selfsigned",verify_mode:"pin",cert_source:"",key_source:"",
-          users:[{username:$username,password:$password}],congestion_control:"bbr",ip_family_preference:"ipv4",max_connections:32}' \
+          users:[{username:$username,password:$password}],congestion_control:$cc,ip_family_preference:"ipv4",max_connections:32}' \
         > "$VOLTO_WORK/settings.json" || return 1
     choose_certificate "$VOLTO_WORK/settings.json" || return 1
     # 交互完成后再创建本脚本管理的系统资源。
@@ -10300,19 +10291,46 @@ renew_certificate() {
     fi
 }
 
+choose_congestion() {
+    local current="${1:-bbr}" binary="${2:-$VOLTO_BIN}" option selected version
+    info "当前拥塞控制：${current}（回车保留）"
+    menu_items '1. BBR (默认)' '2. Cubic' '3. NewReno' \
+        '4. BBR-Capped (减少过量发送，需内核 1.1.0+，建议 1.1.1+)' >&2
+    read -r -p "$(prompt_text '拥塞控制 [1–4，回车保留]: ')" option || return 1
+    case "$option" in
+        '') selected="$current";; 1) selected=bbr;; 2) selected=cubic;;
+        3) selected=newreno;; 4) selected=bbr-capped;;
+        *) error '无效选项。'; return 1;;
+    esac
+    if [[ "$selected" == bbr-capped ]]; then
+        version=$(binary_version "$binary") || return 1
+        if version_newer 1.1.0 "$version"; then
+            error "当前内核 $version 不支持 BBR-Capped，请先更新内核至 1.1.0 或更高版本（建议 1.1.1+）。"
+            return 1
+        fi
+        warn 'BBR-Capped 为可选算法；线路延迟持续升高时可能暂时降速，请按实际线路测试。'
+    fi
+    printf '%s' "$selected"
+}
+
 modify_transport() {
-    local congestion family max listen option
-    menu_items '1. BBR' '2. Cubic' '3. NewReno'
-    read -r -p "$(prompt_text '拥塞控制 [默认 1]: ')" option || return 1
-    case "${option:-1}" in 1) congestion=bbr;; 2) congestion=cubic;; 3) congestion=newreno;; *) return 1;; esac
+    local congestion family max listen option old default_family default_listen current_max
+    old=$(current_revision) || return 1
+    congestion=$(jq -er '.congestion_control' "$old/settings.json") || return 1
+    congestion=$(choose_congestion "$congestion") || return 1
+    family=$(jq -er '.ip_family_preference' "$old/settings.json") || return 1
+    case "$family" in ipv4) default_family=1;; ipv6) default_family=2;; system) default_family=3;; *) return 1;; esac
     menu_items '1. 出站优先 IPv4' '2. 出站优先 IPv6' '3. 使用系统顺序'
-    read -r -p "$(prompt_text '出站偏好 [默认 1]: ')" option || return 1
-    case "${option:-1}" in 1) family=ipv4;; 2) family=ipv6;; 3) family=system;; *) return 1;; esac
+    read -r -p "$(prompt_text "出站偏好 [回车保留 $default_family]: ")" option || return 1
+    case "${option:-$default_family}" in 1) family=ipv4;; 2) family=ipv6;; 3) family=system;; *) return 1;; esac
+    listen=$(jq -er '.listen_address' "$old/settings.json") || return 1
+    case "$listen" in '0.0.0.0') default_listen=1;; '[::]') default_listen=2;; *) return 1;; esac
     menu_items '1. IPv4 监听' '2. IPv4 + IPv6 监听'
-    read -r -p "$(prompt_text '监听方式 [默认 1]: ')" option || return 1
-    case "${option:-1}" in 1) listen='0.0.0.0';; 2) listen='[::]';; *) return 1;; esac
-    read -r -p "$(prompt_text '最大 QUIC 连接数 [1–256，默认 32]: ')" max || return 1
-    max="${max:-32}"
+    read -r -p "$(prompt_text "监听方式 [回车保留 $default_listen]: ")" option || return 1
+    case "${option:-$default_listen}" in 1) listen='0.0.0.0';; 2) listen='[::]';; *) return 1;; esac
+    current_max=$(jq -er '.max_connections' "$old/settings.json") || return 1
+    read -r -p "$(prompt_text "最大 QUIC 连接数 [1–256，回车保留 $current_max]: ")" max || return 1
+    max="${max:-$current_max}"
     [[ "$max" =~ ^[1-9][0-9]{0,2}$ ]] && (( max <= 256 )) || return 1
     new_revision && json_edit "$VOLTO_NEW/settings.json" --arg cc "$congestion" --arg family "$family" \
         --arg listen "$listen" --argjson max "$max" \
@@ -10328,11 +10346,11 @@ service_action() {
 }
 
 update_core() {
-    local channel current
-    require_install && current=$(binary_version "$VOLTO_BIN") && channel=$(choose_channel) && prepare_release "$channel" || return 1
-    info "当前：${current}；上游：$VOLTO_VERSION"
+    local current
+    require_install && current=$(binary_version "$VOLTO_BIN") && prepare_release || return 1
+    info "当前：${current}；最新正式版：$VOLTO_VERSION"
     if ! version_newer "$VOLTO_VERSION" "$current"; then ok '无需更新，不会自动降级。'; return 0; fi
-    ask_yes "更新到 $VOLTO_VERSION?" || return 0
+    ask_yes "更新到正式版 $VOLTO_VERSION?" || return 0
     download_release && new_revision && apply_revision "$VOLTO_NEW" "$VOLTO_WORK/release/volto" || return 1
     ok "内核已更新到 ${VOLTO_VERSION}。"
 }
