@@ -9532,7 +9532,7 @@ volto_emit_manager_script() {
 # jq 表达式使用自己的变量；保持单引号，禁止 Shell 提前展开。
 # shellcheck disable=SC2016
 
-VOLTO_MANAGER_VERSION="1.0.5"
+VOLTO_MANAGER_VERSION="1.0.7"
 VOLTO_DIR="/etc/volto"
 VOLTO_BIN="/usr/local/bin/volto"
 VOLTO_MANAGER="/usr/local/sbin/volto-manager"
@@ -9829,7 +9829,9 @@ validate_settings() {
         (.certificate_mode != "selfsigned" or .verify_mode == "pin") and
         (.sni | type == "string") and (.endpoint | type == "string") and
         (.cert_source | type == "string") and (.key_source | type == "string") and
-        (.congestion_control == "bbr" or .congestion_control == "bbr-capped" or .congestion_control == "cubic" or .congestion_control == "newreno") and
+        (.congestion_control == "bbr" or .congestion_control == "bbr-capped" or .congestion_control == "bbr-uncapped" or .congestion_control == "cubic" or .congestion_control == "newreno") and
+        ((has("mtu_upper_bound") | not) or
+         (.mtu_upper_bound | type == "number" and floor == . and . >= 1200 and . <= 1472)) and
         (.ip_family_preference == "ipv4" or .ip_family_preference == "ipv6" or .ip_family_preference == "system") and
         (.max_connections | type == "number" and floor == . and . >= 1 and . <= 256) and
         (.users | type == "array" and length >= 1 and length <= 100) and
@@ -9854,6 +9856,7 @@ check_listener() {
 render_config() {
     local settings="$1" revision="$2"
     validate_settings "$settings" || return 1
+    # 未记录 MTU 字段的旧配置仍使用历史值 1452；新安装显式记录 1436。
     jq -r --arg dir "$revision" '
         "# 由 Volto.sh 生成，请通过 volto-manager 修改。",
         "[server]",
@@ -9868,7 +9871,8 @@ render_config() {
         ("ip_family_preference = " + (.ip_family_preference|@json)),
         ("max_connections = " + (.max_connections|tostring)),
         "max_targets_per_conn = 256", "max_streams_bidi = 1024",
-        "initial_mtu = 1200", "mtu_upper_bound = 1452", "mtu_discovery = true",
+        "initial_mtu = 1200",
+        ("mtu_upper_bound = " + ((.mtu_upper_bound // 1452)|tostring)), "mtu_discovery = true",
         "max_idle_timeout = 60", "keep_alive_interval = 20", "",
         "[security]", "allow_private_networks = false", "denied_ports = [25]", "",
         "[log]", "level = \"info\"", "keylog = false"
@@ -10156,7 +10160,7 @@ install_service() {
         --arg username "$username" --arg cc "$congestion" --rawfile password "$VOLTO_WORK/password" \
         '{schema:1,port:$port,endpoint:$endpoint,listen_address:$listen,
           sni:"volto.internal",certificate_mode:"selfsigned",verify_mode:"pin",cert_source:"",key_source:"",
-          users:[{username:$username,password:$password}],congestion_control:$cc,ip_family_preference:"ipv4",max_connections:32}' \
+          users:[{username:$username,password:$password}],congestion_control:$cc,mtu_upper_bound:1436,ip_family_preference:"ipv4",max_connections:32}' \
         > "$VOLTO_WORK/settings.json" || return 1
     choose_certificate "$VOLTO_WORK/settings.json" || return 1
     # 交互完成后再创建本脚本管理的系统资源。
@@ -10292,18 +10296,33 @@ renew_certificate() {
 }
 
 choose_congestion() {
-    local current="${1:-bbr}" binary="${2:-$VOLTO_BIN}" option selected version
+    local current="${1:-bbr}" binary="${2:-$VOLTO_BIN}" option selected version modern=0
+    version=$(binary_version "$binary") || return 1
+    if ! version_newer 1.2.0 "$version"; then
+        modern=1
+    fi
     info "当前拥塞控制：${current}（回车保留）"
-    menu_items '1. BBR (默认)' '2. Cubic' '3. NewReno' \
-        '4. BBR-Capped (减少过量发送，需内核 1.1.0+，建议 1.1.1+)' >&2
+    if (( modern )); then
+        menu_items '1. BBR (默认，原 BBR-Capped)' '2. Cubic' '3. NewReno' \
+            '4. BBR-Uncapped (原版 BBR，无额外窗口上限)' >&2
+    else
+        menu_items '1. BBR (旧版默认，无额外窗口上限)' '2. Cubic' '3. NewReno' \
+            '4. BBR-Capped (旧内核选项，需 1.1.0+)' >&2
+    fi
     read -r -p "$(prompt_text '拥塞控制 [1–4，回车保留]: ')" option || return 1
     case "$option" in
         '') selected="$current";; 1) selected=bbr;; 2) selected=cubic;;
-        3) selected=newreno;; 4) selected=bbr-capped;;
+        3) selected=newreno;;
+        4) if (( modern )); then selected=bbr-uncapped; else selected=bbr-capped; fi;;
         *) error '无效选项。'; return 1;;
     esac
+    if [[ "$selected" == bbr-uncapped ]] && (( ! modern )); then
+        error 'BBR-Uncapped 需内核 1.2.0+；旧内核的 BBR 即为原版算法。'; return 1
+    fi
     if [[ "$selected" == bbr-capped ]]; then
-        version=$(binary_version "$binary") || return 1
+        if ! version_newer 1.3.0 "$version"; then
+            error '当前内核不再接受 bbr-capped，请手动选择 BBR。'; return 1
+        fi
         if version_newer 1.1.0 "$version"; then
             error "当前内核 $version 不支持 BBR-Capped，请先更新内核至 1.1.0 或更高版本（建议 1.1.1+）。"
             return 1
@@ -10350,6 +10369,9 @@ update_core() {
     require_install && current=$(binary_version "$VOLTO_BIN") && prepare_release || return 1
     info "当前：${current}；最新正式版：$VOLTO_VERSION"
     if ! version_newer "$VOLTO_VERSION" "$current"; then ok '无需更新，不会自动降级。'; return 0; fi
+    if ! version_newer 1.2.0 "$VOLTO_VERSION"; then
+        info '新版 BBR 即原 BBR-Capped；升级保留已有配置，不自动修改 MTU 上限。'
+    fi
     ask_yes "更新到正式版 $VOLTO_VERSION?" || return 0
     download_release && new_revision && apply_revision "$VOLTO_NEW" "$VOLTO_WORK/release/volto" || return 1
     ok "内核已更新到 ${VOLTO_VERSION}。"
