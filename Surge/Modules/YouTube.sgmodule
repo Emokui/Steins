@@ -1,8 +1,8 @@
-#!name=YouTube Enhance
-#!desc=Remove YouTube ads and enable background playback, Picture in Picture, and up to 4x speed.\nOptions can hide unwanted sections, prefer the highest quality, and enable Jump Ahead.\nBased on Maasea's code (Apache-2.0).
+#!name= YouTube Enhance
+#!desc= Remove YouTube Ads
 #!category= Tools
-#!arguments=block_upload:true,block_shorts:false,auto_hd:true,block_games:true,block_vertical_live:false,jump_ahead:true,block_store:true,native_download:false
-#!requirement=SYSTEM = 'iOS'
+#!arguments= block_upload:true,block_shorts:false,auto_hd:true,block_games:true,block_vertical_live:false,jump_ahead:true,block_store:true,native_download:false
+#!requirement= SYSTEM = 'iOS'
 [Script]
 youtube.enhance.ad-break = type=http-request,pattern=^https:\/\/youtubei\.googleapis\.com\/youtubei\/v1\/player\/ad_break(?:\?.*)?$,script-path=https://raw.githubusercontent.com/Emokui/Steins/refs/heads/Gate/Surge/Script/request.js
 youtube.enhance.download = type=http-response,pattern=^https:\/\/youtubei\.googleapis\.com\/youtubei\/v1\/offline\/get_download_action(?:\?.*)?$,requires-body=1,max-size=-1,binary-body-mode=1,script-path=https://raw.githubusercontent.com/Emokui/Steins/refs/heads/Gate/Surge/Script/response.js,argument="{"nativeDownload":{{{native_download}}}}"
