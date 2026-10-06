@@ -1,5 +1,6 @@
 #!name=Spotify
 #!desc=Block Ads
+#!category=Tools
 
 [Header Rewrite]
 http-request ^https:\/\/(spclient\.wg\.spotify\.com|.*-spclient\.spotify\.com(:443)?)\/user-customization-service\/v1\/customize$ header-del if-none-match
