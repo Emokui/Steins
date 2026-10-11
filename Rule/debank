@@ -55,3 +55,21 @@ DOMAIN-SUFFIX,cloudinary.com
 DOMAIN-SUFFIX,datadog.pool.ntp.org
 DOMAIN,d1dwhf283nul1c.cloudfront.net
 DOMAIN,asset-metadata-service-production.s3.amazonaws.com
+# OKX EU
+DOMAIN-SUFFIX,okx.com
+DOMAIN-KEYWORD,okx.com
+DOMAIN,dkapi.geetest.com
+DOMAIN,api.onesignal.com
+DOMAIN,www.gnmobile2.com
+DOMAIN,www.gnmobile1.com
+DOMAIN,static.coinall.ltd
+DOMAIN-SUFFIX,zimperium.com
+DOMAIN,toblog.tobsnssdk.com
+DOMAIN-SUFFIX,cloudfront.net
+DOMAIN,contendvc.cnouyi.pizza
+DOMAIN-SUFFIX,com.eo.dnse4.com
+DOMAIN-SUFFIX,online-metrix.net
+DOMAIN,vod-license-m.bytepluscdn.com
+DOMAIN,videocloud-i18n.byteplusvod.com
+DOMAIN-SUFFIX,eu-central-1.aliyuncs.com
+DOMAIN,securedata.eu1.aws.prod.e6tech.net
