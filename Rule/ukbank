@@ -62,12 +62,14 @@ DOMAIN-SUFFIX,appsflyersdk.com
 DOMAIN,cdn-settings.segment.com
 # Zilch
 DOMAIN,u.expo.dev
+DOMAIN-KEYWORD,zilch
 DOMAIN,apps.rokt.com
 DOMAIN,intercom-help.eu
 DOMAIN,assets.eascdn.net
 DOMAIN,i.cashbacksrv.com
 DOMAIN,api-eu.mixpanel.com
 DOMAIN-SUFFIX,payzilch.com
+DOMIAN,js.verygoodvault.com
 DOMAIN,config2.mparticle.com
 DOMAIN,mmp.prd.meawallet.app
 DOMAIN,events.launchdarkly.com
