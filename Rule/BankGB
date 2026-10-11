@@ -18,6 +18,7 @@ DOMAIN,gspe1-ssl.ls.apple.com
 # Zopa
 DOMAIN-KEYWORD,zopa
 DOMAIN-SUFFIX,zopa.com
+DOMAIN,assets.thisisbud.com
 # Trading212
 DOMAIN,ticketshack.com
 DOMAIN-KEYWORD,trading212
@@ -45,3 +46,20 @@ DOMAIN,consumer.inapp.customer.io
 DOMAIN,ios.us-east2.aws.oscilar.com
 DOMAIN,browser-http-intake.logs.datadoghq.com
 DOMAIN,uphold-reports-production.s3.us-east-1.amazonaws.com
+# Zilch
+DOMAIN,u.expo.dev
+DOMAIN,apps.rokt.com
+DOMAIN,intercom-help.eu
+DOMAIN,assets.eascdn.net
+DOMAIN,i.cashbacksrv.com
+DOMAIN,api-eu.mixpanel.com
+DOMAIN-SUFFIX,payzilch.com
+DOMAIN,config2.mparticle.com
+DOMAIN,events.launchdarkly.com
+DOMAIN-SUFFIX,us2.mparticle.com
+DOMAIN,static.intercomassets.eu
+DOMAIN,7l353r0wt5gp.statuspage.io
+DOMAIN,browser-intake-datadoghq.eu
+DOMAIN,nexus-europe-websocket.intercom.io
+DOMAIN-SUFFIX,mobile-messenger.eu.intercom.io
+DOMAIN,vgs-collect-keeper.apps.verygood.systems
