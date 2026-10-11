@@ -55,6 +55,7 @@ DOMAIN,i.cashbacksrv.com
 DOMAIN,api-eu.mixpanel.com
 DOMAIN-SUFFIX,payzilch.com
 DOMAIN,config2.mparticle.com
+DOMAIN,mmp.prd.meawallet.app
 DOMAIN,events.launchdarkly.com
 DOMAIN-SUFFIX,us2.mparticle.com
 DOMAIN,static.intercomassets.eu
