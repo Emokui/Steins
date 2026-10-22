@@ -213,7 +213,7 @@
                 }
             }
             $done(y);
-        } catch (e) {
+        } catch {
             d?.endsWith("/initplayback") ? $done(g()) : $done();
         }
     }();
