@@ -83,7 +83,7 @@
                 }
             }
             $done();
-        } catch (e) {
+        } catch {
             $done();
         }
         var r, n;
