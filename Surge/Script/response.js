@@ -317,7 +317,7 @@
                     });
                 }(A.overflowMenu), C = !e(I, A.overflowMenu);
                 return C && Ag(A, "overflowMenu", I), C;
-            } catch (g) {
+            } catch {
                 return !1;
             }
         }(E);
@@ -409,7 +409,7 @@
                 return Ag(A, "frameworkUpdates", h.framework), Ag(A, "engagementPanels", [ ...A.engagementPanels, K ]),
                 Ag(C, "overflowMenu", R);
             }(E) || X;
-        } catch (g) {}
+        } catch {}
         const z = new Set([ "richItemContents", "overlays" ]), T = new Set([ "richItemContents", "contents", "sectionListSupportedRenderers", "overlayCollections" ]), $ = new Set([ "videoWithContextRenderer", "videoRendererContent", "itemSectionRenderer", "shelfRenderer", "richSectionContent", "reelShelfRenderer", "renderer", "content", "item" ]);
         return function g(I, E = !1) {
             if (!I || "object" != typeof I || ArrayBuffer.isView(I)) return 0;
@@ -476,7 +476,7 @@
                     const C = g;
                     C.element?.data && (I = tg(C.element.data, 2185, c) || I), C.videoLockup && (I = tg(C.videoLockup, 18, s) || I),
                     g.videoContent?.videoLockup && (I = tg(g, 6, g => Sg(g, [ 188490103 ], g => Q(g, 1, g => K(g, [ 1 ], h, !0) ? void 0 : g))) || I);
-                } catch (g) {}
+                } catch {}
                 return I;
             }(I) || X);
             const n = I[_];
@@ -774,7 +774,7 @@
                             return {};
                         }
                     }(E, 65536);
-                } catch (g) {
+                } catch {
                     return;
                 }
                 const e = Object.create(null);
@@ -819,7 +819,7 @@
                     }
                     if (h || !i(n) || r(e[o], n)) continue;
                     delete e[o], e[o] = n, B = !0;
-                } catch (g) {}
+                } catch {}
                 if (B) {
                     const I = Object.keys(e);
                     for (const g of I.slice(0, Math.max(0, I.length - 16))) delete e[g];
@@ -827,7 +827,7 @@
                         let I = JSON.stringify(e);
                         for (;g.encode(I).length > 65536; ) delete e[Object.keys(e)[0]], I = JSON.stringify(e);
                         $persistentStore.write(I, E);
-                    } catch (g) {}
+                    } catch {}
                 }
             }(function(g, I) {
                 if ("Player" === g) return [ I ];
@@ -840,7 +840,7 @@
             }(o, n)), $done(e(n, a) ? {
                 body: B.toBinary(n)
             } : void 0);
-        } catch (g) {
+        } catch {
             $done();
         }
     }();
