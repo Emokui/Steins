@@ -299,7 +299,7 @@
                     });
                 }(A.overflowMenu), C = !t(I, A.overflowMenu);
                 return C && Cg(A, "overflowMenu", I), C;
-            } catch (g) {
+            } catch {
                 return !1;
             }
         }(E);
@@ -391,7 +391,7 @@
                 return Cg(A, "frameworkUpdates", a.framework), Cg(A, "engagementPanels", [ ...A.engagementPanels, K ]),
                 Cg(C, "overflowMenu", Q);
             }(E) || N;
-        } catch (g) {}
+        } catch {}
         const Z = new Set([ "richItemContents", "overlays" ]), z = new Set([ "richItemContents", "contents", "sectionListSupportedRenderers", "overlayCollections" ]), _ = new Set([ "videoWithContextRenderer", "videoRendererContent", "itemSectionRenderer", "shelfRenderer", "richSectionContent", "reelShelfRenderer", "renderer", "content", "item" ]);
         return function g(I, E = !1) {
             if (!I || "object" != typeof I || ArrayBuffer.isView(I)) return 0;
@@ -458,7 +458,7 @@
                     const C = g;
                     C.element?.data && (I = ng(C.element.data, 2185, w) || I), C.videoLockup && (I = ng(C.videoLockup, 18, G) || I),
                     g.videoContent?.videoLockup && (I = ng(g, 6, g => Sg(g, [ 188490103 ], g => Q(g, 1, g => c(g, [ 1 ], s, !0) ? void 0 : g))) || I);
-                } catch (g) {}
+                } catch {}
                 return I;
             }(I) || N);
             const r = I[$];
@@ -1027,7 +1027,7 @@
                 let E;
                 try {
                     E = e(o, 65536);
-                } catch (g) {
+                } catch {
                     return;
                 }
                 const B = Object.create(null);
@@ -1072,7 +1072,7 @@
                     }
                     if (r || !h(e) || a(B[o], e)) continue;
                     delete B[o], B[o] = e, t = !0;
-                } catch (g) {}
+                } catch {}
                 if (t) {
                     const I = Object.keys(B);
                     for (const g of I.slice(0, Math.max(0, I.length - 16))) delete B[g];
@@ -1080,7 +1080,7 @@
                         let I = JSON.stringify(B);
                         for (;g.encode(I).length > 65536; ) delete B[Object.keys(B)[0]], I = JSON.stringify(B);
                         $persistentStore.write(I, o);
-                    } catch (g) {}
+                    } catch {}
                 }
             }(c.players), $done(c.body === $response.body ? void 0 : {
                 body: c.body
@@ -1096,7 +1096,7 @@
                         $persistentStore.write(JSON.stringify(g), I);
                     }(A));
                 }(A, C);
-            } catch (g) {}
+            } catch {}
             $done({
                 status: 200,
                 headers: {
