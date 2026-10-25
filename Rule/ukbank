@@ -80,3 +80,8 @@ DOMAIN,browser-intake-datadoghq.eu
 DOMAIN,nexus-europe-websocket.intercom.io
 DOMAIN-SUFFIX,mobile-messenger.eu.intercom.io
 DOMAIN,vgs-collect-keeper.apps.verygood.systems
+# Monzo
+DOMAIN-KEYWORD,monzo
+DOMAIN-SUFFIX,monzo.com
+DOMAIN,monzo.statuspage.io
+DOMAIN-SUFFIX,monzo-alt.net
