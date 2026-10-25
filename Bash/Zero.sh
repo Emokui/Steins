@@ -2503,8 +2503,11 @@ bbr_manage_menu() {
 DNS_RESOLV_CONF="/etc/resolv.conf"
 DNS_RESOLV_BACKUP="/etc/resolv.conf.zero.bak"
 DNS_RESOLVED_DROPIN_DIR="/etc/systemd/resolved.conf.d"
-DNS_RESOLVED_DROPIN_FILE="$DNS_RESOLVED_DROPIN_DIR/90-zero-dns.conf"
+DNS_RESOLVED_DROPIN_FILE="$DNS_RESOLVED_DROPIN_DIR/zz-zero-dns.conf"
+DNS_RESOLVED_PREVIOUS_FILE="$DNS_RESOLVED_DROPIN_DIR/90-zero-dns.conf"
 DNS_RESOLVED_LEGACY_FILE="$DNS_RESOLVED_DROPIN_DIR/99-custom-dns.conf"
+DNS_RESOLVED_RESOLV_BACKUP="/etc/resolv.conf.zero-resolved.bak"
+DNS_RESOLVED_STUB="/run/systemd/resolve/stub-resolv.conf"
 
 dns_read_runtime_status() {
     local active="0" iface="" dns_list=""
@@ -2613,8 +2616,24 @@ dns_systemd_resolved_active() {
     command -v systemctl >/dev/null 2>&1 && systemctl is-active systemd-resolved >/dev/null 2>&1
 }
 
+dns_migrate_resolved_config() {
+    if [[ -e "$DNS_RESOLVED_PREVIOUS_FILE" ]]; then
+        if [[ -e "$DNS_RESOLVED_DROPIN_FILE" ]] || ! grep -qx '# Managed by Zero.sh' "$DNS_RESOLVED_PREVIOUS_FILE"; then
+            echo -e "${RED}检测到冲突 DNS 配置: ${DNS_RESOLVED_PREVIOUS_FILE}${PLAIN}"
+            return 1
+        fi
+        mv "$DNS_RESOLVED_PREVIOUS_FILE" "$DNS_RESOLVED_DROPIN_FILE" || return 1
+    fi
+}
+
+dns_replace_resolv() {
+    local source="$1"
+    [[ ! -d "$DNS_RESOLV_CONF" ]] || return 1
+    rm -f "$DNS_RESOLV_CONF" && cp -a "$source" "$DNS_RESOLV_CONF"
+}
+
 dns_apply_resolved() {
-    local temp_file backup_file="" had_previous=0
+    local work_dir had_previous=0 new_backup=0
 
     if [[ -e "$DNS_RESOLVED_LEGACY_FILE" ]]; then
         echo -e "${RED}检测到旧 DNS 配置: ${DNS_RESOLVED_LEGACY_FILE}${PLAIN}"
@@ -2622,51 +2641,63 @@ dns_apply_resolved() {
         return 1
     fi
 
+    [[ -f "$DNS_RESOLVED_STUB" ]] || {
+        echo -e "${RED}找不到 systemd-resolved 本地解析文件${PLAIN}"
+        return 1
+    }
+    dns_migrate_resolved_config || return 1
     mkdir -p "$DNS_RESOLVED_DROPIN_DIR" || return 1
-    temp_file=$(mktemp "$DNS_RESOLVED_DROPIN_DIR/.90-zero-dns.XXXXXX") || return 1
-
-    if [[ -f "$DNS_RESOLVED_DROPIN_FILE" ]]; then
-        backup_file=$(mktemp "$DNS_RESOLVED_DROPIN_DIR/.90-zero-dns.backup.XXXXXX") || {
-            rm -f "$temp_file"
-            return 1
-        }
-        cp -p "$DNS_RESOLVED_DROPIN_FILE" "$backup_file" || {
-            rm -f "$temp_file" "$backup_file"
+    work_dir=$(mktemp -d "$DNS_RESOLVED_DROPIN_DIR/.zero-dns.XXXXXX") || return 1
+    if ! cp -a "$DNS_RESOLV_CONF" "$work_dir/resolv.conf"; then
+        rm -rf "$work_dir"
+        return 1
+    fi
+    if [[ -e "$DNS_RESOLVED_DROPIN_FILE" ]]; then
+        cp -p "$DNS_RESOLVED_DROPIN_FILE" "$work_dir/previous.conf" || {
+            rm -rf "$work_dir"
             return 1
         }
         had_previous=1
     fi
-
+    if [[ ! -e "$DNS_RESOLVED_RESOLV_BACKUP" && ! -L "$DNS_RESOLVED_RESOLV_BACKUP" ]]; then
+        cp -a "$DNS_RESOLV_CONF" "$DNS_RESOLVED_RESOLV_BACKUP" || {
+            rm -rf "$work_dir"
+            return 1
+        }
+        new_backup=1
+    fi
     {
         echo "# Managed by Zero.sh"
         echo "[Resolve]"
+        echo "DNS="
         printf 'DNS=%s\n' "$*"
         echo "Domains=~."
-    } > "$temp_file" || {
-        rm -f "$temp_file" "$backup_file"
-        return 1
-    }
-    chmod 644 "$temp_file" || {
-        rm -f "$temp_file" "$backup_file"
-        return 1
-    }
-    mv -f "$temp_file" "$DNS_RESOLVED_DROPIN_FILE" || {
-        rm -f "$temp_file" "$backup_file"
+        echo "FallbackDNS="
+        echo "DNSStubListener=yes"
+    } > "$work_dir/new.conf" || {
+        (( new_backup == 1 )) && rm -f "$DNS_RESOLVED_RESOLV_BACKUP"
+        rm -rf "$work_dir"
         return 1
     }
 
-    if ! systemctl restart systemd-resolved 2>/dev/null || ! dns_systemd_resolved_active; then
+    if ! { chmod 644 "$work_dir/new.conf" &&
+        mv -f "$work_dir/new.conf" "$DNS_RESOLVED_DROPIN_FILE" &&
+        ln -sfn "$DNS_RESOLVED_STUB" "$DNS_RESOLV_CONF" &&
+        systemctl restart systemd-resolved 2>/dev/null && dns_systemd_resolved_active; }; then
         if (( had_previous == 1 )); then
-            mv -f "$backup_file" "$DNS_RESOLVED_DROPIN_FILE" 2>/dev/null || true
+            cp -p "$work_dir/previous.conf" "$DNS_RESOLVED_DROPIN_FILE" 2>/dev/null || true
         else
             rm -f "$DNS_RESOLVED_DROPIN_FILE"
         fi
+        dns_replace_resolv "$work_dir/resolv.conf" || true
+        (( new_backup == 1 )) && rm -f "$DNS_RESOLVED_RESOLV_BACKUP"
+        rm -rf "$work_dir"
         systemctl restart systemd-resolved >/dev/null 2>&1 || true
         echo -e "${RED}systemd-resolved 重启失败，已回滚 DNS 配置${PLAIN}"
         return 1
     fi
 
-    [[ -n "$backup_file" ]] && rm -f "$backup_file"
+    rm -rf "$work_dir"
     command -v resolvectl >/dev/null 2>&1 && resolvectl flush-caches >/dev/null 2>&1 || true
     return 0
 }
@@ -2748,25 +2779,33 @@ dns_apply() {
 }
 
 dns_restore() {
-    local changed=0 temp_file backup_file conf_dir
+    local changed=0 temp_file conf_dir work_dir had_previous=0 was_active=0
 
-    if [[ -f "$DNS_RESOLVED_DROPIN_FILE" ]]; then
-        backup_file=$(mktemp "$DNS_RESOLVED_DROPIN_DIR/.90-zero-dns.restore.XXXXXX") || return 1
-        cp -p "$DNS_RESOLVED_DROPIN_FILE" "$backup_file" || {
-            rm -f "$backup_file"
+    dns_migrate_resolved_config || return 1
+    if [[ -f "$DNS_RESOLVED_DROPIN_FILE" || -e "$DNS_RESOLVED_RESOLV_BACKUP" || -L "$DNS_RESOLVED_RESOLV_BACKUP" ]]; then
+        work_dir=$(mktemp -d "$DNS_RESOLVED_DROPIN_DIR/.zero-dns.restore.XXXXXX") || return 1
+        cp -a "$DNS_RESOLV_CONF" "$work_dir/resolv.conf" || {
+            rm -rf "$work_dir"
             return 1
         }
-        rm -f "$DNS_RESOLVED_DROPIN_FILE" || {
-            rm -f "$backup_file"
-            return 1
-        }
-        if dns_systemd_resolved_active && ! systemctl restart systemd-resolved 2>/dev/null; then
-            mv -f "$backup_file" "$DNS_RESOLVED_DROPIN_FILE" 2>/dev/null || true
+        if [[ -f "$DNS_RESOLVED_DROPIN_FILE" ]]; then
+            cp -p "$DNS_RESOLVED_DROPIN_FILE" "$work_dir/previous.conf" || { rm -rf "$work_dir"; return 1; }
+            had_previous=1
+        fi
+        dns_systemd_resolved_active && was_active=1
+        if ! { rm -f "$DNS_RESOLVED_DROPIN_FILE" &&
+            { [[ ! -e "$DNS_RESOLVED_RESOLV_BACKUP" && ! -L "$DNS_RESOLVED_RESOLV_BACKUP" ]] ||
+                dns_replace_resolv "$DNS_RESOLVED_RESOLV_BACKUP"; } &&
+            { (( was_active == 0 )) || { systemctl restart systemd-resolved 2>/dev/null && dns_systemd_resolved_active; }; }; }; then
+            (( had_previous == 1 )) && cp -p "$work_dir/previous.conf" "$DNS_RESOLVED_DROPIN_FILE"
+            dns_replace_resolv "$work_dir/resolv.conf" || true
             systemctl restart systemd-resolved >/dev/null 2>&1 || true
+            rm -rf "$work_dir"
             echo -e "${RED}systemd-resolved 重载失败，已恢复 Zero.sh DNS 配置${PLAIN}"
             return 1
         fi
-        rm -f "$backup_file"
+        rm -f "$DNS_RESOLVED_RESOLV_BACKUP"
+        rm -rf "$work_dir"
         changed=1
     fi
 
@@ -2827,6 +2866,8 @@ dns_show_menu() {
     echo -e "${GREEN}1.${PLAIN}使用公共DNS ${GREEN}8.8.8.8${PLAIN} / ${GREEN}1.1.1.1${PLAIN}"
     echo -e "${GREEN}2.${PLAIN}自定义DNS"
     echo -e "${GREEN}3.${PLAIN}恢复原始DNS配置"
+    echo -e "${GREEN}4.${PLAIN}启用NAT64 ${GREEN}nat64.net${PLAIN} (IPv6访问IPv4)"
+    echo -e "${GREEN}5.${PLAIN}测试NAT64连接"
     echo -e "${YELLOW}0.${PLAIN}返回主菜单"
     echo -e "${BLUE}==============================${PLAIN}"
 }
@@ -2841,6 +2882,25 @@ dns_read_custom_servers() {
         [[ -z "$dns" ]] && break
         printf '%s\n' "$dns"
     done
+}
+
+dns_enable_nat64() {
+    echo -e "${YELLOW}使用 nat64.net 公共 DNS64/NAT64，服务免费，云端流量按原规则计费${PLAIN}"
+    echo -e "${YELLOW}服务条款: https://nat64.net/tos${PLAIN}"
+    dns_apply_with_feedback "2a00:1098:2c::1" "2a00:1098:2b::1" "2a01:4f8:c2c:123f::1"
+}
+
+dns_test_nat64() {
+    echo -e "${YELLOW}正在测试 GitHub API 的 IPv6 连接...${PLAIN}"
+    if ! command -v curl >/dev/null 2>&1; then
+        echo -e "${RED}未安装 curl，无法测试${PLAIN}"
+    elif curl -6 --noproxy '*' --fail --silent --show-error --output /dev/null \
+        --connect-timeout 15 --max-time 30 https://api.github.com; then
+        echo -e "${GREEN}GitHub API 访问成功${PLAIN}"
+    else
+        echo -e "${RED}连接失败，请检查 IPv6 网络、DNS 配置或 NAT64 服务状态${PLAIN}"
+    fi
+    press_any_key_to_continue
 }
 
 handle_dns_choice() {
@@ -2863,6 +2923,12 @@ handle_dns_choice() {
             ;;
         3)
             dns_restore_with_feedback
+            ;;
+        4)
+            dns_enable_nat64
+            ;;
+        5)
+            dns_test_nat64
             ;;
         0)
             return 1
