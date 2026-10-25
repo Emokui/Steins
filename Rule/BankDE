@@ -36,25 +36,6 @@ DOMAIN-SUFFIX,bugsnag.com
 DOMAIN,images.ctfassets.net
 DOMAIN-SUFFIX,usercentrics.eu
 DOMAIN,beyondwickedmapping.org
-# Bybit Eu
-DOMAIN-KEYWORD,bybit
-DOMAIN-SUFFIX,bybit.eu
-DOMAIN,api3.byd3c3.com
-DOMAIN,api3.bybdc6.com
-DOMAIN-SUFFIX,bybit.com
-DOMAIN-SUFFIX,bycsi.com
-DOMAIN,api3.byabcde.com
-DOMAIN,api.wsot2022.com
-DOMAIN,ocsp.usertrust.com
-DOMAIN,content.byabcd.com
-DOMAIN,www.turingfraud.net
-DOMAIN-SUFFIX,nintendo.com
-DOMAIN,resources.triple.app
-DOMAIN,h64.online-metrix.net
-DOMAIN,api.ffbbbdc6d3c353211fe2ba39c9f744cd.com
-DOMAIN,sc-abtest.ffe390afd658c19dcbf707e0597b846d.de
-DOMAIN,sc-datasink.ffbbbdc6d3c353211fe2ba39c9f744cd.com
-DOMAIN,monitor-frontend-collector.ffbbbdc6d3c353211fe2ba39c9f744cd.com
 # Coinbase
 DOMAIN,api.sprig.com
 DOMAIN,icanhazip.com
@@ -68,18 +49,11 @@ DOMAIN-SUFFIX,cloudinary.com
 DOMAIN-SUFFIX,datadog.pool.ntp.org
 DOMAIN,d1dwhf283nul1c.cloudfront.net
 DOMAIN,asset-metadata-service-production.s3.amazonaws.com
-# Ether
-IP-CIDR,198.18.0.1/32,no-resolve
-DOMAIN-SUFFIX,daimo.com
-DOMAIN-SUFFIX,de.sentry.io
-DOMAIN-SUFFIX,ether.fi
-DOMAIN-SUFFIX,intercom.io
-DOMAIN,api.turnkey.com
-DOMAIN,api.onesignal.com
-DOMAIN-SUFFIX,walletconnect.org
-DOMAIN-SUFFIX,walletconnect.com
-DOMAIN,api.web3modal.org
-DOMAIN,api.web3modal.com
-DOMAIN,assets.coingecko.com
-DOMAIN,mpp.prd.meawallet.app
+# Satispay
+DOMAIN,lhhaad.skadsdkless.appsflyersdk.com
+DOMAIN,lhhaad.launches.appsflyersdk.com
 DOMAIN-SUFFIX,s3.eu-west-1.amazonaws.com
+DOMAIN-SUFFIX,eu-west-1.token.awswaf.com
+DOMAIN-SUFFIX,ingest.de.sentry.io
+DOMAIN-SUFFIX,satispay.com
+DOMAIN-KEYWORD,satispay
