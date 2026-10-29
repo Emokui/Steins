@@ -1,5 +1,19 @@
 # Nerverless
 DOMAIN-SUFFIX,neverless.com
+# Krak
+DOMAIN,u.expo.dev
+DOMAIN-KEYWORD,krak
+DOMAIN-KEYWORD,kraken
+DOMAIN-SUFFIX,krak.app
+DOMAIN-SUFFIX,sardine.ai
+DOMAIN-SUFFIX,kraken.com
+DOMAIN-SUFFIX,stripe.com
+DOMAIN,kraken.zendesk.com
+DOMAIN-SUFFIX,nsureapi.com
+DOMAIN,sdk.iad-05.braze.com
+DOMAIN-SUFFIX,launchdarkly.com
+DOMAIN-SUFFIX,appsflyersdk.com
+DOMAIN,cdn-settings.segment.com
 # Bunq
 DOMAIN-KEYWORD,bunq
 DOMAIN-SUFFIX,bunq.com
