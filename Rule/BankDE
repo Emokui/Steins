@@ -44,3 +44,4 @@ DOMAIN-SUFFIX,eu-west-1.token.awswaf.com
 DOMAIN-SUFFIX,ingest.de.sentry.io
 DOMAIN-SUFFIX,satispay.com
 DOMAIN-KEYWORD,satispay
+DOMAIN-SUFFIX,eu.amplitude.com
