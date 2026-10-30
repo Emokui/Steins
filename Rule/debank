@@ -11,6 +11,7 @@ DOMAIN-SUFFIX,stripe.com
 DOMAIN,kraken.zendesk.com
 DOMAIN-SUFFIX,nsureapi.com
 DOMAIN,sdk.iad-05.braze.com
+DOMAIN-SUFFIX,eu1.fullstory.com
 DOMAIN-SUFFIX,launchdarkly.com
 DOMAIN-SUFFIX,appsflyersdk.com
 DOMAIN,cdn-settings.segment.com
@@ -92,6 +93,8 @@ DOMAIN,lhhaad.skadsdkless.appsflyersdk.com
 DOMAIN,lhhaad.launches.appsflyersdk.com
 DOMAIN-SUFFIX,s3.eu-west-1.amazonaws.com
 DOMAIN-SUFFIX,eu-west-1.token.awswaf.com
+DOMAIN-SUFFIX,eu-west-1.sdk.awswaf.com
+DOMAIN-SUFFIX,sr-client-cfg.eu.amplitude.com
 DOMAIN-SUFFIX,ingest.de.sentry.io
 DOMAIN-SUFFIX,satispay.com
 DOMAIN-KEYWORD,satispay
