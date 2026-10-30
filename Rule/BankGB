@@ -15,6 +15,7 @@ DOMAIN,sdk.iad-05.braze.com
 DOMAIN-SUFFIX,launchdarkly.com
 DOMAIN-SUFFIX,appsflyersdk.com
 DOMAIN,cdn-settings.segment.com
+DOMAIN-SUFFIX,eu1.fullstory.com
 # Trading212
 DOMAIN,ticketshack.com
 DOMAIN-KEYWORD,trading212
