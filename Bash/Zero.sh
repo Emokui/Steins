@@ -1374,8 +1374,8 @@ set_ip_priority() {
         echo -e "${BLUE}=== IP连接优先级 ===${PLAIN}"
         echo -e "${YELLOW}当前优先级: ${GREEN}${current_priority}${PLAIN}"
         echo -e "${BLUE}======================${PLAIN}"
-        echo -e "${GREEN}1.${PLAIN}IPv4 优先"
-        echo -e "${GREEN}2.${PLAIN}IPv6 优先"
+        echo -e "${GREEN}1.${PLAIN}IPv4优先"
+        echo -e "${GREEN}2.${PLAIN}IPv6优先"
         echo -e "${GREEN}3.${PLAIN}系统默认"
         echo -e "${YELLOW}0.${PLAIN}返回菜单"
         echo -e "${BLUE}======================${PLAIN}"
@@ -1383,13 +1383,13 @@ set_ip_priority() {
 
         case "$choice" in
             1)
-                _apply_priority_mode "ipv4" "IPv4 优先"
+                _apply_priority_mode "ipv4" "IPv4优先"
                 ;;
             2)
-                _apply_priority_mode "ipv6" "IPv6 优先"
+                _apply_priority_mode "ipv6" "IPv6优先"
                 ;;
             3)
-                _apply_priority_mode "default" "IPv6 优先（系统默认）"
+                _apply_priority_mode "default" "IPv6优先（系统默认）"
                 ;;
             0)
                 return
