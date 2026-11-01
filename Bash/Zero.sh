@@ -617,7 +617,7 @@ reinstall_pick_ipv6_line() {
 }
 
 reinstall_gather_network_state() {
-    local iaddr='' ip6_line='' ip6_route='' ipv6_iface='' attempt=''
+    local iaddr='' ip6_line='' ip6_route='' ipv6_iface=''
 
     REINSTALL_NETWORK_INTERFACE=$(reinstall_get_default_interface)
     [[ -n "$REINSTALL_NETWORK_INTERFACE" ]] || {
@@ -644,14 +644,10 @@ reinstall_gather_network_state() {
     ipv6_iface=$(ip -6 route show default 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i + 1); exit}}')
     [[ -n "$ipv6_iface" ]] || ipv6_iface="$REINSTALL_NETWORK_INTERFACE"
 
-    for attempt in 1 2 3; do
-        ip6_line=$(reinstall_pick_ipv6_line "$ipv6_iface")
-        if [[ -z "$ip6_line" && "$ipv6_iface" != "$REINSTALL_NETWORK_INTERFACE" ]]; then
-            ip6_line=$(reinstall_pick_ipv6_line "$REINSTALL_NETWORK_INTERFACE")
-        fi
-        [[ -n "$ip6_line" ]] && break
-        [[ "$attempt" == '3' ]] || sleep 1
-    done
+    ip6_line=$(reinstall_pick_ipv6_line "$ipv6_iface")
+    if [[ -z "$ip6_line" && "$ipv6_iface" != "$REINSTALL_NETWORK_INTERFACE" ]]; then
+        ip6_line=$(reinstall_pick_ipv6_line "$REINSTALL_NETWORK_INTERFACE")
+    fi
 
     if [[ -n "$ip6_line" ]]; then
         REINSTALL_IPV6_ADDR=$(echo "$ip6_line" | awk '{print $4}' | cut -d/ -f1)
@@ -1378,8 +1374,8 @@ set_ip_priority() {
         echo -e "${BLUE}=== IP连接优先级 ===${PLAIN}"
         echo -e "${YELLOW}当前优先级: ${GREEN}${current_priority}${PLAIN}"
         echo -e "${BLUE}======================${PLAIN}"
-        echo -e "${GREEN}1.${PLAIN}IPv4优先"
-        echo -e "${GREEN}2.${PLAIN}IPv6优先"
+        echo -e "${GREEN}1.${PLAIN}IPv4 优先"
+        echo -e "${GREEN}2.${PLAIN}IPv6 优先"
         echo -e "${GREEN}3.${PLAIN}系统默认"
         echo -e "${YELLOW}0.${PLAIN}返回菜单"
         echo -e "${BLUE}======================${PLAIN}"
@@ -1759,73 +1755,24 @@ bbr_detect_bandwidth() {
         1)
             echo -e "${YELLOW}正在运行 speedtest 自动测速...${PLAIN}" >&2
             bbr_ensure_speedtest >/dev/null 2>&1 || {
-                echo -e "${YELLOW}测速工具安装失败，使用默认值 1000 Mbps${PLAIN}" >&2
+                echo -e "${RED}测速工具安装失败，请选择预设或自定义带宽${PLAIN}" >&2
                 bbr_cleanup_managed_speedtest
-                echo "1000"
                 return 1
             }
 
-            local servers_list server_count
-            servers_list=$(speedtest --accept-license --accept-gdpr --servers 2>/dev/null | sed -nE 's/^[[:space:]]*([0-9]+).*/\1/p' | head -n 10)
-            if [[ -n "$servers_list" ]]; then
-                server_count=$(echo "$servers_list" | wc -l | tr -d ' ')
-                echo -e "${GREEN}已找到 ${server_count} 个附近节点${PLAIN}" >&2
-            else
-                servers_list="auto"
-                echo -e "${YELLOW}未获取到节点列表，将自动选择最近服务器${PLAIN}" >&2
-            fi
-
-            local speedtest_output="" upload_speed="" upload_mbps="" success_server="" failed_server="" attempt=0 server_id
-            for server_id in $servers_list; do
-                attempt=$((attempt + 1))
-
-                if [[ "$server_id" == "auto" ]]; then
-                    echo -e "${YELLOW}[尝试 ${attempt}] 自动选择最近服务器...${PLAIN}" >&2
-                    speedtest_output=$(speedtest --accept-license --accept-gdpr 2>&1)
-                else
-                    echo -e "${YELLOW}[尝试 ${attempt}] 测试服务器 #${server_id}...${PLAIN}" >&2
-                    speedtest_output=$(speedtest --accept-license --accept-gdpr --server-id="$server_id" 2>&1)
-                fi
-
-                echo "$speedtest_output" >&2
-                echo >&2
-
-                upload_speed=""
-                if echo "$speedtest_output" | grep -q "Upload:"; then
-                    upload_speed=$(echo "$speedtest_output" | sed -nE 's/.*[Uu]pload:[[:space:]]*([0-9]+(\.[0-9]+)?).*/\1/p' | head -n 1)
-                fi
-                if [[ -z "$upload_speed" ]]; then
-                    upload_speed=$(echo "$speedtest_output" | grep -i "Upload:" | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+$/) {print $i; exit}}')
-                fi
-
-                if [[ -n "$upload_speed" ]] && ! echo "$speedtest_output" | grep -qi "FAILED\|error"; then
-                    success_server=$(echo "$speedtest_output" | grep "Server:" | head -n 1 | sed 's/.*Server: //')
-                    echo -e "${GREEN}测速成功${PLAIN}" >&2
-                    [[ -n "$success_server" ]] && echo -e "使用服务器: ${GREEN}${success_server}${PLAIN}" >&2
-                    break
-                fi
-
-                failed_server=$(echo "$speedtest_output" | grep "Server:" | head -n 1 | sed 's/.*Server: //' | sed 's/[[:space:]]*$//')
-                if [[ -n "$failed_server" ]]; then
-                    echo -e "${YELLOW}节点失败: ${failed_server}${PLAIN}" >&2
-                else
-                    echo -e "${YELLOW}节点失败,继续尝试下一个${PLAIN}" >&2
-                fi
-                echo >&2
-            done
-
-            if [[ -z "$upload_speed" ]] || echo "$speedtest_output" | grep -qi "FAILED\|error"; then
-                echo -e "${YELLOW}测速失败，使用默认值 1000 Mbps${PLAIN}" >&2
+            local speedtest_output upload_speed upload_mbps
+            if ! speedtest_output=$(speedtest --accept-license --accept-gdpr 2>&1); then
+                printf '%s\n' "$speedtest_output" >&2
+                echo -e "${RED}测速失败，请选择预设或自定义带宽${PLAIN}" >&2
                 bbr_cleanup_managed_speedtest
-                echo "1000"
                 return 1
             fi
-
+            printf '%s\n' "$speedtest_output" >&2
+            upload_speed=$(printf '%s\n' "$speedtest_output" | sed -nE 's/.*[Uu]pload:[[:space:]]*([0-9]+(\.[0-9]+)?).*/\1/p' | head -n 1)
             upload_mbps=${upload_speed%.*}
-            if ! [[ "$upload_mbps" =~ ^[0-9]+$ ]] || (( upload_mbps <= 0 )); then
-                echo -e "${YELLOW}检测值异常 (${upload_speed})，使用默认值 1000 Mbps${PLAIN}" >&2
+            if [[ ! "$upload_mbps" =~ ^[0-9]+$ ]] || (( upload_mbps <= 0 )); then
+                echo -e "${RED}无法读取上传带宽，请选择预设或自定义带宽${PLAIN}" >&2
                 bbr_cleanup_managed_speedtest
-                echo "1000"
                 return 1
             fi
 
@@ -1844,7 +1791,7 @@ bbr_detect_bandwidth() {
             echo "8. 2000 Mbps" >&2
             echo "9. 2500 Mbps" >&2
             echo "10. 自定义输入" >&2
-            read -r -p "请输入选择 [6]: " preset_choice
+            read -r -p "请输入选择 [6]: " preset_choice || return 2
             preset_choice=$(trim_input "$preset_choice")
             preset_choice=${preset_choice:-6}
             case "$preset_choice" in
@@ -1858,23 +1805,21 @@ bbr_detect_bandwidth() {
                 8) echo 2000 ;;
                 9) echo 2500 ;;
                 10)
-                    read -r -p "请输入带宽值（Mbps）: " manual_bandwidth
+                    read -r -p "请输入带宽值（Mbps）: " manual_bandwidth || return 2
                     manual_bandwidth=$(trim_input "$manual_bandwidth")
                     if [[ "$manual_bandwidth" =~ ^[0-9]+$ ]] && (( manual_bandwidth > 0 )); then
                         echo "$manual_bandwidth"
                     else
-                        echo 1000
                         return 1
                     fi
                     ;;
-                *) echo 1000; return 1 ;;
+                *) return 1 ;;
             esac
             ;;
         3)
             return 3
             ;;
         *)
-            echo 1000
             return 1
             ;;
     esac
@@ -2145,13 +2090,12 @@ bbr_configure_direct() {
     local detected_bandwidth
     detected_bandwidth=$(bbr_detect_bandwidth)
     local bandwidth_status=$?
-    if [[ "$bandwidth_status" -eq 2 ]]; then
-        return 0
-    fi
-    if [[ "$bandwidth_status" -eq 3 ]]; then
-        bbr_restore_original_network_config
-        return 0
-    fi
+    case "$bandwidth_status" in
+        0) ;;
+        2) return 0 ;;
+        3) bbr_restore_original_network_config; return $? ;;
+        *) press_any_key_to_continue; return 1 ;;
+    esac
 
     local region="asia" region_choice
     echo "1. 亚太地区（港/日/新/韩等）"
@@ -2556,7 +2500,6 @@ DNS_RESOLV_BACKUP="/etc/resolv.conf.zero.bak"
 DNS_RESOLVED_DROPIN_DIR="/etc/systemd/resolved.conf.d"
 DNS_RESOLVED_DROPIN_FILE="$DNS_RESOLVED_DROPIN_DIR/zz-zero-dns.conf"
 DNS_RESOLVED_PREVIOUS_FILE="$DNS_RESOLVED_DROPIN_DIR/90-zero-dns.conf"
-DNS_RESOLVED_LEGACY_FILE="$DNS_RESOLVED_DROPIN_DIR/99-custom-dns.conf"
 DNS_RESOLVED_RESOLV_BACKUP="/etc/resolv.conf.zero-resolved.bak"
 DNS_RESOLVED_STUB="/run/systemd/resolve/stub-resolv.conf"
 
@@ -2690,12 +2633,6 @@ dns_replace_resolv() {
 
 dns_apply_resolved() {
     local work_dir had_previous=0 new_backup=0
-
-    if [[ -e "$DNS_RESOLVED_LEGACY_FILE" ]]; then
-        echo -e "${RED}检测到旧 DNS 配置: ${DNS_RESOLVED_LEGACY_FILE}${PLAIN}"
-        echo -e "${YELLOW}为避免覆盖来源不明的配置，请先手动确认或移除该文件${PLAIN}"
-        return 1
-    fi
 
     [[ -f "$DNS_RESOLVED_STUB" ]] || {
         echo -e "${RED}找不到 systemd-resolved 本地解析文件${PLAIN}"
@@ -3512,9 +3449,7 @@ ACME_CF_RESPONSE=""
 ACME_CF_HTTP_STATUS=""
 ACME_CF_ZONE_ID=""
 ACME_CF_ZONE_NAME=""
-ACME_CF_ZONE_STATUS=""
 ACME_CF_ACCOUNT_ID=""
-ACME_CF_EXPECTED_NS=""
 ACME_CF_CREDENTIAL_BACKUP=""
 ACME_CF_CREDENTIALS_REMOVED=0
 
@@ -3538,10 +3473,8 @@ acme_has_ipv4() {
 acme_install_dependencies() {
     local packages=(
         curl
-        wget
         socat
         openssl
-        dnsutils
         jq
         cron
         tar
@@ -3631,12 +3564,10 @@ acme_install_core() {
     }
     tarball="$tempdir/master.tar.gz"
 
-    if ! wget -O "$tarball" "$acme_tar_url" 2>/dev/null; then
-        if ! curl -fsSL "$acme_tar_url" -o "$tarball" 2>/dev/null; then
-            echo -e "${RED}acme.sh 下载失败${PLAIN}"
-            rm -rf "$tempdir"
-            return 1
-        fi
+    if ! curl -fsSL --connect-timeout 10 --max-time 180 "$acme_tar_url" -o "$tarball"; then
+        echo -e "${RED}acme.sh 下载失败${PLAIN}"
+        rm -rf "$tempdir"
+        return 1
     fi
 
     if ! tar zxf "$tarball" -C "$tempdir"; then
@@ -3785,19 +3716,12 @@ acme_prompt_validated_domain() {
 }
 
 acme_cf_require_dependencies() {
-    local missing_packages=()
-    local command_name package
-
-    for package in curl jq dnsutils openssl; do
-        case "$package" in
-            dnsutils) command_name="dig" ;;
-            *) command_name="$package" ;;
-        esac
-        command -v "$command_name" >/dev/null 2>&1 || missing_packages+=("$package")
+    local missing_packages=() command_name
+    for command_name in curl jq; do
+        command -v "$command_name" >/dev/null 2>&1 || missing_packages+=("$command_name")
     done
-
     [[ "${#missing_packages[@]}" -eq 0 ]] && return 0
-    echo -e "${YELLOW}正在安装 Cloudflare API 检查依赖: ${missing_packages[*]}${PLAIN}"
+    echo -e "${YELLOW}正在安装 Cloudflare API 依赖: ${missing_packages[*]}${PLAIN}"
     pkg_install "${missing_packages[@]}"
 }
 
@@ -3881,19 +3805,6 @@ acme_cf_print_errors() {
     echo -e "${RED}${summary:-Cloudflare API 请求失败} (HTTP ${ACME_CF_HTTP_STATUS:-000})${PLAIN}"
 }
 
-acme_cf_verify_token() {
-    echo -e "${YELLOW}正在验证 Cloudflare API Token...${PLAIN}"
-    if ! acme_cf_api GET "user/tokens/verify" || ! acme_cf_response_success; then
-        acme_cf_print_errors
-        return 1
-    fi
-    if [[ $(jq -r '.result.status // empty' <<<"$ACME_CF_RESPONSE") != "active" ]]; then
-        echo -e "${RED}Cloudflare API Token 不是 active 状态${PLAIN}"
-        return 1
-    fi
-    echo -e "${GREEN}✓ API Token 有效且处于 active 状态${PLAIN}"
-}
-
 acme_cf_find_zone() {
     local domain="$1"
     local candidate="$domain"
@@ -3915,10 +3826,7 @@ acme_cf_find_zone() {
         if [[ "$count" =~ ^[0-9]+$ ]] && (( count > 0 )); then
             ACME_CF_ZONE_ID=$(jq -r '.result[0].id // empty' <<<"$ACME_CF_RESPONSE")
             ACME_CF_ZONE_NAME=$(jq -r '.result[0].name // empty' <<<"$ACME_CF_RESPONSE")
-            ACME_CF_ZONE_STATUS=$(jq -r '.result[0].status // empty' <<<"$ACME_CF_RESPONSE")
             ACME_CF_ACCOUNT_ID=$(jq -r '.result[0].account.id // empty' <<<"$ACME_CF_RESPONSE")
-            ACME_CF_EXPECTED_NS=$(jq -r '.result[0].name_servers[]? // empty' <<<"$ACME_CF_RESPONSE" \
-                | tr '[:upper:]' '[:lower:]' | sed 's/\.$//' | sort -u)
             break
         fi
         candidate="${candidate#*.}"
@@ -3929,98 +3837,19 @@ acme_cf_find_zone() {
         echo -e "${YELLOW}请确认 Token 已包含目标 Zone，并拥有 Zone Read 权限${PLAIN}"
         return 1
     fi
-    if [[ "$ACME_CF_ZONE_STATUS" != "active" ]]; then
-        echo -e "${RED}Cloudflare Zone 状态为 ${ACME_CF_ZONE_STATUS:-unknown}，不是 active${PLAIN}"
-        return 1
-    fi
     echo -e "${GREEN}✓ Zone Read 验证通过: ${ACME_CF_ZONE_NAME}${PLAIN}"
 }
 
-acme_cf_public_authoritative_ns() {
-    local zone="$1"
-    local resolver result=""
-
-    for resolver in 1.1.1.1 8.8.8.8 ""; do
-        if [[ -n "$resolver" ]]; then
-            result=$(dig +short +time=4 +tries=1 NS "$zone" "@$resolver" 2>/dev/null)
-        else
-            result=$(dig +short +time=4 +tries=1 NS "$zone" 2>/dev/null)
-        fi
-        [[ -n "$result" ]] && break
-    done
-    printf '%s\n' "$result" | tr '[:upper:]' '[:lower:]' | sed '/^$/d; s/\.$//' | sort -u
-}
-
-acme_cf_check_authoritative_ns() {
-    local actual_ns
-
-    echo -e "${YELLOW}正在检查 ${ACME_CF_ZONE_NAME} 的公网权威 NS...${PLAIN}"
-    actual_ns=$(acme_cf_public_authoritative_ns "$ACME_CF_ZONE_NAME")
-    if [[ -z "$actual_ns" ]]; then
-        echo -e "${RED}无法从公共 DNS 查询权威 NS${PLAIN}"
-        return 1
-    fi
-    if [[ -z "$ACME_CF_EXPECTED_NS" ]]; then
-        echo -e "${RED}Cloudflare API 未返回 Zone 的预期 NS${PLAIN}"
-        return 1
-    fi
-    if [[ "$actual_ns" != "$ACME_CF_EXPECTED_NS" ]]; then
-        echo -e "${RED}域名当前的公网权威 NS 与 Cloudflare 分配的 NS 不一致${PLAIN}"
-        echo "Cloudflare 预期 NS: $(tr '\n' ' ' <<<"$ACME_CF_EXPECTED_NS")"
-        echo "公网实际 NS:      $(tr '\n' ' ' <<<"$actual_ns")"
-        return 1
-    fi
-    echo -e "${GREEN}✓ 权威 NS 检查通过: $(tr '\n' ' ' <<<"$actual_ns")${PLAIN}"
-}
-
-acme_cf_probe_dns_write() {
-    local probe_name probe_value payload record_id
-
-    probe_name="_zero-acme-permission-check.${ACME_CF_ZONE_NAME}"
-    probe_value="zero-acme-check-$(openssl rand -hex 12)"
-    payload=$(jq -nc \
-        --arg type "TXT" \
-        --arg name "$probe_name" \
-        --arg content "$probe_value" \
-        '{type:$type,name:$name,content:$content,ttl:120}')
-
-    echo -e "${YELLOW}正在通过临时 TXT 记录验证 DNS Write 权限...${PLAIN}"
-    if ! acme_cf_api POST "zones/${ACME_CF_ZONE_ID}/dns_records" "$payload" || ! acme_cf_response_success; then
-        acme_cf_print_errors
-        echo -e "${RED}Token 需要目标 Zone 的 DNS Write 权限${PLAIN}"
-        return 1
-    fi
-    record_id=$(jq -r '.result.id // empty' <<<"$ACME_CF_RESPONSE")
-    if [[ -z "$record_id" ]]; then
-        echo -e "${RED}临时 TXT 已提交，但 Cloudflare 未返回记录 ID，无法清理${PLAIN}"
-        echo -e "${YELLOW}请手动检查并删除可能残留的记录: ${probe_name}${PLAIN}"
-        return 1
-    fi
-
-    if ! acme_cf_api DELETE "zones/${ACME_CF_ZONE_ID}/dns_records/${record_id}" || ! acme_cf_response_success; then
-        acme_cf_print_errors
-        echo -e "${YELLOW}临时 TXT 可能残留，请手动删除: ${probe_name} (记录 ID: ${record_id})${PLAIN}"
-        return 1
-    fi
-    echo -e "${GREEN}✓ DNS Write/Delete 权限验证通过，临时 TXT 已删除${PLAIN}"
-}
-
-acme_cf_preflight() {
+acme_cf_prepare_zone() {
     local domain="$1"
 
     ACME_CF_RESPONSE=""
     ACME_CF_HTTP_STATUS=""
     ACME_CF_ZONE_ID=""
     ACME_CF_ZONE_NAME=""
-    ACME_CF_ZONE_STATUS=""
     ACME_CF_ACCOUNT_ID=""
-    ACME_CF_EXPECTED_NS=""
 
-    acme_cf_verify_token || return 1
-    acme_cf_find_zone "$domain" || return 1
-    acme_cf_check_authoritative_ns || return 1
-    acme_cf_probe_dns_write || return 1
-    echo -e "${GREEN}✓ Cloudflare Token、Zone 权限和权威 NS 前置检查全部通过${PLAIN}"
+    acme_cf_find_zone "$domain"
 }
 
 acme_cf_clean_old_credentials() {
@@ -4315,7 +4144,7 @@ acme_issue_cf_single() {
 
     acme_require_installed || return
     acme_cf_require_dependencies || {
-        echo -e "${RED}Cloudflare API 检查依赖安装失败${PLAIN}"
+        echo -e "${RED}Cloudflare API 依赖安装失败${PLAIN}"
         press_any_key_to_continue
         return
     }
@@ -4326,9 +4155,9 @@ acme_issue_cf_single() {
         press_any_key_to_continue
         return
     fi
-    if ! acme_cf_preflight "$domain"; then
+    if ! acme_cf_prepare_zone "$domain"; then
         ACME_CF_TOKEN=""
-        echo -e "${RED}Cloudflare 前置检查失败，已取消证书申请${PLAIN}"
+        echo -e "${RED}无法获取 Cloudflare Zone，已取消证书申请${PLAIN}"
         press_any_key_to_continue
         return
     fi
@@ -4347,7 +4176,7 @@ acme_issue_cf_wildcard() {
 
     acme_require_installed || return
     acme_cf_require_dependencies || {
-        echo -e "${RED}Cloudflare API 检查依赖安装失败${PLAIN}"
+        echo -e "${RED}Cloudflare API 依赖安装失败${PLAIN}"
         press_any_key_to_continue
         return
     }
@@ -4358,9 +4187,9 @@ acme_issue_cf_wildcard() {
         press_any_key_to_continue
         return
     fi
-    if ! acme_cf_preflight "$domain"; then
+    if ! acme_cf_prepare_zone "$domain"; then
         ACME_CF_TOKEN=""
-        echo -e "${RED}Cloudflare 前置检查失败，已取消证书申请${PLAIN}"
+        echo -e "${RED}无法获取 Cloudflare Zone，已取消证书申请${PLAIN}"
         press_any_key_to_continue
         return
     fi
@@ -8328,28 +8157,18 @@ wireproxy_show_proxy_status() {
 }
 
 wireproxy_show_proxy_trace() {
-    local v4_trace="" v6_trace="" ip4="" ip6="" warp_status="" attempt
+    local v4_trace="" v6_trace="" ip4="" ip6="" warp_status=""
     wireproxy_load_socks_settings
 
     [[ -f "$WIREPROXY_CONF" ]] || { wireproxy_warn "未找到配置文件"; return; }
 
-    for attempt in 1 2 3; do
-        v4_trace="$(wireproxy_fetch_trace_via_proxy_v4 || true)"
-        [[ -n "$v4_trace" ]] && break
-        sleep 1
-    done
+    v4_trace="$(wireproxy_fetch_trace_via_proxy_v4 || true)"
 
     [[ -n "$v4_trace" ]] && ip4="$(wireproxy_trace_value "$v4_trace" "ip")"
 
-    for attempt in 1 2 3; do
-        v6_trace="$(wireproxy_fetch_trace_via_proxy_v6 || true)"
-        [[ -n "$v6_trace" ]] && break
-        sleep 1
-    done
+    v6_trace="$(wireproxy_fetch_trace_via_proxy_v6 || true)"
 
     [[ -n "$v6_trace" ]] && ip6="$(wireproxy_trace_value "$v6_trace" "ip")"
-
-    [[ -z "$ip6" ]] && ip6="$(wireproxy_fetch_ipv6_ip_via_proxy || true)"
 
     [[ -z "$ip4" ]] && ip4="无"
     [[ -z "$ip6" ]] && ip6="无"
@@ -8393,21 +8212,6 @@ wireproxy_fetch_trace_via_proxy_v6() {
     trace="$(curl "${curl_args[@]}" "http://[2606:4700:4700::1111]/cdn-cgi/trace" 2>/dev/null || true)"
     [[ -n "$trace" && "$trace" == *"warp="* ]] || return 1
     printf '%s\n' "$trace"
-}
-
-wireproxy_fetch_ipv6_ip_via_proxy() {
-    local proxy_url ip=""
-    local curl_args=()
-
-    proxy_url="socks5h://${WIREPROXY_SOCKS_BIND}"
-    curl_args=(--proxy "$proxy_url" --connect-timeout 5 --max-time 10 -s https://api6.ipify.org)
-    if [[ -n "$WIREPROXY_SOCKS_USER" ]]; then
-        curl_args+=(--proxy-user "${WIREPROXY_SOCKS_USER}:${WIREPROXY_SOCKS_PASS}")
-    fi
-
-    ip="$(curl "${curl_args[@]}" 2>/dev/null || true)"
-    [[ -n "$ip" && "$ip" == *:* ]] || return 1
-    printf '%s\n' "$ip"
 }
 
 wireproxy_trace_value() {
@@ -9616,7 +9420,7 @@ volto_emit_manager_script() {
 # Surge：https://manual.nssurge.com/policies/masque.html
 # shellcheck disable=SC2016
 
-VOLTO_MANAGER_VERSION="1.0.9"
+VOLTO_MANAGER_VERSION="1.0.11"
 VOLTO_DIR="/etc/volto"
 VOLTO_BIN="/usr/local/bin/volto"
 VOLTO_MANAGER="/usr/local/sbin/volto-manager"
@@ -9629,6 +9433,7 @@ VOLTO_MARKER="volto-manager-v1"
 VOLTO_WORK=""
 VOLTO_NEW=""
 VOLTO_INSTALLING=0
+VOLTO_WRITING=0
 VOLTO_VERSION=""
 VOLTO_ASSET=""
 VOLTO_URL=""
@@ -9815,7 +9620,7 @@ get_arch() {
     esac
 }
 
-curl_get() { curl -fsSL --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 180 --retry 2 "$@"; }
+curl_get() { curl -fsSL --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 180 "$@"; }
 
 prepare_release() {
     local release arch tag
@@ -10107,21 +9912,17 @@ config_consistent() {
 }
 
 service_healthy() {
-    local revision="$1" port pid sockets i family=inet previous_pid='' stable=0
+    local revision="$1" port pid sockets i family=inet
     port=$(jq -er '.port' "$revision/settings.json") || return 1
     [[ "$(jq -r '.listen_address' "$revision/settings.json")" == '[::]' ]] && family=inet6
     for ((i=0; i<12; i++)); do
-        sleep 1
         if systemctl is-active --quiet "$VOLTO_SERVICE" &&
             pid=$(systemctl show -p MainPID --value "$VOLTO_SERVICE") &&
             [[ "$pid" =~ ^[1-9][0-9]*$ ]] &&
             sockets=$(ss -H -lunp -f "$family" "sport = :$port") && [[ "$sockets" == *"pid=$pid,"* ]]; then
-            if [[ "$pid" == "$previous_pid" ]]; then stable=$((stable + 1)); else stable=1; fi
-            previous_pid="$pid"
-            (( stable >= 4 )) && return 0
-        else
-            previous_pid=''; stable=0
+            return 0
         fi
+        (( i < 11 )) && sleep 1
     done
     return 1
 }
@@ -10168,12 +9969,12 @@ apply_revision() {
     if [[ "$binary" != "$VOLTO_BIN" ]] && ! cp -- "$VOLTO_BIN" "$tx/volto"; then rm -rf -- "$tx"; return 1; fi
     touch "$tx/ready" || { rm -rf -- "$tx"; return 1; }
     if [[ "$binary" != "$VOLTO_BIN" ]] && ! atomic_install "$binary" "$VOLTO_BIN" 755; then
-        recover_transaction; return 1
+        return 1
     fi
-    if ! atomic_link "$revision"; then recover_transaction; return 1; fi
+    atomic_link "$revision" || return 1
     if (( active )) && ! { systemctl restart "$VOLTO_SERVICE" && service_healthy "$revision"; }; then
         error '应用后服务未正常监听，回滚本次变更。'
-        recover_transaction; return 1
+        return 1
     fi
     rm -f -- "$tx/ready" || return 1
     rm -rf -- "$tx" || return 1
@@ -10514,15 +10315,7 @@ discard_revision() {
 }
 
 after_action() {
-    local result="$1"
-    if (( VOLTO_INSTALLING )); then
-        cleanup_install || { error '首次安装未能完全撤销，已停止后续操作，请检查 /etc/volto。'; exit 1; }
-    fi
-    if [[ -f "$VOLTO_DIR/.transaction/ready" ]]; then
-        recover_transaction || { error '自动恢复未成功，停止后续操作并保留备份。'; exit 1; }
-    fi
-    discard_revision
-    (( result == 0 )) || warn '本次操作未完成。'
+    (( $1 == 0 )) || warn '本次操作未完成。'
     pause_menu
 }
 
@@ -10536,8 +10329,8 @@ config_menu() {
             '6. 从原路径同步已续期证书' '0. 返回上级'
         read -r -p "$(prompt_text '✦ Steins Gate ✦ : ')" option || return 0
         case "$option" in
-            1) modify_port;; 2) manage_users;; 3) modify_certificate;; 4) modify_endpoint;;
-            5) modify_transport;; 6) renew_certificate;; 0) return 0;; *) warn '无效选项。'; continue;;
+            1) run_action modify_port;; 2) run_action manage_users;; 3) run_action modify_certificate;; 4) run_action modify_endpoint;;
+            5) run_action modify_transport;; 6) run_action renew_certificate;; 0) return 0;; *) warn '无效选项。'; continue;;
         esac
         after_action "$?"
     done
@@ -10554,9 +10347,9 @@ service_menu() {
             '7. 查看最近日志' '8. 检查配置及证书' '0. 返回主页'
         read -r -p "$(prompt_text '✦ Steins Gate ✦ : ')" option || return 0
         case "$option" in
-            1) show_status;; 2) config_menu; continue;; 3) service_action stop;;
-            4) service_action restart;; 5) service_action start;; 6) show_surge;;
-            7) journalctl -u "$VOLTO_SERVICE" -n 80 --no-pager;; 8) check_install;;
+            1) run_action show_status;; 2) config_menu; continue;; 3) run_action service_action stop;;
+            4) run_action service_action restart;; 5) run_action service_action start;; 6) run_action show_surge;;
+            7) journalctl -u "$VOLTO_SERVICE" -n 80 --no-pager;; 8) run_action check_install;;
             0) return 0;; *) warn '无效选项。'; continue;;
         esac
         after_action "$?"
@@ -10571,10 +10364,10 @@ main_menu() {
         menu_items '1. 安装服务' '2. 管理服务' '3. 更新内核' '4. 删除服务' "${VOLTO_EXIT_TEXT:-0. 退出脚本}"
         read -r -p "$(prompt_text '✦ Steins Gate ✦ : ')" option || return 0
         case "$option" in
-            1) install_service;;
+            1) run_action install_service;;
             2) if require_install; then service_menu; continue; fi; false;;
-            3) update_core;;
-            4) uninstall_service;; 0) return 0;; *) warn '无效选项。'; continue;;
+            3) run_action update_core;;
+            4) run_action uninstall_service;; 0) return 0;; *) warn '无效选项。'; continue;;
         esac
         after_action "$?"
     done
@@ -10597,14 +10390,41 @@ dependencies() {
 finish() {
     local result=$?
     trap - EXIT INT TERM HUP
-    if (( VOLTO_INSTALLING )); then cleanup_install || result=1; fi
-    if [[ -f "$VOLTO_DIR/.transaction/ready" ]]; then recover_transaction || result=1; fi
-    if (( VOLTO_INSTALLING == 0 )); then discard_revision || result=1; fi
+    if (( VOLTO_WRITING )); then
+        if (( VOLTO_INSTALLING )); then cleanup_install || result=1; fi
+        if [[ -f "$VOLTO_DIR/.transaction/ready" ]]; then recover_transaction || result=1; fi
+        if (( VOLTO_INSTALLING == 0 )); then discard_revision || result=1; fi
+        flock -u 9 || result=1
+    fi
     if [[ "$VOLTO_WORK" == /tmp/volto-manager.* && -d "$VOLTO_WORK" && ! -L "$VOLTO_WORK" ]]; then
         rm -rf -- "$VOLTO_WORK"
     fi
     exit "$result"
 }
+
+run_action() (
+    case "$1" in
+        show_status|show_surge|check_install) ;;
+        *)
+            [[ ! -L /run/lock/volto-manager.lock ]] || return 1
+            exec 9>/run/lock/volto-manager.lock || return 1
+            flock -n 9 || { error '另一个窗口正在修改，请稍后再试。'; return 1; }
+            VOLTO_WRITING=1
+            ;;
+    esac
+    if (( VOLTO_WRITING )) && is_managed && [[ -d "$VOLTO_DIR/.transaction" ]]; then
+        if [[ -f "$VOLTO_DIR/.transaction/ready" ]]; then recover_transaction || return 1
+        else rm -rf -- "$VOLTO_DIR/.transaction" || return 1
+        fi
+    fi
+    VOLTO_WORK=$(mktemp -d /tmp/volto-manager.XXXXXXXX) || return 1
+    trap finish EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+    if (( VOLTO_WRITING )); then refresh_manager || return 1; fi
+    "$@"
+)
 
 main() {
     local action="${1:---menu}"
@@ -10623,23 +10443,9 @@ main() {
     export LC_ALL=C.UTF-8
     if [[ -t 2 ]]; then RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[0;33m'; BLUE=$'\033[0;34m'; PLAIN=$'\033[0m'; fi
     dependencies || return 1
-    [[ ! -L /run/lock/volto-manager.lock ]] || return 1
-    exec 9>/run/lock/volto-manager.lock || return 1
-    flock -n 9 || { error '另一个管理操作正在运行，请稍后再试。'; return 1; }
-    VOLTO_WORK=$(mktemp -d /tmp/volto-manager.XXXXXXXX) || return 1
-    trap finish EXIT
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
-    trap 'exit 129' HUP
-    if is_managed && [[ -d "$VOLTO_DIR/.transaction" ]]; then
-        if [[ -f "$VOLTO_DIR/.transaction/ready" ]]; then recover_transaction || return 1
-        else rm -rf -- "$VOLTO_DIR/.transaction" || return 1
-        fi
-    fi
-    refresh_manager || return 1
     case "$action" in
-        --menu) main_menu;; --status) show_status;; --show-surge) show_surge;;
-        --check) check_install;; --renew-cert) renew_certificate;;
+        --menu) main_menu;; --status) run_action show_status;; --show-surge) run_action show_surge;;
+        --check) run_action check_install;; --renew-cert) run_action renew_certificate;;
     esac
 }
 
