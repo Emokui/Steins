@@ -1,5 +1,6 @@
 DOMAIN,api.segment.io
 DOMAIN,ep2.facebook.com
+DOMAIN-SUFFIX,adzerk.net
 DOMAIN,graph.facebook.com
 DOMAIN,connect.facebook.net
 DOMAIN,analytics.adjust.io
