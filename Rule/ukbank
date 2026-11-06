@@ -15,19 +15,18 @@ IP-CIDR,185.153.236.0/22,no-resolve
 IP-CIDR,148.252.160.0/19,no-resolve
 # Apple
 DOMAIN,gspe1-ssl.ls.apple.com
+DOMAIN-SUFFIX,co.uk
 # Zopa
 DOMAIN-KEYWORD,zopa
 DOMAIN-SUFFIX,zopa.com
 DOMAIN,assets.thisisbud.com
-# Trading212
-DOMAIN,ticketshack.com
-DOMAIN-KEYWORD,trading212
-DOMAIN,content.ethoca.com
-DOMAIN-SUFFIX,trading212.com
-DOMAIN,eu1.clevertap-prod.com
-DOMAIN,d1o59w04t0rrym.cloudfront.net
-DOMAIN,d14vqntc8kjril.cloudfront.net
-DOMAIN,trading212equities.s3.eu-central-1.amazonaws.com
+# Monzo
+USER-AGENT,Monzo*
+DOMAIN-KEYWORD,monzo
+DOMAIN-SUFFIX,monzo.com
+DOMAIN,monzo.statuspage.io
+DOMAIN,sdk.fra-01.braze.eu
+DOMAIN-SUFFIX,monzo-alt.net
 # Sumup
 DOMAIN-KEYWORD,sumup
 DOMAIN-SUFFIX,sumup.io
@@ -36,18 +35,23 @@ DOMAIN-SUFFIX,sumup.com
 DOMAIN,api.eu.iterable.com
 DOMAIN,sumup-92784.zendesk.com
 DOMAIN,pod-31-sunco-ws.zendesk.com
-# Uphold
-DOMAIN,cdp.customer.io
-DOMAIN-SUFFIX,uphold.com
-DOMAIN,uphold.zendesk.com
-DOMAIN,images.cryptocompare.com
-DOMAIN,consumer.inapp.customer.io
-DOMAIN,ios.us-east2.aws.oscilar.com
-DOMAIN,browser-http-intake.logs.datadoghq.com
-DOMAIN,uphold-reports-production.s3.us-east-1.amazonaws.com
+# Hsbc
+DOMAIN-KEYWORD,hsbc
+DOMAIN,api.zaius.com
+DOMAIN,tags.tiqcdn.com
+DOMAIN-SUFFIX,hsbc.co.uk
+DOMAIN,cdn.optimizely.com
+DOMAIN,accdn.lpsnmedia.net
+DOMAIN-SUFFIX,tealiumiq.com
+DOMAIN-SUFFIX,zimperium.com
+DOMAIN-SUFFIX,liveperson.net
+DOMAIN,lpcdn-vip.lpsnmedia.net
+DOMAIN-SUFFIX,online-metrix.net
+DOMAIN,mobile.eum-appdynamics.com
+DOMAIN,log-beed83c9.eu.v2.we-stats.com
+DOMAIN-SUFFIX,vam-uk.cloud1.vv1865.com
 # Zilch
 DOMAIN,u.expo.dev
-DOMAIN-KEYWORD,zilch
 DOMAIN,apps.rokt.com
 DOMAIN,intercom-help.eu
 DOMAIN,assets.eascdn.net
@@ -65,12 +69,24 @@ DOMAIN,browser-intake-datadoghq.eu
 DOMAIN,nexus-europe-websocket.intercom.io
 DOMAIN-SUFFIX,mobile-messenger.eu.intercom.io
 DOMAIN,vgs-collect-keeper.apps.verygood.systems
-# Monzo
-DOMAIN-KEYWORD,monzo
-DOMAIN-SUFFIX,monzo.com
-DOMAIN,monzo.statuspage.io
-DOMAIN,sdk.fra-01.braze.eu
-DOMAIN-SUFFIX,monzo-alt.net
+# Trading212
+DOMAIN,ticketshack.com
+DOMAIN-KEYWORD,trading212
+DOMAIN,content.ethoca.com
+DOMAIN-SUFFIX,trading212.com
+DOMAIN,eu1.clevertap-prod.com
+DOMAIN,d1o59w04t0rrym.cloudfront.net
+DOMAIN,d14vqntc8kjril.cloudfront.net
+DOMAIN,trading212equities.s3.eu-central-1.amazonaws.com
+# Uphold
+DOMAIN,cdp.customer.io
+DOMAIN-SUFFIX,uphold.com
+DOMAIN,uphold.zendesk.com
+DOMAIN,images.cryptocompare.com
+DOMAIN,consumer.inapp.customer.io
+DOMAIN,ios.us-east2.aws.oscilar.com
+DOMAIN,browser-http-intake.logs.datadoghq.com
+DOMAIN,uphold-reports-production.s3.us-east-1.amazonaws.com
 # Paypal
 DOMAIN,edge.paypal-ads.com
 DOMAIN,3.datadog.pool.ntp.org
