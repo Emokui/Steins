@@ -28,12 +28,9 @@ DOMAIN,bunq-prod-model-storage-public.s3.eu-central-1.amazonaws.com
 # N26
 DOMAIN-KEYWORD,n26
 DOMAIN-SUFFIX,n26.com
-DOMAIN-SUFFIX,braze.eu
 DOMAIN,cdn.number26.de
 DOMAIN-SUFFIX,tech26.de
 DOMAIN,cdn.dev-tech26.de
-DOMAIN,featureassets.org
-DOMAIN,prodregistryv2.org
 DOMAIN-SUFFIX,bugsnag.com
 DOMAIN,images.ctfassets.net
 DOMAIN-SUFFIX,usercentrics.eu
