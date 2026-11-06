@@ -69,6 +69,7 @@ DOMAIN,vgs-collect-keeper.apps.verygood.systems
 DOMAIN-KEYWORD,monzo
 DOMAIN-SUFFIX,monzo.com
 DOMAIN,monzo.statuspage.io
+DOMAIN,sdk.fra-01.braze.eu
 DOMAIN-SUFFIX,monzo-alt.net
 # Paypal
 DOMAIN,edge.paypal-ads.com
