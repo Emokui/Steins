@@ -1,4 +1,15 @@
-DOMAIN,venmo.s3.amazonaws.com
+DOMAIN,edge.paypal-ads.com
+DOMAIN,3.datadog.pool.ntp.org
+DOMAIN,api-sdk.datadome.co
+DOMAIN,assets.adobedtm.com
+DOMAIN,browser-intake-us5-datadoghq.com
+DOMAIN,cdn.joinhoney.com
+DOMAIN,featureassets.org
+DOMAIN,fraud-api.dyneti.com
+DOMAIN,mobile-protect-api.securetheorem.com
+DOMAIN,prodregistryv2.org
+DOMAIN,s.zkcdn.net
+DOMAIN,static.captcha-delivery.com
 DOMAIN-SUFFIX,account-paypal.info
 DOMAIN-SUFFIX,account-paypal.net
 DOMAIN-SUFFIX,account-paypal.org
