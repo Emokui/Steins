@@ -1,6 +1,7 @@
 DOMAIN,api.segment.io
 DOMAIN,ep2.facebook.com
 DOMAIN-SUFFIX,adzerk.net
+DOMAIN-SUFFIX,ip-api.com
 DOMAIN,graph.facebook.com
 DOMAIN,connect.facebook.net
 DOMAIN,analytics.adjust.io
@@ -9,5 +10,6 @@ DOMAIN,inapps.appsflyer.com
 DOMAIN,gcdsdk.appsflyer.com
 DOMAIN,launches.appsflyer.com
 DOMAIN,app-analytics-services.com
+DOMAIN-SUFFIX,order.luckydogsoft.com
 DOMAIN,crashlyticsreports-pa.googleapis.com
 AND,((OR,((DEST-PORT,3478), (DEST-PORT,19302))), (PROTOCOL,UDP))
