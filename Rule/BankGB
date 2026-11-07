@@ -1,5 +1,6 @@
 DOMAIN-SUFFIX,co.uk
 # Zopa
+USER-AGENT,zopa*
 DOMAIN-KEYWORD,zopa
 DOMAIN-SUFFIX,zopa.com
 DOMAIN,assets.thisisbud.com
@@ -19,6 +20,7 @@ DOMAIN,api.eu.iterable.com
 DOMAIN,sumup-92784.zendesk.com
 DOMAIN,pod-31-sunco-ws.zendesk.com
 # Chase
+USER-AGENT,chase*
 DOMAIN-KEYWORD,chase
 DOMAIN,auth.split.io
 DOMAIN-SUFFIX,chase.co.uk
@@ -33,6 +35,7 @@ DOMAIN,qktjjz.launches.appsflyersdk.com
 DOMAIN,qktjjz.skadsdkless.appsflyersdk.com
 DOMAIN,qktjjz.cdn-settings.appsflyersdk.com
 # Hsbc
+USER-AGENT,hsbc*
 DOMAIN-KEYWORD,hsbc
 DOMAIN,api.zaius.com
 DOMAIN,tags.tiqcdn.com
@@ -48,7 +51,9 @@ DOMAIN,mobile.eum-appdynamics.com
 DOMAIN,log-beed83c9.eu.v2.we-stats.com
 DOMAIN-SUFFIX,vam-uk.cloud1.vv1865.com
 # Zilch
+USER-AGENT,zilch*
 DOMAIN,u.expo.dev
+DOMAIN-KEYWORD,zilch
 DOMAIN,apps.rokt.com
 DOMAIN,intercom-help.eu
 DOMAIN,assets.eascdn.net
@@ -66,7 +71,38 @@ DOMAIN,browser-intake-datadoghq.eu
 DOMAIN,nexus-europe-websocket.intercom.io
 DOMAIN-SUFFIX,mobile-messenger.eu.intercom.io
 DOMAIN,vgs-collect-keeper.apps.verygood.systems
+# Yonder
+DOMAIN-SUFFIX,yondercard.com
+DOMAIN-KEYWORD,yonder
+DOMAIN,www.yonder.com
+DOMAIN,u.expo.dev
+USER-AGENT,yonder*
+DOMAIN,cdn.branch.io
+DOMAIN,api3.branch.io
+DOMAIN,api.eu.sardine.ai
+DOMAIN,p.eu.sardine.ai
+DOMAIN,3mqszj41v3hp94de2q26lwx4qd58ztmu.d.eu.sardine.ai
+DOMAIN,4ckuv80aczgmhv5tggnafzvmb8z1b4yc.d.eu.sardine.ai
+DOMAIN,nexus-europe-websocket.intercom.io
+DOMAIN,tcqe0qwu-ios.mobile-messenger.eu.intercom.io
+DOMAIN,www.datocms-assets.com
+DOMAIN,graphql.datocms.com
+DOMAIN,cdn-settings.segment.com
+DOMAIN,api.segment.io
+DOMAIN,cdn.honey.io
+DOMAIN,s.joinhoney.com
+DOMAIN,d.joinhoney.com
+DOMAIN,cdn.prod.website-files.com
+DOMAIN,m.stripe.com
+DOMAIN,o4507463578615808.ingest.de.sentry.io
+DOMAIN,sdk.fra-01.braze.eu
+DOMAIN,stream.mux.com
+DOMAIN,unpkg.com
+DOMAIN,use.typekit.net
+DOMAIN,widgets-sandbox.marqeta.com
+DOMAIN,widgets.marqeta.com
 # Krak
+USER-AGENT,krak*
 DOMAIN,u.expo.dev
 DOMAIN-KEYWORD,krak
 DOMAIN-KEYWORD,kraken
