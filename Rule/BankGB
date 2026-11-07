@@ -18,6 +18,20 @@ DOMAIN-SUFFIX,sumup.com
 DOMAIN,api.eu.iterable.com
 DOMAIN,sumup-92784.zendesk.com
 DOMAIN,pod-31-sunco-ws.zendesk.com
+# Chase
+DOMAIN-KEYWORD,chase
+DOMAIN,auth.split.io
+DOMAIN-SUFFIX,chase.co.uk
+DOMAIN,streaming.split.io
+DOMAIN,events.backtrace.io
+DOMAIN,sdk-02.moengage.com
+DOMAIN,config2.mparticle.com
+DOMAIN,identity.mparticle.com
+DOMAIN,nativesdks.mparticle.com
+DOMAIN,qktjjz.inapps.appsflyersdk.com
+DOMAIN,qktjjz.launches.appsflyersdk.com
+DOMAIN,qktjjz.skadsdkless.appsflyersdk.com
+DOMAIN,qktjjz.cdn-settings.appsflyersdk.com
 # Hsbc
 DOMAIN-KEYWORD,hsbc
 DOMAIN,api.zaius.com
