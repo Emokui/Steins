@@ -114,30 +114,27 @@
         const r = Object.entries(e.headers ?? {}).find(([e]) => "content-length" === e.toLowerCase())?.[1];
         if (Number(r) > 0) throw new Error("YouTube request body unavailable; requires-body must be enabled");
     }
-    function g() {
-        return {
-            response: {
-                status: 200,
-                headers: {
-                    "Content-Type": "application/x-protobuf"
-                },
-                body: new Uint8Array
-            }
-        };
-    }
     !function() {
-        let d;
         try {
-            let y;
-            if (d = $request.url.split("?")[0], d.endsWith("/player/ad_break")) y = g(); else if (d.endsWith("/initplayback")) {
+            const g = $request.url.split("?")[0];
+            let d;
+            if (g.endsWith("/player/ad_break")) d = {
+                response: {
+                    status: 200,
+                    headers: {
+                        "Content-Type": "application/x-protobuf"
+                    },
+                    body: new Uint8Array
+                }
+            }; else if (g.endsWith("/initplayback")) {
                 if ("GET" !== $request.method && "HEAD" !== $request.method) {
                     const s = l($request);
-                    if (y = function(r, o) {
-                        if (void 0 === r || 0 === r.length) return;
-                        const i = t()[o], s = f(r, 3), u = s && f(s, 5);
-                        if (!u?.length) return g();
-                        for (const e of (a = i) ? [ a, ...Array.isArray(a.previous) ? a.previous.slice(0, 3) : [] ].filter(e => e && "string" == typeof e.clientKey && "string" == typeof e.encryptKey && e.clientKey.length > 0 && e.clientKey.length <= 5500 && e.encryptKey.length > 0 && e.encryptKey.length <= 5500) : []) try {
-                            if (n(u, c(e.encryptKey))) return;
+                    if (s?.length && function(r, o) {
+                        const i = f(r, 3), s = i && f(i, 5);
+                        if (!s?.length) return !1;
+                        const u = t()[o];
+                        for (const e of (a = u) ? [ a, ...Array.isArray(a.previous) ? a.previous.slice(0, 3) : [] ].filter(e => e && "string" == typeof e.clientKey && "string" == typeof e.encryptKey && e.clientKey.length > 0 && e.clientKey.length <= 5500 && e.encryptKey.length > 0 && e.encryptKey.length <= 5500) : []) try {
+                            if (n(s, c(e.encryptKey))) return !0;
                         } catch {}
                         var a;
                         return function(r, n) {
@@ -148,20 +145,20 @@
                             JSON.stringify(i) === JSON.stringify(s) && (delete o[r], function(t, r = e) {
                                 $persistentStore.write(JSON.stringify(t), r);
                             }(o));
-                        }(o, i), g();
-                    }(s, a($request)), !y && s?.length && !1 !== u().autoHd) {
+                        }(o, u), !1;
+                    }(s, a($request)) && !1 !== u().autoHd) {
                         const e = function(e) {
                             const t = i(e), n = t.filter(e => 2 === e.no && 2 === e.wire);
                             if (1 !== n.length) return e;
                             const s = n[0], u = h(s.data, void 0);
                             return u === s.data ? e : r(t.map(e => e === s ? r([ o(18), o(u.length), u ]) : e.raw));
                         }(s);
-                        e !== s && (y = {
+                        e !== s && (d = {
                             body: e
                         });
                     }
                 }
-            } else if (d.endsWith("/videoplayback")) {
+            } else if (g.endsWith("/videoplayback")) {
                 const e = !1 === u().autoHd ? void 0 : l($request);
                 if (e?.length) {
                     const u = function(e, u) {
@@ -207,14 +204,14 @@
                         if (g) for (const e of c.formats) d.push(o(138), o(e.length), e);
                         return p ? r(d) : e;
                     }(e, $request.url);
-                    u !== e && (y = {
+                    u !== e && (d = {
                         body: u
                     });
                 }
             }
-            $done(y);
+            $done(d);
         } catch {
-            d?.endsWith("/initplayback") ? $done(g()) : $done();
+            $done();
         }
     }();
 })();
