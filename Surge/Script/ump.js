@@ -1097,13 +1097,7 @@
                     }(A));
                 }(A, C);
             } catch {}
-            $done({
-                status: 200,
-                headers: {
-                    "Content-Type": "text/plain"
-                },
-                body: new Uint8Array
-            });
+            $done();
         }
         var t, n;
     }();
