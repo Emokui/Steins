@@ -1,7 +1,6 @@
 # Nerverless
 DOMAIN-SUFFIX,neverless.com
 # Bunq
-DOMAIN-KEYWORD,bunq
 DOMAIN-SUFFIX,bunq.com
 DOMAIN,ota.lokalise.com
 DOMAIN-SUFFIX,eu.sardine.ai
@@ -10,8 +9,8 @@ DOMAIN-SUFFIX,eu.amplitude.com
 DOMAIN,ota-bundles.lokalise.com
 DOMAIN-SUFFIX,app-ads-services.com
 DOMAIN,bunq-prod-model-storage-public.s3.eu-central-1.amazonaws.com
+DOMAIN-KEYWORD,bunq
 # N26
-DOMAIN-KEYWORD,n26
 DOMAIN-SUFFIX,n26.com
 DOMAIN,cdn.number26.de
 DOMAIN-SUFFIX,tech26.de
@@ -20,6 +19,7 @@ DOMAIN-SUFFIX,bugsnag.com
 DOMAIN,images.ctfassets.net
 DOMAIN-SUFFIX,usercentrics.eu
 DOMAIN,beyondwickedmapping.org
+DOMAIN-KEYWORD,n26
 # Coinbase
 DOMAIN,api.sprig.com
 DOMAIN,icanhazip.com
@@ -33,6 +33,7 @@ DOMAIN-SUFFIX,cloudinary.com
 DOMAIN-SUFFIX,datadog.pool.ntp.org
 DOMAIN,d1dwhf283nul1c.cloudfront.net
 DOMAIN,asset-metadata-service-production.s3.amazonaws.com
+DOMAIN-KEYWORD,coinbase
 # Satispay
 DOMAIN,lhhaad.skadsdkless.appsflyersdk.com
 DOMAIN,lhhaad.launches.appsflyersdk.com
@@ -43,3 +44,26 @@ DOMAIN-SUFFIX,ingest.de.sentry.io
 DOMAIN-SUFFIX,eu.amplitude.com
 DOMAIN-SUFFIX,satispay.com
 DOMAIN-KEYWORD,satispay
+# Transfergo
+DOMAIN,sdk.split.io
+DOMAIN,auth.split.io
+DOMAIN,events.split.io
+DOMAIN,ota.lokalise.com
+DOMAIN,streaming.split.io
+DOMAIN,gs.eu.amplitude.com
+DOMAIN,sdk.fra-02.braze.eu
+DOMAIN,dust.fra-02.braze.eu
+DOMAIN-SUFFIX,transfergo.com
+DOMAIN,3.datadog.pool.ntp.org
+DOMAIN,transfergo.zendesk.com
+DOMAIN,api.lab.eu.amplitude.com
+DOMAIN,browser-intake-datadoghq.com
+DOMAIN,pod-18-sunco-ws.zendesk.com
+DOMAIN,sr-client-cfg.eu.amplitude.com
+DOMAIN-KEYWORD,transfergo
+# Vodafone
+DOMAIN-SUFFIX,epdg.epc.mnc003.mcc262.pub.3gppnetwork.org
+DOMAIN-SUFFIX,epdg.epc.mnc002.mcc262.pub.3gppnetwork.org
+IP-CIDR,139.7.117.168/30,no-resolve
+IP-CIDR,213.20.0.0/16,no-resolve
+IP-CIDR,62.52.0.0/16,no-resolve
