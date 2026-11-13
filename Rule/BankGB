@@ -7,28 +7,27 @@ IP-CIDR,88.82.0.0/19,no-resolve
 # All
 DOMAIN-SUFFIX,co.uk
 # Zopa
-USER-AGENT,zopa*
-DOMAIN-KEYWORD,zopa
 DOMAIN-SUFFIX,zopa.com
 DOMAIN,assets.thisisbud.com
+DOMAIN-KEYWORD,zopa
+USER-AGENT,zopa*
 # Monzo
-USER-AGENT,Monzo*
-DOMAIN-KEYWORD,monzo
 DOMAIN-SUFFIX,monzo.com
 DOMAIN,monzo.statuspage.io
 DOMAIN,sdk.fra-01.braze.eu
 DOMAIN-SUFFIX,monzo-alt.net
+DOMAIN-KEYWORD,monzo
+USER-AGENT,Monzo*
 # Sumup
-DOMAIN-KEYWORD,sumup
 DOMAIN-SUFFIX,sumup.io
 DOMAIN-SUFFIX,sumup.net
 DOMAIN-SUFFIX,sumup.com
 DOMAIN,api.eu.iterable.com
 DOMAIN,sumup-92784.zendesk.com
 DOMAIN,pod-31-sunco-ws.zendesk.com
+DOMAIN-KEYWORD,sumup
+USER-AGENT,sumup*
 # Chase
-USER-AGENT,chase*
-DOMAIN-KEYWORD,chase
 DOMAIN,auth.split.io
 DOMAIN-SUFFIX,chase.co.uk
 DOMAIN,streaming.split.io
@@ -41,9 +40,9 @@ DOMAIN,qktjjz.inapps.appsflyersdk.com
 DOMAIN,qktjjz.launches.appsflyersdk.com
 DOMAIN,qktjjz.skadsdkless.appsflyersdk.com
 DOMAIN,qktjjz.cdn-settings.appsflyersdk.com
+DOMAIN-KEYWORD,chase
+USER-AGENT,chase*
 # Hsbc
-USER-AGENT,hsbc*
-DOMAIN-KEYWORD,hsbc
 DOMAIN,api.zaius.com
 DOMAIN,tags.tiqcdn.com
 DOMAIN-SUFFIX,hsbc.co.uk
@@ -56,11 +55,11 @@ DOMAIN,lpcdn-vip.lpsnmedia.net
 DOMAIN-SUFFIX,online-metrix.net
 DOMAIN,mobile.eum-appdynamics.com
 DOMAIN,log-beed83c9.eu.v2.we-stats.com
-DOMAIN-SUFFIX,vam-uk.cloud1.vv1865.com
+DOMAIN-SUFFIX,vam-uk.cloud1.vv1865.com、
+DOMAIN-KEYWORD,hsbc
+USER-AGENT,hsbc*
 # Zilch
-USER-AGENT,zilch*
 DOMAIN,u.expo.dev
-DOMAIN-KEYWORD,zilch
 DOMAIN,apps.rokt.com
 DOMAIN,intercom-help.eu
 DOMAIN,assets.eascdn.net
@@ -78,41 +77,40 @@ DOMAIN,browser-intake-datadoghq.eu
 DOMAIN,nexus-europe-websocket.intercom.io
 DOMAIN-SUFFIX,mobile-messenger.eu.intercom.io
 DOMAIN,vgs-collect-keeper.apps.verygood.systems
+DOMAIN-KEYWORD,zilch
+USER-AGENT,zilch*
 # Yonder
-DOMAIN-SUFFIX,yondercard.com
-DOMAIN-KEYWORD,yonder
-DOMAIN,www.yonder.com
+DOMAIN,unpkg.com
 DOMAIN,u.expo.dev
-USER-AGENT,yonder*
+DOMAIN,m.stripe.com
+DOMAIN,cdn.honey.io
 DOMAIN,cdn.branch.io
 DOMAIN,api3.branch.io
-DOMAIN,api.eu.sardine.ai
 DOMAIN,p.eu.sardine.ai
-DOMAIN,3mqszj41v3hp94de2q26lwx4qd58ztmu.d.eu.sardine.ai
-DOMAIN,4ckuv80aczgmhv5tggnafzvmb8z1b4yc.d.eu.sardine.ai
-DOMAIN,nexus-europe-websocket.intercom.io
-DOMAIN,tcqe0qwu-ios.mobile-messenger.eu.intercom.io
-DOMAIN,www.datocms-assets.com
-DOMAIN,graphql.datocms.com
-DOMAIN,cdn-settings.segment.com
-DOMAIN,api.segment.io
-DOMAIN,cdn.honey.io
 DOMAIN,s.joinhoney.com
 DOMAIN,d.joinhoney.com
-DOMAIN,cdn.prod.website-files.com
-DOMAIN,m.stripe.com
-DOMAIN,o4507463578615808.ingest.de.sentry.io
-DOMAIN,sdk.fra-01.braze.eu
+DOMAIN,api.segment.io
 DOMAIN,stream.mux.com
-DOMAIN,unpkg.com
+DOMAIN,www.yonder.com
 DOMAIN,use.typekit.net
-DOMAIN,widgets-sandbox.marqeta.com
+DOMAIN,api.eu.sardine.ai
+DOMAIN,graphql.datocms.com
 DOMAIN,widgets.marqeta.com
+DOMAIN,sdk.fra-01.braze.eu
+DOMAIN-SUFFIX,yondercard.com
+DOMAIN,www.datocms-assets.com
+DOMAIN,cdn-settings.segment.com
+DOMAIN,cdn.prod.website-files.com
+DOMAIN,widgets-sandbox.marqeta.com
+DOMAIN,nexus-europe-websocket.intercom.io
+DOMAIN,o4507463578615808.ingest.de.sentry.io
+DOMAIN,tcqe0qwu-ios.mobile-messenger.eu.intercom.io
+DOMAIN,3mqszj41v3hp94de2q26lwx4qd58ztmu.d.eu.sardine.ai
+DOMAIN,4ckuv80aczgmhv5tggnafzvmb8z1b4yc.d.eu.sardine.ai
+DOMAIN-KEYWORD,yonder
+USER-AGENT,yonder*
 # Krak
-USER-AGENT,krak*
 DOMAIN,u.expo.dev
-DOMAIN-KEYWORD,krak
-DOMAIN-KEYWORD,kraken
 DOMAIN-SUFFIX,krak.app
 DOMAIN-SUFFIX,kraken.com
 DOMAIN-SUFFIX,stripe.com
@@ -123,15 +121,18 @@ DOMAIN-SUFFIX,launchdarkly.com
 DOMAIN-SUFFIX,appsflyersdk.com
 DOMAIN,cdn-settings.segment.com
 DOMAIN-SUFFIX,eu1.fullstory.com
+DOMAIN-KEYWORD,krak
+USER-AGENT,krak*
 # Trading212
 DOMAIN,ticketshack.com
-DOMAIN-KEYWORD,trading212
 DOMAIN,content.ethoca.com
 DOMAIN-SUFFIX,trading212.com
 DOMAIN,eu1.clevertap-prod.com
 DOMAIN,d1o59w04t0rrym.cloudfront.net
 DOMAIN,d14vqntc8kjril.cloudfront.net
 DOMAIN,trading212equities.s3.eu-central-1.amazonaws.com
+DOMAIN-KEYWORD,trading212
+USER-AGENT,trading212*
 # Uphold
 DOMAIN,cdp.customer.io
 DOMAIN-SUFFIX,uphold.com
@@ -141,6 +142,8 @@ DOMAIN,consumer.inapp.customer.io
 DOMAIN,ios.us-east2.aws.oscilar.com
 DOMAIN,browser-http-intake.logs.datadoghq.com
 DOMAIN,uphold-reports-production.s3.us-east-1.amazonaws.com
+DOMAIN-KEYWORD,uphold
+USER-AGENT,uphold*
 # Paypal
 DOMAIN,edge.paypal-ads.com
 DOMAIN,3.datadog.pool.ntp.org
