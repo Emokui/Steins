@@ -9420,7 +9420,7 @@ volto_emit_manager_script() {
 # Surge：https://manual.nssurge.com/policies/masque.html
 # shellcheck disable=SC2016
 
-VOLTO_MANAGER_VERSION="1.0.13"
+VOLTO_MANAGER_VERSION="1.0.14"
 VOLTO_SOURCE="${BASH_SOURCE[0]}"
 VOLTO_DIR="/etc/volto"
 VOLTO_BIN="/usr/local/bin/volto"
@@ -10099,7 +10099,7 @@ install_service() {
         --arg username "$username" --arg cc "$congestion" --rawfile password "$VOLTO_WORK/password" \
         '{schema:1,port:$port,endpoint:$endpoint,listen_address:"[::]",
           sni:"volto.internal",certificate_mode:"selfsigned",verify_mode:"pin",cert_source:"",key_source:"",
-          users:[{username:$username,password:$password}],congestion_control:$cc,mtu_upper_bound:1436,ip_family_preference:"system",max_connections:256}' \
+          users:[{username:$username,password:$password}],congestion_control:$cc,mtu_upper_bound:1436,ip_family_preference:"ipv4",max_connections:256}' \
         > "$VOLTO_WORK/settings.json" || return 1
     choose_certificate "$VOLTO_WORK/settings.json" || return 1
     install -d -m 750 "$VOLTO_DIR" || return 1
@@ -10264,7 +10264,7 @@ modify_transport() {
     congestion=$(choose_congestion "$congestion") || return 1
     family=$(jq -er '.ip_family_preference' "$old/settings.json") || return 1
     case "$family" in system) default=1;; ipv4) default=2;; ipv6) default=3;; *) return 1;; esac
-    menu_items '1. 遵循系统设置 (默认)' '2. 优先 IPv4' '3. 优先 IPv6'
+    menu_items '1. 遵循系统设置' '2. 优先 IPv4 (默认)' '3. 优先 IPv6'
     read -r -p "$(prompt_text "出站 IP 优先级 [回车保留 $default]: ")" option || return 1
     case "${option:-$default}" in
         1) family=system;; 2) family=ipv4;; 3) family=ipv6;;
