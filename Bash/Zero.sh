@@ -9420,7 +9420,7 @@ volto_emit_manager_script() {
 # Surge：https://manual.nssurge.com/policies/masque.html
 # shellcheck disable=SC2016
 
-VOLTO_MANAGER_VERSION="1.0.14"
+VOLTO_MANAGER_VERSION="1.0.15"
 VOLTO_SOURCE="${BASH_SOURCE[0]}"
 VOLTO_DIR="/etc/volto"
 VOLTO_BIN="/usr/local/bin/volto"
@@ -9446,6 +9446,7 @@ VOLTO_URL=""
 VOLTO_DIGEST=""
 VOLTO_SUMS_URL=""
 VOLTO_CERT_CHANGED=0
+VOLTO_ACTION=''
 RED='' GREEN='' YELLOW='' BLUE='' PLAIN=''
 
 info() { printf '%b%s%b\n' "$BLUE" "$*" "$PLAIN" >&2; }
@@ -9752,6 +9753,18 @@ detect_endpoint() {
     error '无法自动获取公网 IP，请检查服务器到 api64.ipify.org 的连接。'
 }
 
+default_listener() {
+    local endpoint="$1" ipv6="${2:-/proc/sys/net/ipv6}"
+    if valid_ipv6 "$endpoint" || {
+        [[ -r "$ipv6/conf/all/disable_ipv6" && -r "$ipv6/bindv6only" ]] &&
+        [[ "$(<"$ipv6/conf/all/disable_ipv6")" == 0 && "$(<"$ipv6/bindv6only")" == 0 ]];
+    }; then
+        printf '[::]'
+    else
+        printf '0.0.0.0'
+    fi
+}
+
 render_config() {
     local settings="$1" revision="$2"
     validate_settings "$settings" || return 1
@@ -9825,8 +9838,8 @@ choose_certificate() {
         cert="${files[$((selected-1))]}"; key="${cert%.crt}.key"
     else error '无效选项。'; return 1
     fi
-    [[ "$cert" == /* && "$key" == /* && -r "$cert" && -r "$key" ]] || {
-        error '需要存在且可读的绝对路径。'; return 1;
+    [[ "$cert" == /* && "$key" == /* && -f "$cert" && -f "$key" && -r "$cert" && -r "$key" ]] || {
+        error '证书和私钥必须是存在且可读的文件，并使用绝对路径。'; return 1;
     }
     [[ "$cert" != "$VOLTO_DIR/"* && "$key" != "$VOLTO_DIR/"* ]] || {
         error '请选择 /etc/volto 以外的原始证书路径。'; return 1;
@@ -9850,7 +9863,9 @@ make_certificate() {
         }
     elif [[ "$mode" == import ]]; then
         cert=$(jq -er '.cert_source' "$file") && key=$(jq -er '.key_source' "$file") || return 1
-        [[ "$cert" == /* && "$key" == /* && -f "$cert" && -f "$key" ]] || return 1
+        [[ "$cert" == /* && "$key" == /* && -f "$cert" && -f "$key" && -r "$cert" && -r "$key" ]] || {
+            error '原路径中的证书或私钥文件不存在或不可读。'; return 1;
+        }
         cp -- "$cert" "$revision/cert.pem" && cp -- "$key" "$revision/key.pem" || return 1
     else return 1
     fi
@@ -9988,6 +10003,7 @@ apply_revision() {
     rm -f -- "$tx/ready" || return 1
     rm -rf -- "$tx" || return 1
     VOLTO_NEW=''
+    prune_revisions || warn '旧配置目录未能完全清理，请检查文件权限。'
     if (( active )); then ok '配置已生效。'; else ok '配置已保存，服务保持停止状态。'; fi
 }
 
@@ -10049,7 +10065,7 @@ EOF
 Description=Check Volto certificate every 5 minutes
 
 [Timer]
-OnBootSec=2min
+OnActiveSec=2min
 OnUnitActiveSec=5min
 Unit=$VOLTO_CERT_SERVICE
 
@@ -10078,7 +10094,7 @@ firewall_hint() {
 }
 
 install_service() {
-    local port endpoint username password congestion load
+    local port endpoint username password congestion listen load
     if [[ -e "$VOLTO_DIR" || -L "$VOLTO_DIR" || -e "$VOLTO_BIN" || -L "$VOLTO_BIN" ||
           -e "$VOLTO_UNIT" || -L "$VOLTO_UNIT" || -e "$VOLTO_MANAGER" || -L "$VOLTO_MANAGER" ||
           -e "$VOLTO_CERT_UNIT" || -L "$VOLTO_CERT_UNIT" || -e "$VOLTO_CERT_TIMER_UNIT" || -L "$VOLTO_CERT_TIMER_UNIT" ]]; then
@@ -10092,12 +10108,13 @@ install_service() {
     prepare_release && download_release || return 1
     port=$(prompt_port) || return 1
     endpoint=$(detect_endpoint) || return 1
+    listen=$(default_listener "$endpoint") || return 1
     congestion=$(choose_congestion bbr-uncapped "$VOLTO_WORK/release/volto") || return 1
     username=$(prompt_value '用户名' 'surge' valid_user) && password=$(prompt_password) || return 1
     printf '%s' "$password" > "$VOLTO_WORK/password" || return 1
-    jq -n --argjson port "$port" --arg endpoint "$endpoint" \
+    jq -n --argjson port "$port" --arg endpoint "$endpoint" --arg listen "$listen" \
         --arg username "$username" --arg cc "$congestion" --rawfile password "$VOLTO_WORK/password" \
-        '{schema:1,port:$port,endpoint:$endpoint,listen_address:"[::]",
+        '{schema:1,port:$port,endpoint:$endpoint,listen_address:$listen,
           sni:"volto.internal",certificate_mode:"selfsigned",verify_mode:"pin",cert_source:"",key_source:"",
           users:[{username:$username,password:$password}],congestion_control:$cc,mtu_upper_bound:1436,ip_family_preference:"ipv4",max_connections:256}' \
         > "$VOLTO_WORK/settings.json" || return 1
@@ -10124,17 +10141,24 @@ install_service() {
 }
 
 cleanup_install() {
+    local unit load stopped=1
     (( VOLTO_INSTALLING )) || return 0
     is_managed || return 1
     warn '撤销未完成的首次安装...'
-    if [[ -f "$VOLTO_CERT_TIMER_UNIT" ]]; then
-        systemctl disable --now "$VOLTO_CERT_TIMER" || return 1
-    fi
-    if [[ -f "$VOLTO_UNIT" ]]; then
-        systemctl stop "$VOLTO_SERVICE" && systemctl disable "$VOLTO_SERVICE" || return 1
-    fi
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    for unit in "$VOLTO_CERT_TIMER" "$VOLTO_CERT_SERVICE" "$VOLTO_SERVICE"; do
+        if load=$(systemctl show -p LoadState --value "$unit"); then
+            if [[ "$load" != not-found ]]; then systemctl stop "$unit" || stopped=0; fi
+        else stopped=0
+        fi
+    done
+    (( stopped )) || { error '服务未能完全停止，已保留安装文件，请重试卸载。'; return 1; }
+    systemctl disable "$VOLTO_CERT_TIMER" "$VOLTO_SERVICE" >/dev/null 2>&1 || true
     rm -f -- "$VOLTO_UNIT" "$VOLTO_BIN" "$VOLTO_MANAGER" "$VOLTO_CERT_UNIT" "$VOLTO_CERT_TIMER_UNIT" || return 1
+    rm -f -- "${VOLTO_UNIT%/*}/multi-user.target.wants/$VOLTO_SERVICE" \
+        "${VOLTO_UNIT%/*}/timers.target.wants/$VOLTO_CERT_TIMER" || return 1
     systemctl daemon-reload || return 1
+    systemctl reset-failed "$VOLTO_SERVICE" "$VOLTO_CERT_SERVICE" "$VOLTO_CERT_TIMER" >/dev/null 2>&1 || true
     if getent passwd "$VOLTO_USER" >/dev/null; then userdel "$VOLTO_USER" || return 1; fi
     if getent group "$VOLTO_USER" >/dev/null; then groupdel "$VOLTO_USER" || return 1; fi
     rm -rf -- "$VOLTO_DIR" || return 1
@@ -10155,6 +10179,7 @@ show_status() {
     systemctl --no-pager --full status "$VOLTO_SERVICE" || true
     printf '\n内核：'; binary_version "$VOLTO_BIN"; printf '\n'
     jq 'del(.users[].password)' "$revision/settings.json" || return 1
+    info 'Surge 节点配置：sudo volto-manager --show-surge'
     openssl x509 -in "$revision/cert.pem" -noout -enddate
 }
 
@@ -10176,10 +10201,12 @@ modify_port() {
 }
 
 modify_endpoint() {
-    local old endpoint
+    local old endpoint listen
     old=$(current_revision) || return 1
     endpoint=$(detect_endpoint) || return 1
-    new_revision && json_edit "$VOLTO_NEW/settings.json" --arg value "$endpoint" '.endpoint=$value' &&
+    listen=$(default_listener "$endpoint") || return 1
+    new_revision && json_edit "$VOLTO_NEW/settings.json" --arg value "$endpoint" --arg listen "$listen" \
+        '.endpoint=$value | .listen_address=$listen' &&
         apply_revision "$VOLTO_NEW" && show_surge
 }
 
@@ -10205,7 +10232,7 @@ modify_certificate() {
 }
 
 renew_certificate() {
-    local old mode
+    local old mode verify_mode
     require_install && old=$(current_revision) || return 1
     mode=$(jq -r '.certificate_mode' "$old/settings.json") || return 1
     [[ "$mode" == import ]] || return 0
@@ -10214,8 +10241,9 @@ renew_certificate() {
         config_consistent "$old" && check_certificate "$old" && discard_revision || return 1
         ok '来源证书没有变化。'; return 0
     fi
+    verify_mode=$(jq -er '.verify_mode' "$old/settings.json") || return 1
     apply_revision "$VOLTO_NEW" || return 1
-    if [[ "$(jq -r '.verify_mode' "$old/settings.json")" == pin ]]; then
+    if [[ "$verify_mode" == pin ]]; then
         warn '证书指纹已变化，请执行 volto-manager --show-surge 更新客户端。'
     fi
 }
@@ -10226,6 +10254,7 @@ choose_congestion() {
     if ! version_newer 1.2.0 "$version"; then
         modern=1
     fi
+    if (( ! modern )) && [[ "$current" == bbr-uncapped ]]; then current=bbr; fi
     info "当前拥塞控制：${current}（回车保留）"
     if (( modern )); then
         menu_items '1. BBR (原 BBR-Capped)' '2. Cubic' '3. NewReno' \
@@ -10277,7 +10306,7 @@ modify_transport() {
         error '连接数必须为 1–256。'; return 1
     fi
     new_revision && json_edit "$VOLTO_NEW/settings.json" --arg cc "$congestion" --arg family "$family" --argjson max "$max" \
-        '.congestion_control=$cc | .ip_family_preference=$family | .listen_address="[::]" | .max_connections=$max' &&
+        '.congestion_control=$cc | .ip_family_preference=$family | .max_connections=$max' &&
         apply_revision "$VOLTO_NEW"
 }
 
@@ -10360,6 +10389,17 @@ discard_revision() {
     VOLTO_NEW=''
 }
 
+prune_revisions() {
+    local current revision
+    [[ ! -e "$VOLTO_DIR/.transaction" ]] || return 0
+    current=$(current_revision) || return 1
+    for revision in "$VOLTO_DIR"/revisions/rev.*; do
+        [[ "$revision" != "$current" ]] || continue
+        managed_revision "$revision" || continue
+        rm -rf -- "$revision" || return 1
+    done
+}
+
 after_action() {
     (( $1 == 0 )) || warn '本次操作未完成。'
     pause_menu
@@ -10371,12 +10411,12 @@ config_menu() {
         screen
         menu_title '✦ Volto 配置管理 ✦'
         menu_items '1. 修改 UDP 端口' '2. 更换证书 / SNI' \
-            '3. 拥塞控制 / QUIC 连接数' '4. 自动刷新服务器地址' '0. 返回上级'
+            '3. 拥塞控制 / IP 优先级 / QUIC 连接数' '4. 自动刷新服务器地址' '0. 返回上级'
         read -r -p "$(prompt_text '✦ Steins Gate ✦ : ')" option || return 0
         case "$option" in
             1) run_action modify_port;; 2) run_action modify_certificate;;
             3) run_action modify_transport;; 4) run_action modify_endpoint;;
-            0) return 0;; *) warn '无效选项。'; continue;;
+            0) return 0;; *) warn '无效选项。'; pause_menu; continue;;
         esac
         after_action "$?"
     done
@@ -10394,7 +10434,7 @@ service_menu() {
         case "$option" in
             1) run_action show_status;; 2) config_menu; continue;; 3) run_action service_action stop;;
             4) run_action service_action restart;; 5) run_action service_action start;;
-            0) return 0;; *) warn '无效选项。'; continue;;
+            0) return 0;; *) warn '无效选项。'; pause_menu; continue;;
         esac
         after_action "$?"
     done
@@ -10411,7 +10451,7 @@ main_menu() {
             1) run_action install_service;;
             2) if require_install; then service_menu; continue; fi; false;;
             3) run_action update_core;;
-            4) run_action uninstall_service;; 0) return 0;; *) warn '无效选项。'; continue;;
+            4) run_action uninstall_service;; 0) return 0;; *) warn '无效选项。'; pause_menu; continue;;
         esac
         after_action "$?"
     done
@@ -10431,22 +10471,31 @@ dependencies() {
     apt-get update && apt-get install -y --no-install-recommends "${missing[@]}"
 }
 
+new_workspace() {
+    local directory="${VOLTO_BIN%/*}"
+    [[ -d "$directory" ]] || install -d -m 755 "$directory" || return 1
+    VOLTO_WORK=$(mktemp -d "$directory/.volto-manager.XXXXXXXX")
+}
+
 finish() {
     local result=$?
     trap - EXIT INT TERM HUP
     if (( VOLTO_WRITING )); then
-        if (( VOLTO_INSTALLING )); then cleanup_install || result=1; fi
-        if [[ -f "$VOLTO_DIR/.transaction/ready" ]]; then recover_transaction || result=1; fi
-        if (( VOLTO_INSTALLING == 0 )); then discard_revision || result=1; fi
+        if [[ "$VOLTO_ACTION" != uninstall_service ]]; then
+            if (( VOLTO_INSTALLING )); then cleanup_install || result=1; fi
+            if [[ -f "$VOLTO_DIR/.transaction/ready" ]]; then recover_transaction || result=1; fi
+            if (( VOLTO_INSTALLING == 0 )); then discard_revision || result=1; fi
+        fi
         flock -u 9 || result=1
     fi
-    if [[ "$VOLTO_WORK" == /tmp/volto-manager.* && -d "$VOLTO_WORK" && ! -L "$VOLTO_WORK" ]]; then
+    if [[ "$VOLTO_WORK" == "${VOLTO_BIN%/*}/.volto-manager."* && -d "$VOLTO_WORK" && ! -L "$VOLTO_WORK" ]]; then
         rm -rf -- "$VOLTO_WORK"
     fi
     exit "$result"
 }
 
 run_action() (
+    VOLTO_ACTION="$1"
     case "$1" in
         show_status|show_surge|check_install) ;;
         *)
@@ -10457,17 +10506,18 @@ run_action() (
             VOLTO_WRITING=1
             ;;
     esac
-    if (( VOLTO_WRITING )) && is_managed && [[ -d "$VOLTO_DIR/.transaction" ]]; then
+    if (( VOLTO_WRITING )) && [[ "$VOLTO_ACTION" != uninstall_service ]] &&
+        is_managed && [[ -d "$VOLTO_DIR/.transaction" ]]; then
         if [[ -f "$VOLTO_DIR/.transaction/ready" ]]; then recover_transaction || return 1
         else rm -rf -- "$VOLTO_DIR/.transaction" || return 1
         fi
     fi
-    VOLTO_WORK=$(mktemp -d /tmp/volto-manager.XXXXXXXX) || return 1
+    new_workspace || return 1
     trap finish EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
     trap 'exit 129' HUP
-    if (( VOLTO_WRITING )); then refresh_manager || return 1; fi
+    if (( VOLTO_WRITING )) && [[ "$VOLTO_ACTION" != uninstall_service ]]; then refresh_manager || return 1; fi
     "$@"
 )
 
