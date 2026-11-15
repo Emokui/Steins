@@ -9420,7 +9420,7 @@ volto_emit_manager_script() {
 # Surge：https://manual.nssurge.com/policies/masque.html
 # shellcheck disable=SC2016
 
-VOLTO_MANAGER_VERSION="1.0.15"
+VOLTO_MANAGER_VERSION="1.0.16"
 VOLTO_SOURCE="${BASH_SOURCE[0]}"
 VOLTO_DIR="/etc/volto"
 VOLTO_BIN="/usr/local/bin/volto"
@@ -9595,10 +9595,12 @@ prompt_value() {
 }
 
 prompt_password() {
-    local value
+    local current="${1:-}" value label='密码 (8–128 位字母数字，回车随机生成 16 位): '
+    [[ -z "$current" ]] || label='密码 (8–128 位字母数字，回车保留当前密码): '
     while true; do
-        read -r -s -p "$(prompt_text '密码 (8–128 位字母数字，回车随机生成 16 位): ')" value || return 1
+        read -r -s -p "$(prompt_text "$label")" value || return 1
         printf '\n' >&2
+        value="${value:-$current}"
         [[ -n "$value" ]] || value=$(random_password) || return 1
         if valid_password "$value"; then printf '%s' "$value"; return 0; fi
         warn '密码仅允许 8–128 位大小写字母和数字。'
@@ -10210,6 +10212,25 @@ modify_endpoint() {
         apply_revision "$VOLTO_NEW" && show_surge
 }
 
+modify_auth() {
+    local old current_user current_password username password
+    old=$(current_revision) || return 1
+    current_user=$(jq -er '.users[0].username' "$old/settings.json") &&
+        current_password=$(jq -er '.users[0].password' "$old/settings.json") || return 1
+    username=$(prompt_value '用户名' "$current_user" valid_user) &&
+        password=$(prompt_password "$current_password") || return 1
+    if [[ "$username" == "$current_user" && "$password" == "$current_password" ]]; then
+        ok '认证没有变化，无需重启。'
+        show_surge; return
+    fi
+    printf '%s' "$password" > "$VOLTO_WORK/password" || return 1
+    new_revision && json_edit "$VOLTO_NEW/settings.json" --arg user "$username" \
+        --rawfile password "$VOLTO_WORK/password" \
+        '.users[0].username=$user | .users[0].password=$password' && apply_revision "$VOLTO_NEW" || return 1
+    info '请替换 Surge 中的节点配置，并重新连接。'
+    show_surge
+}
+
 modify_certificate() {
     local current_sni='' sni=''
     new_revision && choose_certificate "$VOLTO_NEW/settings.json" || return 1
@@ -10411,11 +10432,13 @@ config_menu() {
         screen
         menu_title '✦ Volto 配置管理 ✦'
         menu_items '1. 修改 UDP 端口' '2. 更换证书 / SNI' \
-            '3. 拥塞控制 / IP 优先级 / QUIC 连接数' '4. 自动刷新服务器地址' '0. 返回上级'
+            '3. 拥塞控制 / IP 优先级 / QUIC 连接数' '4. 自动刷新服务器地址' \
+            '5. 更改认证 (用户名 / 密码)' '0. 返回上级'
         read -r -p "$(prompt_text '✦ Steins Gate ✦ : ')" option || return 0
         case "$option" in
             1) run_action modify_port;; 2) run_action modify_certificate;;
             3) run_action modify_transport;; 4) run_action modify_endpoint;;
+            5) run_action modify_auth;;
             0) return 0;; *) warn '无效选项。'; pause_menu; continue;;
         esac
         after_action "$?"
