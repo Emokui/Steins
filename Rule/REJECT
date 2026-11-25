@@ -3,13 +3,15 @@ DOMAIN,ep2.facebook.com
 DOMAIN-SUFFIX,adzerk.net
 DOMAIN-SUFFIX,ip-api.com
 DOMAIN,graph.facebook.com
-DOMAIN,connect.facebook.net
+DOMAIN,play.googleapis.com
 DOMAIN,analytics.adjust.io
+DOMAIN,connect.facebook.net
 DOMAIN,analytics.adjust.com
 DOMAIN,inapps.appsflyer.com
 DOMAIN,gcdsdk.appsflyer.com
 DOMAIN,launches.appsflyer.com
 DOMAIN,app-analytics-services.com
 DOMAIN-SUFFIX,order.luckydogsoft.com
+DOMAIN,daily-cloudcode-pa.googleapis.com
 DOMAIN,crashlyticsreports-pa.googleapis.com
 AND,((OR,((DEST-PORT,3478), (DEST-PORT,19302))), (PROTOCOL,UDP))
