@@ -144,6 +144,19 @@ DOMAIN,browser-http-intake.logs.datadoghq.com
 DOMAIN,uphold-reports-production.s3.us-east-1.amazonaws.com
 DOMAIN-KEYWORD,uphold
 USER-AGENT,uphold*
+# Tide
+DOMAIN,ps.pndsn.com
+DOMAIN-SUFFIX,evergage.com
+DOMAIN-SUFFIX,valuedynamx.com
+DOMAIN,mobile.launchdarkly.com
+DOMAIN-SUFFIX,rewardengine.com
+DOMAIN,tide.api.kustomerapp.com
+DOMAIN-SUFFIX,quantummetric.com
+DOMAIN-SUFFIX,device.marketingcloudapis.com
+DOMAIN,ingress.eu2.rum-ingress-coralogix.com
+DOMAIN-SUFFIX,tide.co
+DOMAIN-KEYWORD,tide
+USER-AGENT,tide*
 # Paypal
 DOMAIN,edge.paypal-ads.com
 DOMAIN,3.datadog.pool.ntp.org
