@@ -9420,7 +9420,7 @@ volto_emit_manager_script() {
 # Surge：https://manual.nssurge.com/policies/masque.html
 # shellcheck disable=SC2016
 
-VOLTO_MANAGER_VERSION="1.0.16"
+VOLTO_MANAGER_VERSION="1.0.17"
 VOLTO_SOURCE="${BASH_SOURCE[0]}"
 VOLTO_DIR="/etc/volto"
 VOLTO_BIN="/usr/local/bin/volto"
@@ -10111,7 +10111,7 @@ install_service() {
     port=$(prompt_port) || return 1
     endpoint=$(detect_endpoint) || return 1
     listen=$(default_listener "$endpoint") || return 1
-    congestion=$(choose_congestion bbr-uncapped "$VOLTO_WORK/release/volto") || return 1
+    congestion=$(choose_congestion '' "$VOLTO_WORK/release/volto") || return 1
     username=$(prompt_value '用户名' 'surge' valid_user) && password=$(prompt_password) || return 1
     printf '%s' "$password" > "$VOLTO_WORK/password" || return 1
     jq -n --argjson port "$port" --arg endpoint "$endpoint" --arg listen "$listen" \
@@ -10269,42 +10269,47 @@ renew_certificate() {
     fi
 }
 
+# 返回此版本另行提供的 BBR 变体。1.8 起只提供 bbr、cubic 和 newreno。
+bbr_variant() {
+    if ! version_newer 1.8.0 "$1"; then return 0; fi
+    if ! version_newer 1.2.0 "$1"; then printf 'bbr-uncapped'
+    elif ! version_newer 1.1.0 "$1"; then printf 'bbr-capped'
+    fi
+}
+
+compatible_congestion() {
+    local current="$1" variant="$2"
+    if [[ ( "$current" == bbr-capped || "$current" == bbr-uncapped ) && "$current" != "$variant" ]]; then
+        current=bbr
+    fi
+    printf '%s' "$current"
+}
+
 choose_congestion() {
-    local current="${1:-bbr-uncapped}" binary="${2:-$VOLTO_BIN}" option selected version modern=0
+    local current="$1" binary="${2:-$VOLTO_BIN}" option version variant
+    local -a choices=('1. BBR' '2. Cubic' '3. NewReno')
     version=$(binary_version "$binary") || return 1
-    if ! version_newer 1.2.0 "$version"; then
-        modern=1
-    fi
-    if (( ! modern )) && [[ "$current" == bbr-uncapped ]]; then current=bbr; fi
-    info "当前拥塞控制：${current}（回车保留）"
-    if (( modern )); then
-        menu_items '1. BBR (原 BBR-Capped)' '2. Cubic' '3. NewReno' \
-            '4. BBR-Uncapped (脚本默认，无额外窗口上限)' >&2
-    else
-        menu_items '1. BBR (旧版默认，无额外窗口上限)' '2. Cubic' '3. NewReno' \
-            '4. BBR-Capped (旧内核选项，需 1.1.0+)' >&2
-    fi
-    read -r -p "$(prompt_text '拥塞控制 [1–4，回车保留]: ')" option || return 1
-    case "$option" in
-        '') selected="$current";; 1) selected=bbr;; 2) selected=cubic;;
-        3) selected=newreno;;
-        4) if (( modern )); then selected=bbr-uncapped; else selected=bbr-capped; fi;;
-        *) error '无效选项。'; return 1;;
+    variant=$(bbr_variant "$version") || return 1
+    case "$variant" in
+        bbr-uncapped) choices+=('4. BBR-Uncapped');;
+        bbr-capped) choices+=('4. BBR-Capped');;
     esac
-    if [[ "$selected" == bbr-uncapped ]] && (( ! modern )); then
-        error 'BBR-Uncapped 需内核 1.2.0+；旧内核的 BBR 即为原版算法。'; return 1
+    if [[ -z "$current" ]]; then
+        current=bbr
+        [[ "$variant" != bbr-uncapped ]] || current=bbr-uncapped
+    else
+        current=$(compatible_congestion "$current" "$variant")
     fi
-    if [[ "$selected" == bbr-capped ]]; then
-        if ! version_newer 1.3.0 "$version"; then
-            error '当前内核不再接受 bbr-capped，请手动选择 BBR。'; return 1
-        fi
-        if version_newer 1.1.0 "$version"; then
-            error "当前内核 $version 不支持 BBR-Capped，请先更新内核至 1.1.0 或更高版本（建议 1.1.1+）。"
-            return 1
-        fi
-        warn 'BBR-Capped 为可选算法；线路延迟持续升高时可能暂时降速，请按实际线路测试。'
-    fi
-    printf '%s' "$selected"
+    menu_items "${choices[@]}" >&2
+    read -r -p "$(prompt_text "拥塞控制 [1–${#choices[@]}，回车使用 $current]: ")" option || return 1
+    case "$option" in
+        '') printf '%s' "$current";;
+        1) printf 'bbr';;
+        2) printf 'cubic';;
+        3) printf 'newreno';;
+        4) if [[ -n "$variant" ]]; then printf '%s' "$variant"; else error '无效选项。'; fi;;
+        *) error '无效选项。';;
+    esac
 }
 
 modify_transport() {
@@ -10339,18 +10344,19 @@ service_action() {
 }
 
 update_core() {
-    local current
+    local current settings previous selected variant
     require_install && current=$(binary_version "$VOLTO_BIN") && prepare_release || return 1
     info "当前：${current}；最新正式版：$VOLTO_VERSION"
     if ! version_newer "$VOLTO_VERSION" "$current"; then ok '无需更新，不会自动降级。'; return 0; fi
-    if ! version_newer 1.2.0 "$VOLTO_VERSION"; then
-        info '新版 BBR 即原 BBR-Capped；升级保留已有配置，不自动修改 MTU 上限。'
-    fi
     ask_yes "更新到正式版 $VOLTO_VERSION?" || return 0
     download_release && new_revision || return 1
-    if ! version_newer 1.2.0 "$VOLTO_VERSION"; then
-        json_edit "$VOLTO_NEW/settings.json" \
-            'if .congestion_control == "bbr-capped" then .congestion_control="bbr" else . end' || return 1
+    settings="$VOLTO_NEW/settings.json"
+    previous=$(jq -er '.congestion_control' "$settings") || return 1
+    variant=$(bbr_variant "$VOLTO_VERSION") || return 1
+    selected=$(compatible_congestion "$previous" "$variant")
+    if [[ "$selected" != "$previous" ]]; then
+        info "新内核的拥塞控制将由 $previous 调整为 $selected。"
+        json_edit "$settings" --arg cc "$selected" '.congestion_control=$cc' || return 1
     fi
     apply_revision "$VOLTO_NEW" "$VOLTO_WORK/release/volto" || return 1
     ok "内核已更新到 ${VOLTO_VERSION}。"
