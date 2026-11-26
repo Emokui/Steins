@@ -2,11 +2,11 @@
 
 set -u
 
-GREEN="\033[0;32m"
-YELLOW="\033[0;33m"
-BLUE="\033[0;34m"
-RED="\033[0;31m"
-PLAIN="\033[0m"
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[0;33m'
+BLUE=$'\033[0;34m'
+RED=$'\033[0;31m'
+PLAIN=$'\033[0m'
 
 check_supported_system() {
     local os_id arch
@@ -44,7 +44,17 @@ fi
 check_supported_system || exit 1
 
 get_root_home() {
-    getent passwd root | cut -d: -f6
+    local line home=""
+    if [[ -r /etc/passwd ]]; then
+        while IFS=: read -r user _ uid _ _ dir _; do
+            if [[ "$user" == "root" ]]; then
+                home="$dir"
+                break
+            fi
+        done < /etc/passwd
+    fi
+    [[ -n "$home" ]] || home=$(getent passwd root 2>/dev/null | cut -d: -f6)
+    printf '%s\n' "${home:-/root}"
 }
 
 ROOT_HOME="$(get_root_home)"
@@ -53,8 +63,8 @@ SSHD_CONFIG="/etc/ssh/sshd_config"
 press_any_key_to_continue() {
     if [ -t 0 ]; then
         local msg="${1:-按任意键返回菜单...}"
-        echo -ne "${GREEN}${msg}\033[0m"
-        read -n 1 -s -r
+        printf '%s%s%s' "$GREEN" "$msg" "$PLAIN"
+        read -n 1 -s -r || true
         echo
     else
         echo
@@ -64,7 +74,7 @@ press_any_key_to_continue() {
 pause_enter() {
     local msg="${1:-按回车继续...}"
     if [ -t 0 ]; then
-        read -r -p "$(echo -e "${BLUE}${msg}${PLAIN}")" _
+        read -r -p "${BLUE}${msg}${PLAIN}" _ || true
     else
         echo
     fi
@@ -95,8 +105,9 @@ service_failure_hint() {
 }
 
 normalize_numeric_choice() {
-    local value
-    value=$(trim_input "$1")
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
     if [[ "$value" =~ ^[0-9]+$ ]]; then
         value="${value#"${value%%[!0]*}"}"
         printf '%s' "${value:-0}"
@@ -108,7 +119,7 @@ normalize_numeric_choice() {
 read_menu_choice() {
     local prompt="$1"
     local value
-    read -r -p "$(echo -e "${BLUE}${prompt}${PLAIN}")" value || return 1
+    read -r -p "${BLUE}${prompt}${PLAIN}" value || return 1
     normalize_numeric_choice "$value"
 }
 
@@ -135,66 +146,168 @@ get_default_interface() {
     echo "$iface"
 }
 
+zero_get_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo "amd64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        *) return 1 ;;
+    esac
+}
+
 get_sshd_effective_option() {
     local option="$1"
-    local key value
-    key=$(printf '%s' "$option" | tr '[:upper:]' '[:lower:]')
-
-    if ! command -v sshd >/dev/null 2>&1; then
-        return 1
-    fi
-
-    value=$(sshd -T -f "$SSHD_CONFIG" 2>/dev/null | awk -v key="$key" 'tolower($1) == key {print $2; exit}')
+    local value
+    command -v sshd >/dev/null 2>&1 || return 1
+    value=$(sshd -T -f "$SSHD_CONFIG" 2>/dev/null | awk -v key="$option" 'BEGIN { key = tolower(key) } tolower($1) == key { print $2; exit }')
     [[ -n "$value" ]] || return 1
-    echo "$value"
+    printf '%s\n' "$value"
 }
 
 update_sshd_option() {
     local option="$1"
     local value="$2"
     local config_file="${3:-$SSHD_CONFIG}"
-    local dropin_dir="/etc/ssh/sshd_config.d" f
+    local dropin_dir="${config_file}.d" src_file="/dev/null" config_dir f tmp_file
+
     if [[ -d "$dropin_dir" ]]; then
         for f in "$dropin_dir"/*.conf; do
-            if [[ -f "$f" ]]; then
-                sed -i "/^[#[:space:]]*${option}[[:space:]]/Id" "$f" || return 1
-            fi
+            [[ -f "$f" ]] || continue
+            grep -Eqi "^[#[:space:]]*${option}([[:space:]]+|=)" "$f" 2>/dev/null || continue
+            tmp_file=$(mktemp "${f}.zero.XXXXXX") || return 1
+            chmod --reference="$f" "$tmp_file" 2>/dev/null || chmod 644 "$tmp_file"
+            awk -v k="$option" '
+                BEGIN { lk = tolower(k); in_match = 0 }
+                tolower($1) == "match" { in_match = 1 }
+                !in_match && tolower($0) ~ ("^[#[:space:]]*" lk "([[:space:]]+|=)") { next }
+                { print }
+            ' "$f" > "$tmp_file" && mv -f "$tmp_file" "$f" || { rm -f "$tmp_file"; return 1; }
         done
     fi
-    
-    sed -i "/^[#[:space:]]*${option}[[:space:]]/Id" "$config_file" || return 1
-    [[ -s "$config_file" ]] || printf '\n' > "$config_file" || return 1
-    sed -i "1i${option} ${value}" "$config_file"
+
+    if [[ "$config_file" == */* ]]; then
+        config_dir="${config_file%/*}"
+        mkdir -p "${config_dir:-/}" || return 1
+    fi
+    tmp_file=$(mktemp "${config_file}.zero.XXXXXX") || return 1
+    if [[ -f "$config_file" ]]; then
+        src_file="$config_file"
+        chmod --reference="$config_file" "$tmp_file" 2>/dev/null || chmod 644 "$tmp_file"
+    else
+        chmod 644 "$tmp_file"
+    fi
+
+    if awk -v k="$option" -v v="$value" '
+        BEGIN { inserted = 0; lk = tolower(k); in_match = 0 }
+        {
+            low = tolower($0)
+            if (!in_match && low ~ "^[[:space:]]*match[[:space:]]+") {
+                if (!inserted) {
+                    print k " " v
+                    inserted = 1
+                }
+                in_match = 1
+            }
+            if (!in_match && low ~ ("^[#[:space:]]*" lk "([[:space:]]+|=)")) next
+            print
+        }
+        END {
+            if (!inserted) print k " " v
+        }
+    ' "$src_file" > "$tmp_file" 2>/dev/null && mv -f "$tmp_file" "$config_file"; then
+        return 0
+    fi
+    rm -f "$tmp_file"
+    return 1
 }
 
 get_sshd_option() {
     local option="$1"
     local default="${2:-}"
     local config_file="${3:-$SSHD_CONFIG}"
-    local line value effective
+    local effective value="" f dropin_list=""
 
-    if effective=$(get_sshd_effective_option "$option"); then
-        echo "$effective"
-        return
+    if [[ "$config_file" == "$SSHD_CONFIG" ]] && effective=$(get_sshd_effective_option "$option"); then
+        printf '%s\n' "$effective"
+        return 0
     fi
 
-    line=$(grep -Ei "^[[:space:]]*${option}[[:space:]]+" "$config_file" 2>/dev/null | tail -1 || true)
-    if [[ -n "$line" ]]; then
-        value=$(echo "$line" | awk '{print tolower($2)}')
-        echo "$value"
-    else
-        echo "$default"
+    if [[ -f "$config_file" ]]; then
+        if [[ -d "${config_file}.d" ]]; then
+            for f in "${config_file}.d"/*.conf; do
+                [[ -f "$f" ]] && dropin_list+="${dropin_list:+$'\n'}$f"
+            done
+        fi
+        value=$(awk -v k="$option" -v dropins="$dropin_list" '
+            function check_line(raw,    line, kw) {
+                if (raw ~ /^[[:space:]]*#/) return 0
+                line = raw
+                sub(/^[[:space:]]+/, "", line)
+                kw = line
+                sub(/[[:space:]=].*$/, "", kw)
+                kw = tolower(kw)
+                if (kw == "match") exit
+                if (kw == lk) {
+                    sub(/^[^[:space:]=]+[[:space:]=]+/, "", line)
+                    sub(/[[:space:]]+$/, "", line)
+                    print tolower(line)
+                    exit
+                }
+                return (kw == "include")
+            }
+            BEGIN {
+                lk = tolower(k)
+                nd = split(dropins, dfiles, "\n")
+            }
+            {
+                if (check_line($0)) {
+                    for (i = 1; i <= nd; i++) {
+                        if (dfiles[i] == "") continue
+                        while ((getline dline < dfiles[i]) > 0) {
+                            if (tolower(dline) ~ /^[[:space:]]*match([[:space:]]|$)/) break
+                            check_line(dline)
+                        }
+                        close(dfiles[i])
+                    }
+                }
+            }
+        ' "$config_file" 2>/dev/null)
     fi
+    printf '%s\n' "${value:-$default}"
 }
 
 ssh_get_current_port() {
     local current_port
     current_port=$(get_sshd_option "Port" "22")
     [[ "$current_port" =~ ^[0-9]+$ ]] || current_port=22
-    echo "$current_port"
+    printf '%s\n' "$current_port"
 }
 
 ssh_read_status() {
+    local out=""
+    if command -v sshd >/dev/null 2>&1; then
+        out=$(sshd -T -f "$SSHD_CONFIG" 2>/dev/null | awk '
+            {
+                k = tolower($1)
+                if (k == "port" && port == "") port = $2
+                else if (k == "permitrootlogin" && root == "") root = tolower($2)
+                else if (k == "passwordauthentication" && pass == "") pass = tolower($2)
+                else if (k == "pubkeyauthentication" && pub == "") pub = tolower($2)
+            }
+            END {
+                if (port != "" || root != "" || pass != "" || pub != "") {
+                    if (port !~ /^[0-9]+$/) port = "22"
+                    if (root == "") root = "prohibit-password"
+                    if (pass == "") pass = "yes"
+                    if (pub == "") pub = "yes"
+                    printf "%s\n%s\n%s\n%s\n", port, root, pass, pub
+                }
+            }
+        ')
+    fi
+    if [[ -n "$out" ]]; then
+        printf '%s\n' "$out"
+        return 0
+    fi
     printf '%s\n' \
         "$(ssh_get_current_port)" \
         "$(get_sshd_option "PermitRootLogin" "prohibit-password")" \
@@ -235,8 +348,7 @@ ssh_socket_units_available() {
     command -v systemctl >/dev/null 2>&1 || return 1
     local unit
     for unit in ssh.socket sshd.socket; do
-        if systemctl is-active --quiet "$unit" 2>/dev/null &&
-           [[ "$(systemctl show -p Accept --value "$unit" 2>/dev/null)" == yes ]]; then
+        if systemctl is-active --quiet "$unit" 2>/dev/null; then
             return 0
         fi
     done
@@ -245,7 +357,7 @@ ssh_socket_units_available() {
 
 ssh_apply_socket_port() {
     local port="$1"
-    local unit dropin_dir dropin_file socket_listen socket_address applied=0
+    local unit dropin_dir dropin_file socket_listen socket_address tok prev_tok applied=0
     local -a socket_streams
 
     command -v systemctl >/dev/null 2>&1 || return 0
@@ -255,14 +367,19 @@ ssh_apply_socket_port() {
         if systemctl is-active "$unit" >/dev/null 2>&1 || systemctl is-enabled "$unit" >/dev/null 2>&1; then
             socket_listen=$(systemctl show -p Listen --value "$unit" 2>/dev/null) || return 1
             socket_streams=()
-            while IFS= read -r socket_address; do
-                [[ "$socket_address" == *' (Stream)' ]] || continue
-                socket_address="${socket_address% (Stream)}"
-                if [[ "$socket_address" =~ ^([0-9.]+|\[[^]]+\]):[0-9]+(%[^[:space:]]+)?$ ]]; then
-                    socket_address="${BASH_REMATCH[1]}:${port}${BASH_REMATCH[2]:-}"
+            prev_tok=""
+            for tok in $socket_listen; do
+                if [[ "$tok" == "(Stream)" && -n "$prev_tok" ]]; then
+                    socket_address="$prev_tok"
+                    if [[ "$socket_address" =~ ^([0-9.]+|\[[^]]+\]|\*):[0-9]+(%[^[:space:]]+)?$ ]]; then
+                        socket_address="${BASH_REMATCH[1]}:${port}${BASH_REMATCH[2]:-}"
+                    elif [[ "$socket_address" =~ ^[0-9]+$ ]]; then
+                        socket_address="$port"
+                    fi
+                    socket_streams+=("$socket_address")
                 fi
-                socket_streams+=("$socket_address")
-            done <<< "$socket_listen"
+                prev_tok="$tok"
+            done
             (( ${#socket_streams[@]} )) || return 1
             dropin_dir="/etc/systemd/system/${unit}.d"
             dropin_file="${dropin_dir}/zero-port.conf"
@@ -292,12 +409,12 @@ ssh_port_is_listening() {
     local port="$1"
 
     if command -v ss >/dev/null 2>&1; then
-        ss -H -lnt 2>/dev/null | awk -v port="$port" '$4 ~ ":" port "$" || $4 ~ "\\]:" port "$" {found=1} END {exit !found}'
+        ss -H -lnt "sport = :$port" 2>/dev/null | grep -q .
         return $?
     fi
 
     if command -v netstat >/dev/null 2>&1; then
-        netstat -lnt 2>/dev/null | awk -v port="$port" '$4 ~ ":" port "$" || $4 ~ "\\]:" port "$" {found=1} END {exit !found}'
+        netstat -lnt 2>/dev/null | awk -v port="$port" '$4 ~ ":" port "$" || $4 ~ "\\]:" port "$" {found=1; exit} END {exit !found}'
         return $?
     fi
 
@@ -305,7 +422,7 @@ ssh_port_is_listening() {
 }
 
 restart_sshd_safe() {
-    local expected_port="${1:-}"
+    local expected_port="${1:-}" i
 
     if ! sshd -t 2>/dev/null; then
         echo -e "${RED}sshd 配置有误,未重启sshd请检查${SSHD_CONFIG}${PLAIN}"
@@ -333,37 +450,44 @@ restart_sshd_safe() {
     fi
 
     if [[ -n "$expected_port" ]]; then
-        sleep 1
-        if ! ssh_port_is_listening "$expected_port"; then
-            echo -e "${RED}sshd 未监听新的端口 ${expected_port},已停止本次修改${PLAIN}"
-            return 1
-        fi
+        for ((i = 0; i < 6; i++)); do
+            ssh_port_is_listening "$expected_port" && return 0
+            sleep 0.2
+        done
+        echo -e "${RED}sshd 未监听新的端口 ${expected_port},已停止本次修改${PLAIN}"
+        return 1
     fi
 
     return 0
 }
 
 pkg_install() {
-    command -v apt >/dev/null 2>&1 || return 1
-    apt update && apt install -y "$@"
+    command -v apt-get >/dev/null 2>&1 || return 1
+    DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
 }
 
 pkg_update() {
-    command -v apt >/dev/null 2>&1 || return 1
-    apt update && apt upgrade -y
+    command -v apt-get >/dev/null 2>&1 || return 2
+    apt-get update && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
 }
 
 pkg_clean() {
-    command -v apt >/dev/null 2>&1 || return 1
-    apt autoremove -y && apt autoclean -y && apt clean
+    command -v apt-get >/dev/null 2>&1 || return 2
+    DEBIAN_FRONTEND=noninteractive apt-get autoremove -y && apt-get autoclean -y && apt-get clean
 }
 
 linux_update() {
+    local rc=0
     clear
     echo -e "${YELLOW}正在更新系统...${PLAIN}"
 
-    if ! pkg_update; then
-        echo -e "${RED}未检测到可用的 apt!${PLAIN}"
+    pkg_update || rc=$?
+    if (( rc != 0 )); then
+        if (( rc == 2 )); then
+            echo -e "${RED}未检测到可用的 apt-get!${PLAIN}"
+        else
+            echo -e "${RED}系统更新失败，请检查软件源或网络连接${PLAIN}"
+        fi
         press_any_key_to_continue
         return 1
     fi
@@ -375,6 +499,7 @@ linux_update() {
 linux_filter_old_kernel_packages() {
     local current="$1" package version
     while IFS= read -r package; do
+        [[ -n "$package" ]] || continue
         version="${package#linux-}"
         version="${version#*-}"
         version="${version#extra-}"
@@ -394,67 +519,63 @@ linux_filter_old_kernel_packages() {
 }
 
 linux_clean() {
+    local rc=0 current_kernel cache_dir
+    local -a old_kernel_pkgs=()
+
     clear
     echo -e "${YELLOW}正在清理系统垃圾...${PLAIN}"
 
-    pkg_clean || echo -e "${RED}未检测到可用的 apt!${PLAIN}"
+    pkg_clean || {
+        rc=$?
+        (( rc == 2 )) && echo -e "${RED}未检测到可用的 apt-get!${PLAIN}" || echo -e "${YELLOW}警告: apt 缓存清理部分失败${PLAIN}"
+    }
 
     echo -e "${YELLOW}正在清理旧内核...${PLAIN}"
-    local current_kernel
     current_kernel=$(uname -r)
     echo -e "${BLUE}当前运行内核: ${GREEN}${current_kernel}${PLAIN}"
 
-    local old_kernels=""
-    old_kernels=$(dpkg -l | \
-        grep -E '^ii|^rc' | \
-        grep -E 'linux-(image|headers|modules)' | \
-        awk '{print $2}' | \
-        grep -E '^linux-(image|headers|modules)(-extra|-unsigned)?-[0-9]' | \
-        linux_filter_old_kernel_packages "$current_kernel" \
-        || true)
-    if [ -n "$old_kernels" ]; then
+    if command -v dpkg-query >/dev/null 2>&1; then
+        mapfile -t old_kernel_pkgs < <(
+            dpkg-query -W -f='${db:Status-Abbrev}\t${binary:Package}\n' 2>/dev/null |
+                awk '$1 ~ /^(ii|rc)/ && $2 ~ /^linux-(image|headers|modules)(-extra|-unsigned)?-[0-9]/ { print $2 }' |
+                linux_filter_old_kernel_packages "$current_kernel"
+        )
+    fi
+
+    if (( ${#old_kernel_pkgs[@]} > 0 )); then
         echo -e "${YELLOW}发现以下旧内核包:${PLAIN}"
-        echo "$old_kernels"
-        for pkg in $old_kernels; do
-            echo -e "  清理: $pkg"
-            if ! apt-get purge -y "$pkg" > /dev/null 2>&1; then
-                echo -e "  ${RED}警告: $pkg 清理失败${PLAIN}"
-            fi
-        done
+        printf '  %s\n' "${old_kernel_pkgs[@]}"
+        if ! DEBIAN_FRONTEND=noninteractive apt-get purge -y "${old_kernel_pkgs[@]}" >/dev/null 2>&1; then
+            echo -e "${YELLOW}批量清理失败，尝试逐个清理...${PLAIN}"
+            local pkg
+            for pkg in "${old_kernel_pkgs[@]}"; do
+                DEBIAN_FRONTEND=noninteractive apt-get purge -y "$pkg" >/dev/null 2>&1 ||
+                    echo -e "  ${RED}警告: $pkg 清理失败${PLAIN}"
+            done
+        fi
     else
         echo -e "${GREEN}无旧内核需要清理${PLAIN}"
     fi
 
-    if [ -n "$old_kernels" ]; then
-        if command -v update-grub &>/dev/null; then
-            echo -e "${YELLOW}正在更新GRUB引导...${PLAIN}"
-            update-grub > /dev/null 2>&1
-        fi
-    fi
-
-    if command -v docker &>/dev/null; then
-        echo -e "${YELLOW}清理Docker垃圾...${PLAIN}"
-        docker system prune -af
-        docker volume prune -f
+    if command -v docker >/dev/null 2>&1; then
+        echo -e "${YELLOW}清理Docker悬空镜像与构建缓存...${PLAIN}"
+        docker image prune -f >/dev/null 2>&1 || true
+        docker builder prune -f >/dev/null 2>&1 || true
     fi
 
     echo -e "${YELLOW}正在清理系统日志...${PLAIN}"
-    if command -v journalctl &>/dev/null; then
-        journalctl --vacuum-time=1d --vacuum-size=10M
+    if command -v journalctl >/dev/null 2>&1; then
+        journalctl --vacuum-time=1d --vacuum-size=10M >/dev/null 2>&1 || true
     fi
-    local log_pattern
-    for log_pattern in "*.log" "*.gz" "*.1"; do
-        find /var/log -type f -name "$log_pattern" -mtime +1 -exec rm -f {} \;
-    done
+    find /var/log -type f \( -name '*.log' -o -name '*.gz' -o -name '*.1' \) -mtime +1 -delete 2>/dev/null || true
 
     echo -e "${YELLOW}正在清理临时目录...${PLAIN}"
-    find /tmp -mindepth 1 -maxdepth 1 -mmin +60 -exec rm -rf {} + 2>/dev/null
-    find /var/tmp -mindepth 1 -maxdepth 1 -mmin +60 -exec rm -rf {} + 2>/dev/null
+    find /tmp -mindepth 1 -maxdepth 1 -mmin +60 -exec rm -rf {} + 2>/dev/null || true
+    find /var/tmp -mindepth 1 -maxdepth 1 -mmin +60 -exec rm -rf {} + 2>/dev/null || true
 
     echo -e "${YELLOW}正在清理用户缓存...${PLAIN}"
-    local cache_dir
-    for cache_dir in "$HOME/.cache" /home/*/.cache; do
-        [ -d "$cache_dir" ] && rm -rf "$cache_dir"/*
+    for cache_dir in "${ROOT_HOME}/.cache" /home/*/.cache; do
+        [[ -d "$cache_dir" && ! -L "$cache_dir" ]] && find "$cache_dir" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
     done
 
     echo -e "${GREEN}系统清理完成${PLAIN}"
@@ -462,6 +583,19 @@ linux_clean() {
 }
 
 swapfile_path="/swapfile"
+
+REINSTALL_DNS_V4="${REINSTALL_DNS_V4:-8.8.8.8 1.1.1.1}"
+REINSTALL_DNS_V6="${REINSTALL_DNS_V6:-2001:4860:4860::8888 2606:4700:4700::1111}"
+REINSTALL_DNS_LIST="${REINSTALL_DNS_LIST:-8.8.8.8 1.1.1.1 2001:4860:4860::8888}"
+REINSTALL_STACK_PREF="${REINSTALL_STACK_PREF:-auto}"
+
+reinstall_get_arch() {
+    zero_get_arch
+}
+
+reinstall_is_efi() {
+    [[ -d "${REINSTALL_EFI_DIR:-/sys/firmware/efi}" ]]
+}
 
 reinstall_check_sys() {
     reinstall_release=''
@@ -474,8 +608,28 @@ reinstall_check_sys() {
 }
 
 reinstall_install_dependencies() {
-    apt-get -o Acquire::ForceIPv4=true update
-    apt-get -y -o Acquire::ForceIPv4=true install xz-utils openssl gawk file wget cpio gzip iproute2 util-linux
+    local -a missing_pkgs=()
+    command -v openssl >/dev/null 2>&1 || missing_pkgs+=("openssl")
+    command -v awk >/dev/null 2>&1 || missing_pkgs+=("gawk")
+    if ! command -v wget >/dev/null 2>&1 ||
+       wget --help 2>&1 | grep -qi 'busybox' ||
+       wget --version 2>&1 | grep -qi 'busybox'; then
+        missing_pkgs+=("wget")
+    fi
+    [[ -f "${REINSTALL_CA_CERT_FILE:-/etc/ssl/certs/ca-certificates.crt}" ]] || missing_pkgs+=("ca-certificates")
+    command -v cpio >/dev/null 2>&1 || missing_pkgs+=("cpio")
+    command -v gzip >/dev/null 2>&1 || missing_pkgs+=("gzip")
+    command -v ip >/dev/null 2>&1 || missing_pkgs+=("iproute2")
+    command -v lsblk >/dev/null 2>&1 || missing_pkgs+=("util-linux")
+    command -v findmnt >/dev/null 2>&1 || missing_pkgs+=("mount")
+    command -v grub-editenv >/dev/null 2>&1 || missing_pkgs+=("grub-common")
+
+    (( ${#missing_pkgs[@]} == 0 )) && return 0
+
+    command -v apt-get >/dev/null 2>&1 || return 1
+    DEBIAN_FRONTEND=noninteractive apt-get update ||
+        echo -e "${YELLOW}警告: apt-get update 存在部分源错误，尝试直接安装缺失依赖 (${missing_pkgs[*]})...${PLAIN}"
+    DEBIAN_FRONTEND=noninteractive apt-get -y install "${missing_pkgs[@]}"
 }
 
 reinstall_require_commands() {
@@ -495,43 +649,285 @@ reinstall_require_commands() {
 }
 
 reinstall_cidr_to_netmask() {
-    local n="${1:-32}" b='' m='' i='' s=''
-    for ((i = 0; i < 32; i++)); do
-        if [[ "$i" -lt "$n" ]]; then
-            b="${b}1"
+    local n="${1:-32}" mask_u=0
+    if [[ ! "$n" =~ ^[0-9]+$ ]] || (( n < 0 || n > 32 )); then
+        n=32
+    fi
+    if (( n == 0 )); then
+        mask_u=0
+    else
+        mask_u=$(( (0xffffffff << (32 - n)) & 0xffffffff ))
+    fi
+    printf '%d.%d.%d.%d\n' \
+        $(( (mask_u >> 24) & 255 )) \
+        $(( (mask_u >> 16) & 255 )) \
+        $(( (mask_u >> 8) & 255 )) \
+        $(( mask_u & 255 ))
+}
+
+reinstall_ipv4_to_uint() {
+    local ip="${1:-}" o1='' o2='' o3='' o4='' extra=''
+    IFS='.' read -r o1 o2 o3 o4 extra <<< "$ip"
+    [[ -z "$extra" && "$o1" =~ ^[0-9]+$ && "$o2" =~ ^[0-9]+$ && "$o3" =~ ^[0-9]+$ && "$o4" =~ ^[0-9]+$ ]] || return 1
+    (( 10#$o1 <= 255 && 10#$o2 <= 255 && 10#$o3 <= 255 && 10#$o4 <= 255 )) || return 1
+    printf '%u\n' $(( ((10#$o1 << 24) | (10#$o2 << 16) | (10#$o3 << 8) | 10#$o4) & 0xffffffff ))
+}
+
+reinstall_is_public_ipv4() {
+    local ip="${1%%/*}" o1='' o2='' o3='' o4='' extra=''
+    IFS='.' read -r o1 o2 o3 o4 extra <<< "$ip"
+    [[ -z "$extra" && "$o1" =~ ^[0-9]+$ && "$o2" =~ ^[0-9]+$ && "$o3" =~ ^[0-9]+$ && "$o4" =~ ^[0-9]+$ ]] || return 1
+    o1=$((10#$o1)); o2=$((10#$o2)); o3=$((10#$o3)); o4=$((10#$o4))
+    (( o1 <= 255 && o2 <= 255 && o3 <= 255 && o4 <= 255 )) || return 1
+    (( o1 == 0 || o1 == 10 || o1 == 127 || o1 >= 224 )) && return 1
+    (( o1 == 169 && o2 == 254 )) && return 1
+    (( o1 == 172 && o2 >= 16 && o2 <= 31 )) && return 1
+    (( o1 == 192 && o2 == 168 )) && return 1
+    (( o1 == 100 && o2 >= 64 && o2 <= 127 )) && return 1
+    return 0
+}
+
+reinstall_ipv4_in_same_subnet() {
+    local ip="${1:-}" prefix="${2:-}" gw="${3:-}"
+    local ip_u='' gw_u='' mask_u=0
+    [[ "$prefix" =~ ^[0-9]+$ ]] || return 1
+    (( prefix >= 1 && prefix <= 31 )) || return 1
+    ip_u=$(reinstall_ipv4_to_uint "$ip") || return 1
+    gw_u=$(reinstall_ipv4_to_uint "$gw") || return 1
+    mask_u=$(( (0xffffffff << (32 - prefix)) & 0xffffffff ))
+    (( (ip_u & mask_u) == (gw_u & mask_u) ))
+}
+
+reinstall_ipv6_prefix_to_netmask() {
+    local p="${1:-64}" rem=0 i=0 val=0 chunk='' out=''
+    if [[ ! "$p" =~ ^[0-9]+$ ]] || (( p < 0 || p > 128 )); then
+        p=64
+    fi
+    rem=$p
+    for ((i = 0; i < 8; i++)); do
+        if (( rem >= 16 )); then
+            val=65535
+            rem=$((rem - 16))
+        elif (( rem <= 0 )); then
+            val=0
         else
-            b="${b}0"
+            val=$(( (0xffff << (16 - rem)) & 0xffff ))
+            rem=0
         fi
+        chunk=$(printf '%x' "$val")
+        out="${out:+${out}:}${chunk}"
     done
-    for ((i = 0; i < 4; i++)); do
-        s=$(echo "$b" | cut -c$((i * 8 + 1))-$(((i + 1) * 8)))
-        if [[ -z "$m" ]]; then
-            m="$((2#${s}))"
+    printf '%s\n' "$out"
+}
+
+reinstall_expand_ipv6() {
+    local ip="${1:-}" left='' right='' i=0 n_left=0 n_right=0 missing=0 part='' out=''
+    local -a lparts=() rparts=() full=()
+    ip="${ip%%%*}"
+    [[ -n "$ip" && "$ip" == *:* ]] || return 1
+
+    if [[ "$ip" == *::* ]]; then
+        [[ "${ip#*::}" != *::* ]] || return 1
+        left="${ip%%::*}"
+        right="${ip#*::}"
+        [[ -n "$left" ]] && IFS=':' read -r -a lparts <<< "$left"
+        [[ -n "$right" ]] && IFS=':' read -r -a rparts <<< "$right"
+        n_left=${#lparts[@]}
+        n_right=${#rparts[@]}
+        missing=$((8 - n_left - n_right))
+        (( missing >= 1 )) || return 1
+        (( n_left > 0 )) && full+=("${lparts[@]}")
+        for ((i = 0; i < missing; i++)); do
+            full+=("0")
+        done
+        (( n_right > 0 )) && full+=("${rparts[@]}")
+    else
+        IFS=':' read -r -a full <<< "$ip"
+        (( ${#full[@]} == 8 )) || return 1
+    fi
+
+    (( ${#full[@]} == 8 )) || return 1
+    for part in "${full[@]}"; do
+        [[ "$part" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+        part=$(printf '%04x' "$((16#$part))")
+        out="${out:+${out}:}${part}"
+    done
+    printf '%s\n' "$out"
+}
+
+reinstall_ipv6_in_same_subnet() {
+    local ip="${1:-}" prefix="${2:-}" gw="${3:-}"
+    local exp_ip='' exp_gw='' rem=0 i=0 mask=0 h1=0 h2=0
+    local -a g_ip=() g_gw=()
+
+    [[ "$prefix" =~ ^[0-9]+$ ]] || return 1
+    (( prefix >= 1 && prefix <= 127 )) || return 1
+    gw="${gw%%%*}"
+    case "$gw" in
+        [Ff][Ee]80:*|'') return 1 ;;
+    esac
+
+    exp_ip=$(reinstall_expand_ipv6 "$ip") || return 1
+    exp_gw=$(reinstall_expand_ipv6 "$gw") || return 1
+    IFS=':' read -r -a g_ip <<< "$exp_ip"
+    IFS=':' read -r -a g_gw <<< "$exp_gw"
+
+    rem=$prefix
+    for ((i = 0; i < 8; i++)); do
+        (( rem <= 0 )) && break
+        if (( rem >= 16 )); then
+            mask=65535
+            rem=$((rem - 16))
         else
-            m="${m}.$((2#${s}))"
+            mask=$(( (0xffff << (16 - rem)) & 0xffff ))
+            rem=0
         fi
+        h1=$((16#${g_ip[$i]}))
+        h2=$((16#${g_gw[$i]}))
+        (( (h1 & mask) == (h2 & mask) )) || return 1
     done
-    echo "$m"
+    return 0
+}
+
+reinstall_is_candidate_nic() {
+    local iface="${1:-}" sys_net="${REINSTALL_SYS_NET_DIR:-/sys/class/net}" nic_type=''
+    iface="${iface%%@*}"
+    [[ -n "$iface" && "$iface" != "lo" ]] || return 1
+    case "$iface" in
+        docker*|br-*|veth*|virbr*|vnet*|fwbr*|fwpr*|fwln*|cni*|flannel*|cali*|cilium*|weave*|kube-*|tun*|tap*|wg*|warp*|CloudflareWARP*|tailscale*|zt*|sit*|gre*|ip6tnl*|erspan*|dummy*|ifb*|lxcbr*|lxdbr*|podman*|incusbr*|macvtap*|ipvtap*|venet*)
+            return 1
+            ;;
+    esac
+    if [[ -r "${sys_net}/${iface}/type" ]]; then
+        nic_type=$(cat "${sys_net}/${iface}/type" 2>/dev/null || true)
+        [[ "$nic_type" == "1" ]] || return 1
+    fi
+    return 0
+}
+
+reinstall_get_default_routes() {
+    local family="$1" dev="${2:-}" out=''
+    if [[ -n "$dev" ]]; then
+        out=$(ip "$family" route show default dev "$dev" 2>/dev/null | grep -Ev '^[[:space:]]*(unreachable|prohibit|blackhole|throw)([[:space:]]|$)' || true)
+        if [[ -z "$out" ]]; then
+            out=$(ip "$family" route show table all default dev "$dev" 2>/dev/null | grep -Ev '^[[:space:]]*(unreachable|prohibit|blackhole|throw)([[:space:]]|$)' || true)
+        fi
+    else
+        out=$(
+            {
+                ip "$family" route show default 2>/dev/null
+                ip "$family" route show table all default 2>/dev/null
+            } | grep -Ev '^[[:space:]]*(unreachable|prohibit|blackhole|throw)([[:space:]]|$)' || true
+        )
+    fi
+    [[ -n "$out" ]] || return 1
+    printf '%s\n' "$out"
+}
+
+reinstall_get_iface_mac() {
+    local iface="${1:-}" sys_net="${REINSTALL_SYS_NET_DIR:-/sys/class/net}" mac=''
+    [[ -n "$iface" ]] || return 1
+    if [[ -r "${sys_net}/${iface}/address" ]]; then
+        mac=$(tr '[:upper:]' '[:lower:]' < "${sys_net}/${iface}/address" 2>/dev/null || true)
+    fi
+    if [[ -z "$mac" ]]; then
+        mac=$(ip -o link show dev "$iface" 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "link/ether") {print tolower($(i + 1)); exit}}')
+    fi
+    if [[ "$mac" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ && "$mac" != "00:00:00:00:00:00" ]]; then
+        printf '%s\n' "$mac"
+        return 0
+    fi
+    return 1
+}
+
+reinstall_find_family_iface() {
+    local family="$1" cand='' fallback_routed=''
+    while IFS= read -r cand; do
+        cand="${cand%%@*}"
+        reinstall_is_candidate_nic "$cand" || continue
+        [[ -z "$fallback_routed" ]] && fallback_routed="$cand"
+        if [[ "$family" == "-6" ]]; then
+            if reinstall_pick_ipv6_line "$cand" >/dev/null 2>&1; then
+                printf '%s\n' "$cand"
+                return 0
+            fi
+        else
+            if reinstall_pick_ipv4_line "$cand" >/dev/null 2>&1; then
+                printf '%s\n' "$cand"
+                return 0
+            fi
+        fi
+    done < <(reinstall_get_default_routes "$family" | awk '{for (i = 1; i < NF; i++) if ($i == "dev") print $(i + 1)}')
+    if [[ -n "$fallback_routed" ]]; then
+        printf '%s\n' "$fallback_routed"
+        return 0
+    fi
+
+    while IFS= read -r cand; do
+        cand="${cand%%@*}"
+        reinstall_is_candidate_nic "$cand" || continue
+        if [[ "$family" == "-6" ]]; then
+            if reinstall_pick_ipv6_line "$cand" >/dev/null 2>&1; then
+                printf '%s\n' "$cand"
+                return 0
+            fi
+        else
+            if reinstall_pick_ipv4_line "$cand" >/dev/null 2>&1; then
+                printf '%s\n' "$cand"
+                return 0
+            fi
+        fi
+    done < <(ip "$family" -o addr show scope global 2>/dev/null | awk '{print $2}')
+
+    while IFS= read -r cand; do
+        cand="${cand%%@*}"
+        if reinstall_is_candidate_nic "$cand"; then
+            printf '%s\n' "$cand"
+            return 0
+        fi
+    done < <(ip -o link show 2>/dev/null | awk -F': ' '{print $2}')
+
+    return 1
 }
 
 reinstall_get_default_interface() {
-    get_default_interface
+    reinstall_find_family_iface -4 || reinstall_find_family_iface -6 || get_default_interface
 }
 
 reinstall_get_target_disk() {
-    local root_source='' root_disk='' disks=''
+    local root_source='' cur='' parent='' disk_by_dep='' disks=''
     root_source=$(findmnt -n -o SOURCE / 2>/dev/null | head -n1)
+    root_source="${root_source%%\[*}"
+    if [[ -n "$root_source" && -e "$root_source" ]] && command -v readlink >/dev/null 2>&1; then
+        root_source=$(readlink -f "$root_source" 2>/dev/null || printf '%s' "$root_source")
+    fi
     if [[ -n "$root_source" ]]; then
-        root_disk=$(lsblk -ndo PKNAME "$root_source" 2>/dev/null | tail -n1)
-        if [[ "$root_disk" =~ ^dm- ]]; then
-            root_disk=$(lsblk -ndo PKNAME "/dev/$root_disk" 2>/dev/null | tail -n1)
+        disk_by_dep=$(
+            { lsblk -nls -o NAME,TYPE "$root_source" 2>/dev/null || lsblk -ns -o NAME,TYPE "$root_source" 2>/dev/null; } |
+                awk '$2 == "disk" {print $1; exit}' |
+                sed 's/^[^[:alnum:]\/]*//'
+        )
+        if [[ -n "$disk_by_dep" ]]; then
+            [[ "$disk_by_dep" == /dev/* ]] && echo "$disk_by_dep" || echo "/dev/$disk_by_dep"
+            return
         fi
-        if [[ -n "$root_disk" ]]; then
-            echo "/dev/$root_disk"
+        cur="$root_source"
+        local depth=0
+        while (( depth < 8 )); do
+            parent=$(lsblk -ndo PKNAME "$cur" 2>/dev/null | tail -n1 | sed 's/^[^[:alnum:]\/]*//')
+            [[ -n "$parent" ]] || break
+            [[ "$parent" == /dev/* ]] && cur="$parent" || cur="/dev/$parent"
+            depth=$((depth + 1))
+        done
+        if [[ "$cur" != "$root_source" && -n "$cur" ]]; then
+            echo "$cur"
             return
         fi
     fi
-    disks=$(lsblk | sed 's/[[:space:]]*$//g' | grep "disk$" | cut -d' ' -f1 | grep -v "fd[0-9]*\|sr[0-9]*" | head -n1)
+    disks=$(lsblk -ndo NAME,TYPE 2>/dev/null | awk '$2 == "disk" && $1 !~ /^(fd|sr|loop|ram|zram)[0-9]*/ {print $1; exit}' | sed 's/^[^[:alnum:]\/]*//')
+    if [[ -z "$disks" ]]; then
+        disks=$(lsblk 2>/dev/null | sed 's/[[:space:]]*$//g' | grep "disk$" | cut -d' ' -f1 | sed 's/^[^[:alnum:]\/]*//' | grep -v "fd[0-9]*\|sr[0-9]*" | head -n1)
+    fi
     if [[ "$disks" == /dev/* ]]; then
         echo "$disks"
     elif [[ -n "$disks" ]]; then
@@ -540,16 +936,36 @@ reinstall_get_target_disk() {
 }
 
 reinstall_get_grub() {
-    local boot_dir="${1:-/boot}" folder file_name ver
-    while IFS= read -r folder; do
+    local boot_dir="${1:-/boot}" folder='' file_name='' cfg_path='' ver=0 fallback=''
+    for folder in "${boot_dir}/grub" "${boot_dir}/grub2"; do
         for file_name in grub.cfg grub.conf; do
             [[ -f "$folder/$file_name" ]] || continue
             ver=0
             [[ "$file_name" == grub.conf ]] && ver=1
+            if grep -q '^[[:space:]]*menuentry[[:space:]]' "$folder/$file_name" 2>/dev/null; then
+                printf '%s:%s:%s\n' "$folder" "$file_name" "$ver"
+                return 0
+            fi
+            [[ -z "$fallback" ]] && fallback="${folder}:${file_name}:${ver}"
+        done
+    done
+    while IFS= read -r cfg_path; do
+        [[ -f "$cfg_path" ]] || continue
+        folder=$(dirname "$cfg_path")
+        file_name=$(basename "$cfg_path")
+        ver=0
+        [[ "$file_name" == grub.conf ]] && ver=1
+        if grep -q '^[[:space:]]*menuentry[[:space:]]' "$cfg_path" 2>/dev/null; then
             printf '%s:%s:%s\n' "$folder" "$file_name" "$ver"
             return 0
-        done
-    done < <(find "$boot_dir" \( -type d -name 'grub*' -print \) -o \( -type f -name grubenv -exec dirname {} \; \) 2>/dev/null)
+        fi
+        [[ -z "$fallback" ]] && fallback="${folder}:${file_name}:${ver}"
+    done < <(find "$boot_dir" -type f \( -name 'grub.cfg' -o -name 'grub.conf' \) 2>/dev/null)
+
+    if [[ -n "$fallback" ]]; then
+        printf '%s\n' "$fallback"
+        return 0
+    fi
     return 1
 }
 
@@ -557,201 +973,1429 @@ reinstall_low_mem() {
     local mem=''
     mem=$(grep "^MemTotal:" /proc/meminfo 2>/dev/null | grep -o "[0-9]*")
     [[ -n "$mem" ]] || return 0
-    [[ "$mem" -le "524288" ]] && return 1 || return 0
+    (( mem >= 360000 && mem <= 1048576 )) && return 1 || return 0
+}
+
+reinstall_validate_kernel_image() {
+    local kfile="$1" arch="$2" fsize=0
+    [[ -f "$kfile" ]] || return 1
+    fsize=$(wc -c < "$kfile" 2>/dev/null | tr -d '[:space:]')
+    [[ "$fsize" =~ ^[0-9]+$ ]] && (( fsize >= 524288 )) || return 1
+
+    od -An -tx1 -v -N 518 "$kfile" 2>/dev/null | awk -v arch="$arch" '
+        {
+            for (i = 1; i <= NF; i++) b[++n] = tolower($i)
+        }
+        END {
+            if (n < 518) exit 1
+            m0 = b[1] b[2]
+            mz = b[5] b[6] b[7] b[8]
+            ma = b[57] b[58] b[59] b[60]
+            mh = b[515] b[516] b[517] b[518]
+            if (arch == "amd64") {
+                exit((ma != "41524d64" && mz != "7a696d67" && (mh == "48647253" || m0 == "4d5a")) ? 0 : 1)
+            }
+            if (arch == "arm64") {
+                exit((mh != "48647253" && (ma == "41524d64" || mz == "7a696d67" || m0 == "4d5a" || m0 == "1f8b")) ? 0 : 1)
+            }
+            exit 1
+        }
+    '
 }
 
 reinstall_validate_grub_config() {
-    local grub_file="$1" open_count='' close_count=''
+    local grub_file="$1" open_count='' close_count='' log_file="${REINSTALL_TMP_ROOT:-/tmp}/grub-script-check.log"
     if command -v grub-script-check >/dev/null 2>&1; then
-        grub-script-check "$grub_file" >/tmp/grub-script-check.log 2>&1
+        grub-script-check "$grub_file" >"$log_file" 2>&1
         return $?
     elif command -v grub2-script-check >/dev/null 2>&1; then
-        grub2-script-check "$grub_file" >/tmp/grub-script-check.log 2>&1
+        grub2-script-check "$grub_file" >"$log_file" 2>&1
         return $?
     fi
     open_count=$(grep -o '{' "$grub_file" 2>/dev/null | wc -l | tr -d ' ')
     close_count=$(grep -o '}' "$grub_file" 2>/dev/null | wc -l | tr -d ' ')
     if grep -q 'menuentry ' "$grub_file" && [[ "$open_count" == "$close_count" ]]; then
-        : >/tmp/grub-script-check.log
+        : >"$log_file"
         return 0
     fi
     return 1
 }
 
 reinstall_detect_current_ssh_port() {
-    local port=''
-    if command -v sshd >/dev/null 2>&1; then
-        port=$(sshd -T 2>/dev/null | awk 'tolower($1) == "port" {print $2; exit}')
-    fi
-    if [[ ! "$port" =~ ^[0-9]+$ ]] && [[ -f /etc/ssh/sshd_config ]]; then
-        port=$(awk 'tolower($1) == "port" {print $2}' /etc/ssh/sshd_config 2>/dev/null | tail -n1)
-    fi
-    [[ "$port" =~ ^[0-9]+$ ]] || port='22'
-    echo "$port"
+    ssh_get_current_port
+}
+
+reinstall_hash_password() {
+    local pw="$1"
+    printf '%s\n' "$pw" | openssl passwd -6 -stdin 2>/dev/null ||
+        printf '%s\n' "$pw" | openssl passwd -1 -stdin 2>/dev/null
 }
 
 reinstall_select_debian_mirror() {
-    local dist="$1" current='' url=''
-    for current in "https://deb.debian.org/debian" "https://archive.debian.org/debian"; do
-        url="${current}/dists/${dist}/main/installer-amd64/current/images/netboot/debian-installer/amd64/initrd.gz"
-        if wget -4 --spider --timeout=3 -o /dev/null "$url"; then
-            echo "$current"
-            return 0
-        fi
+    local dist="$1" arch="$2" stack_mode="$3"
+    local current='' url='' fam=''
+    local -a families=() mirrors=(
+        "https://deb.debian.org/debian"
+        "https://ftp.debian.org/debian"
+        "https://archive.debian.org/debian"
+        "http://deb.debian.org/debian"
+        "http://ftp.debian.org/debian"
+        "http://archive.debian.org/debian"
+    )
+
+    case "$stack_mode" in
+        ipv4) families=("-4") ;;
+        ipv6) families=("-6") ;;
+        dual) families=("-4" "-6") ;;
+        *) return 1 ;;
+    esac
+
+    for fam in "${families[@]}"; do
+        for current in "${mirrors[@]}"; do
+            url="${current}/dists/${dist}/main/installer-${arch}/current/images/netboot/debian-installer/${arch}/initrd.gz"
+            if wget "$fam" --spider -q --timeout=4 --tries=1 "$url" >/dev/null 2>&1; then
+                if [[ "$fam" == "-4" ]]; then
+                    printf 'ipv4|%s\n' "$current"
+                else
+                    printf 'ipv6|%s\n' "$current"
+                fi
+                return 0
+            fi
+        done
     done
     return 1
 }
 
-reinstall_pick_ipv6_line() {
-    local iface="$1" ip6_line='' ip6_src=''
-
-    ip6_line=$(ip -6 -o addr show dev "$iface" scope global 2>/dev/null | awk '!/ temporary / && !/ deprecated / {print; exit}')
-    if [[ -z "$ip6_line" ]]; then
-        ip6_src=$(ip -6 route get 2001:4860:4860::8888 oif "$iface" 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "src") {print $(i + 1); exit}}')
-        if [[ -n "$ip6_src" ]]; then
-            ip6_line=$(ip -6 -o addr show dev "$iface" scope global 2>/dev/null | awk -v src="$ip6_src" '$4 ~ ("^" src "/") {print; exit}')
-        fi
-    fi
-
-    echo "$ip6_line"
+reinstall_is_global_unicast_ipv6() {
+    local addr="${1:-}" exp=''
+    addr="${addr%%/*}"
+    addr="${addr%%%*}"
+    exp=$(reinstall_expand_ipv6 "$addr") || return 1
+    case "$exp" in
+        0000:0000:0000:0000:0000:0000:0000:0000|\
+        0000:0000:0000:0000:0000:0000:0000:0001|\
+        0064:ff9b:*|\
+        fe[89ab]?:*|\
+        fc??:*|fd??:*|\
+        ff??:*)
+            return 1
+            ;;
+    esac
+    return 0
 }
 
-reinstall_gather_network_state() {
-    local iaddr='' ip6_line='' ip6_route='' ipv6_iface=''
+reinstall_pick_ipv4_line() {
+    local iface="$1" line='' addr_tok='' addr_ip='' v4_src='' fallback_line=''
+    local -a addr_lines=()
+    [[ -n "$iface" ]] || return 1
 
-    REINSTALL_NETWORK_INTERFACE=$(reinstall_get_default_interface)
-    [[ -n "$REINSTALL_NETWORK_INTERFACE" ]] || {
-        echo -e "${RED}未检测到默认网卡。${PLAIN}"
-        exit 1
-    }
+    mapfile -t addr_lines < <(ip -4 -o addr show dev "$iface" scope global 2>/dev/null)
+    (( ${#addr_lines[@]} > 0 )) || return 1
 
-    iaddr=$(ip -4 addr show dev "$REINSTALL_NETWORK_INTERFACE" | awk '/inet / {print $2; exit}')
-    REINSTALL_IPV4_ADDR="${iaddr%/*}"
-    REINSTALL_IPV4_PREFIX="${iaddr#*/}"
-    REINSTALL_IPV4_MASK=$(reinstall_cidr_to_netmask "$REINSTALL_IPV4_PREFIX")
-    REINSTALL_IPV4_GATE=$(ip -4 route show default | awk '/^default/ {print $3; exit}')
+    v4_src=$(
+        reinstall_get_default_routes -4 "$iface" |
+            awk '{for (i = 1; i < NF; i++) if ($i == "src") {print $(i + 1); exit}}'
+    )
+    if [[ -z "$v4_src" ]]; then
+        v4_src=$(ip -4 route get 1.1.1.1 oif "$iface" 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") {print $(i + 1); exit}}')
+    fi
 
-    [[ -n "$REINSTALL_IPV4_ADDR" && -n "$REINSTALL_IPV4_MASK" && -n "$REINSTALL_IPV4_GATE" ]] || {
-        echo -e "${RED}当前 IPv4 信息不完整，无法执行重装。${PLAIN}"
-        exit 1
-    }
+    if [[ -n "$v4_src" ]] && reinstall_ipv4_to_uint "$v4_src" >/dev/null 2>&1; then
+        for line in "${addr_lines[@]}"; do
+            [[ "$line" =~ (^|[[:space:]])inet[[:space:]]+([^[:space:]]+) ]] || continue
+            addr_tok="${BASH_REMATCH[2]}"
+            addr_ip="${addr_tok%%/*}"
+            if [[ "$addr_ip" == "$v4_src" ]]; then
+                printf '%s\n' "$line"
+                return 0
+            fi
+        done
+    fi
 
+    for line in "${addr_lines[@]}"; do
+        [[ "$line" =~ (^|[[:space:]])inet[[:space:]]+([^[:space:]]+) ]] || continue
+        addr_tok="${BASH_REMATCH[2]}"
+        addr_ip="${addr_tok%%/*}"
+        case "$addr_ip" in
+            127.*|169.254.*|'') continue ;;
+        esac
+        reinstall_ipv4_to_uint "$addr_ip" >/dev/null 2>&1 || continue
+        if reinstall_is_public_ipv4 "$addr_ip"; then
+            printf '%s\n' "$line"
+            return 0
+        fi
+        [[ -z "$fallback_line" ]] && fallback_line="$line"
+    done
+
+    if [[ -n "$fallback_line" ]]; then
+        printf '%s\n' "$fallback_line"
+        return 0
+    fi
+    return 1
+}
+
+reinstall_pick_ipv6_line() {
+    local iface="$1" line='' addr_tok='' ip6_src='' src_exp='' tok_exp=''
+    local -a addr_lines=()
+    [[ -n "$iface" ]] || return 1
+
+    mapfile -t addr_lines < <(ip -6 -o addr show dev "$iface" scope global 2>/dev/null)
+    (( ${#addr_lines[@]} > 0 )) || return 1
+
+    ip6_src=$(
+        reinstall_get_default_routes -6 "$iface" |
+            awk '{for (i = 1; i < NF; i++) if ($i == "src") {print $(i + 1); exit}}'
+    )
+    if [[ -z "$ip6_src" ]]; then
+        ip6_src=$(ip -6 route get 2001:4860:4860::8888 oif "$iface" 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") {print $(i + 1); exit}}')
+    fi
+    if reinstall_is_global_unicast_ipv6 "$ip6_src"; then
+        src_exp=$(reinstall_expand_ipv6 "$ip6_src" || true)
+        for line in "${addr_lines[@]}"; do
+            [[ "$line" =~ (^|[[:space:]])(temporary|deprecated|tentative)([[:space:]]|$) ]] && continue
+            [[ "$line" =~ (^|[[:space:]])inet6[[:space:]]+([^[:space:]]+) ]] || continue
+            addr_tok="${BASH_REMATCH[2]}"
+            tok_exp=$(reinstall_expand_ipv6 "${addr_tok%%/*}" || true)
+            if [[ -n "$src_exp" && "$tok_exp" == "$src_exp" ]]; then
+                printf '%s\n' "$line"
+                return 0
+            fi
+        done
+    fi
+
+    for line in "${addr_lines[@]}"; do
+        [[ "$line" =~ (^|[[:space:]])(temporary|deprecated|tentative)([[:space:]]|$) ]] && continue
+        [[ "$line" =~ (^|[[:space:]])inet6[[:space:]]+([^[:space:]]+) ]] || continue
+        addr_tok="${BASH_REMATCH[2]}"
+        if reinstall_is_global_unicast_ipv6 "$addr_tok"; then
+            printf '%s\n' "$line"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+reinstall_probe_network_state() {
+    local v4_line='' v4_tok='' v4_peer_tok='' v4_route=''
+    local ip6_line='' v6_tok='' v6_peer_tok='' ip6_route='' cand='' v4_has_v6_main_route=''
+
+    REINSTALL_HAS_IPV4=0
+    REINSTALL_IPV4_IFACE=''
+    REINSTALL_IPV4_MAC=''
+    REINSTALL_IPV4_MODE='none'
+    REINSTALL_IPV4_ADDR=''
+    REINSTALL_IPV4_PREFIX=''
+    REINSTALL_IPV4_MASK=''
+    REINSTALL_IPV4_GATE=''
+
+    REINSTALL_HAS_IPV6=0
+    REINSTALL_IPV6_IFACE=''
+    REINSTALL_IPV6_MAC=''
     REINSTALL_IPV6_MODE='none'
     REINSTALL_IPV6_ADDR=''
     REINSTALL_IPV6_PREFIX=''
     REINSTALL_IPV6_GATE=''
 
-    ipv6_iface=$(ip -6 route show default 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i + 1); exit}}')
-    [[ -n "$ipv6_iface" ]] || ipv6_iface="$REINSTALL_NETWORK_INTERFACE"
+    REINSTALL_NETWORK_INTERFACE=''
 
-    ip6_line=$(reinstall_pick_ipv6_line "$ipv6_iface")
-    if [[ -z "$ip6_line" && "$ipv6_iface" != "$REINSTALL_NETWORK_INTERFACE" ]]; then
-        ip6_line=$(reinstall_pick_ipv6_line "$REINSTALL_NETWORK_INTERFACE")
+    REINSTALL_IPV4_IFACE=$(reinstall_find_family_iface -4 || true)
+    if [[ -n "$REINSTALL_IPV4_IFACE" ]] && v4_line=$(reinstall_pick_ipv4_line "$REINSTALL_IPV4_IFACE"); then
+        REINSTALL_IPV4_MAC=$(reinstall_get_iface_mac "$REINSTALL_IPV4_IFACE" || true)
+        [[ "$v4_line" =~ (^|[[:space:]])inet[[:space:]]+([^[:space:]]+) ]] && v4_tok="${BASH_REMATCH[2]}"
+        [[ "$v4_line" =~ (^|[[:space:]])peer[[:space:]]+([^[:space:]]+) ]] && v4_peer_tok="${BASH_REMATCH[2]}"
+        if [[ "$v4_tok" == */* ]]; then
+            REINSTALL_IPV4_ADDR="${v4_tok%/*}"
+            REINSTALL_IPV4_PREFIX="${v4_tok#*/}"
+        elif [[ -n "$v4_peer_tok" ]]; then
+            REINSTALL_IPV4_ADDR="$v4_tok"
+            if [[ "$v4_peer_tok" == */* ]]; then
+                REINSTALL_IPV4_PREFIX="${v4_peer_tok#*/}"
+            else
+                REINSTALL_IPV4_PREFIX='32'
+            fi
+        else
+            REINSTALL_IPV4_ADDR="$v4_tok"
+            REINSTALL_IPV4_PREFIX='32'
+        fi
+
+        if [[ -n "$REINSTALL_IPV4_ADDR" ]] && reinstall_ipv4_to_uint "$REINSTALL_IPV4_ADDR" >/dev/null 2>&1; then
+            REINSTALL_IPV4_MASK=$(reinstall_cidr_to_netmask "$REINSTALL_IPV4_PREFIX")
+            v4_route=$(reinstall_get_default_routes -4 "$REINSTALL_IPV4_IFACE" || true)
+            if [[ -n "$v4_route" ]]; then
+                [[ "$v4_route" =~ (^|[[:space:]])via[[:space:]]+([^[:space:]]+) ]] && REINSTALL_IPV4_GATE="${BASH_REMATCH[2]}"
+                if [[ -z "$REINSTALL_IPV4_GATE" && -n "$v4_peer_tok" ]]; then
+                    REINSTALL_IPV4_GATE="${v4_peer_tok%%/*}"
+                fi
+                if [[ -n "$REINSTALL_IPV4_GATE" ]] && ! reinstall_ipv4_to_uint "$REINSTALL_IPV4_GATE" >/dev/null 2>&1; then
+                    REINSTALL_IPV4_GATE=''
+                fi
+
+                if [[ "$v4_line" =~ (^|[[:space:]])dynamic([[:space:]]|$) ]] ||
+                   [[ "$v4_route" =~ (^|[[:space:]])proto[[:space:]]+dhcp([[:space:]]|$) ]] ||
+                   [[ -z "$REINSTALL_IPV4_GATE" ]]; then
+                    REINSTALL_IPV4_MODE='dhcp'
+                else
+                    REINSTALL_IPV4_MODE='static'
+                fi
+                REINSTALL_HAS_IPV4=1
+            fi
+        fi
     fi
 
-    if [[ -n "$ip6_line" ]]; then
-        REINSTALL_IPV6_ADDR=$(echo "$ip6_line" | awk '{print $4}' | cut -d/ -f1)
-        REINSTALL_IPV6_PREFIX=$(echo "$ip6_line" | awk '{print $4}' | cut -d/ -f2)
-        ip6_route=$(ip -6 route show default dev "$ipv6_iface" 2>/dev/null | awk '/^default/ {print; exit}')
-        REINSTALL_IPV6_GATE=$(echo "$ip6_route" | awk '/^default/ {print $3; exit}')
-        if echo "$ip6_line $ip6_route" | grep -Eq 'proto[[:space:]]+ra|(^|[[:space:]])dynamic([[:space:]]|$)|(^|[[:space:]])mngtmpaddr([[:space:]]|$)'; then
-            REINSTALL_IPV6_MODE='auto'
-        elif [[ -n "$REINSTALL_IPV6_GATE" ]]; then
-            REINSTALL_IPV6_MODE='static'
-        else
-            REINSTALL_IPV6_MODE='auto'
+    if (( REINSTALL_HAS_IPV4 == 0 )); then
+        REINSTALL_IPV4_IFACE=''
+        REINSTALL_IPV4_MAC=''
+        REINSTALL_IPV4_MODE='none'
+        REINSTALL_IPV4_ADDR=''
+        REINSTALL_IPV4_PREFIX=''
+        REINSTALL_IPV4_MASK=''
+        REINSTALL_IPV4_GATE=''
+    fi
+
+    if (( REINSTALL_HAS_IPV4 == 1 )) && [[ -n "$REINSTALL_IPV4_IFACE" ]]; then
+        v4_has_v6_main_route=$(ip -6 route show default dev "$REINSTALL_IPV4_IFACE" 2>/dev/null | grep -Ev '^[[:space:]]*(unreachable|prohibit|blackhole|throw)([[:space:]]|$)' || true)
+    fi
+    if [[ -n "$v4_has_v6_main_route" ]] && ip6_line=$(reinstall_pick_ipv6_line "$REINSTALL_IPV4_IFACE"); then
+        REINSTALL_IPV6_IFACE="$REINSTALL_IPV4_IFACE"
+    else
+        cand=$(reinstall_find_family_iface -6 || true)
+        if [[ -n "$cand" ]] && ip6_line=$(reinstall_pick_ipv6_line "$cand"); then
+            REINSTALL_IPV6_IFACE="$cand"
         fi
+    fi
+
+    if [[ -n "$REINSTALL_IPV6_IFACE" && -n "$ip6_line" ]]; then
+        REINSTALL_IPV6_MAC=$(reinstall_get_iface_mac "$REINSTALL_IPV6_IFACE" || true)
+        [[ "$ip6_line" =~ (^|[[:space:]])inet6[[:space:]]+([^[:space:]]+) ]] && v6_tok="${BASH_REMATCH[2]}"
+        [[ "$ip6_line" =~ (^|[[:space:]])peer[[:space:]]+([^[:space:]]+) ]] && v6_peer_tok="${BASH_REMATCH[2]}"
+        if [[ "$v6_tok" == */* ]]; then
+            REINSTALL_IPV6_ADDR="${v6_tok%/*}"
+            REINSTALL_IPV6_PREFIX="${v6_tok#*/}"
+        elif [[ -n "$v6_peer_tok" ]]; then
+            REINSTALL_IPV6_ADDR="$v6_tok"
+            if [[ "$v6_peer_tok" == */* ]]; then
+                REINSTALL_IPV6_PREFIX="${v6_peer_tok#*/}"
+            else
+                REINSTALL_IPV6_PREFIX='128'
+            fi
+        else
+            REINSTALL_IPV6_ADDR="$v6_tok"
+            REINSTALL_IPV6_PREFIX='64'
+        fi
+        REINSTALL_IPV6_ADDR="${REINSTALL_IPV6_ADDR%%%*}"
+        [[ "$REINSTALL_IPV6_PREFIX" =~ ^[0-9]+$ ]] || REINSTALL_IPV6_PREFIX='64'
+
+        ip6_route=$(reinstall_get_default_routes -6 "$REINSTALL_IPV6_IFACE" || true)
+        if [[ -n "$ip6_route" ]]; then
+            [[ "$ip6_route" =~ (^|[[:space:]])via[[:space:]]+([^[:space:]]+) ]] && REINSTALL_IPV6_GATE="${BASH_REMATCH[2]}"
+            if [[ -z "$REINSTALL_IPV6_GATE" && -n "$v6_peer_tok" ]]; then
+                REINSTALL_IPV6_GATE="${v6_peer_tok%%/*}"
+            fi
+            REINSTALL_IPV6_GATE="${REINSTALL_IPV6_GATE%%%*}"
+
+            if [[ "$ip6_line" =~ mngtmpaddr|proto[[:space:]]+kernel_ra ]]; then
+                REINSTALL_IPV6_MODE='slaac'
+            elif [[ "$ip6_line" =~ (^|[[:space:]])dynamic([[:space:]]|$)|proto[[:space:]]+dhcp ]]; then
+                if [[ "$REINSTALL_IPV6_PREFIX" == "128" || "$ip6_line" =~ proto[[:space:]]+dhcp ]]; then
+                    REINSTALL_IPV6_MODE='dhcp6'
+                else
+                    REINSTALL_IPV6_MODE='slaac'
+                fi
+            else
+                REINSTALL_IPV6_MODE='static'
+            fi
+
+            if reinstall_expand_ipv6 "$REINSTALL_IPV6_ADDR" >/dev/null 2>&1; then
+                REINSTALL_HAS_IPV6=1
+            fi
+        fi
+    fi
+
+    if (( REINSTALL_HAS_IPV6 == 0 )); then
+        REINSTALL_IPV6_IFACE=''
+        REINSTALL_IPV6_MAC=''
+        REINSTALL_IPV6_MODE='none'
+        REINSTALL_IPV6_ADDR=''
+        REINSTALL_IPV6_PREFIX=''
+        REINSTALL_IPV6_GATE=''
+    fi
+
+    if [[ -n "$REINSTALL_IPV4_IFACE" && "$REINSTALL_HAS_IPV4" -eq 1 ]]; then
+        REINSTALL_NETWORK_INTERFACE="$REINSTALL_IPV4_IFACE"
+    elif [[ -n "$REINSTALL_IPV6_IFACE" && "$REINSTALL_HAS_IPV6" -eq 1 ]]; then
+        REINSTALL_NETWORK_INTERFACE="$REINSTALL_IPV6_IFACE"
+    else
+        REINSTALL_NETWORK_INTERFACE=$(reinstall_get_default_interface || true)
     fi
 }
 
-reinstall_build_ipv6_block() {
-    case "$REINSTALL_IPV6_MODE" in
+reinstall_resolve_stack_mode() {
+    local pref="${1:-${REINSTALL_STACK_PREF:-auto}}"
+    REINSTALL_EFFECTIVE_STACK=''
+    REINSTALL_STACK_ERROR=''
+
+    case "$pref" in
         auto)
+            if (( REINSTALL_HAS_IPV4 == 1 && REINSTALL_HAS_IPV6 == 1 )); then
+                REINSTALL_EFFECTIVE_STACK='dual'
+            elif (( REINSTALL_HAS_IPV4 == 1 )); then
+                REINSTALL_EFFECTIVE_STACK='ipv4'
+            elif (( REINSTALL_HAS_IPV6 == 1 )); then
+                REINSTALL_EFFECTIVE_STACK='ipv6'
+            else
+                REINSTALL_STACK_ERROR='未检测到可用的公网 IPv4 或 IPv6 网络配置，无法执行重装。'
+                return 1
+            fi
+            ;;
+        dual)
+            if (( REINSTALL_HAS_IPV4 != 1 )); then
+                REINSTALL_STACK_ERROR='当前主机未检测到完整的公网 IPv4 配置，无法使用「双栈」模式重装。'
+                return 1
+            fi
+            if (( REINSTALL_HAS_IPV6 != 1 )); then
+                REINSTALL_STACK_ERROR='当前主机未检测到完整的公网 IPv6 配置，无法使用「双栈」模式重装。'
+                return 1
+            fi
+            REINSTALL_EFFECTIVE_STACK='dual'
+            ;;
+        ipv4)
+            if (( REINSTALL_HAS_IPV4 != 1 )); then
+                REINSTALL_STACK_ERROR='当前主机未检测到完整的公网 IPv4 配置，无法使用「仅 IPv4」模式重装。'
+                return 1
+            fi
+            REINSTALL_EFFECTIVE_STACK='ipv4'
+            ;;
+        ipv6)
+            if (( REINSTALL_HAS_IPV6 != 1 )); then
+                REINSTALL_STACK_ERROR='当前主机未检测到完整的公网 IPv6 配置，无法使用「仅 IPv6」模式重装。'
+                return 1
+            fi
+            REINSTALL_EFFECTIVE_STACK='ipv6'
+            ;;
+        *)
+            REINSTALL_STACK_ERROR="未知的网络栈模式: ${pref}"
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+reinstall_stack_label() {
+    case "${1:-}" in
+        dual) echo "双栈 (IPv4 + IPv6)" ;;
+        ipv4) echo "仅 IPv4" ;;
+        ipv6) echo "仅 IPv6" ;;
+        auto) echo "自动识别" ;;
+        *)    echo "未知" ;;
+    esac
+}
+
+reinstall_gather_network_state() {
+    reinstall_probe_network_state
+    [[ -n "$REINSTALL_NETWORK_INTERFACE" ]] || {
+        echo -e "${RED}未检测到默认网卡。${PLAIN}"
+        exit 1
+    }
+    if ! reinstall_resolve_stack_mode "${REINSTALL_STACK_PREF:-auto}"; then
+        echo -e "${RED}${REINSTALL_STACK_ERROR}${PLAIN}"
+        exit 1
+    fi
+}
+
+reinstall_target_dns_list() {
+    case "${1:-$REINSTALL_EFFECTIVE_STACK}" in
+        ipv4) echo "$REINSTALL_DNS_V4" ;;
+        ipv6) echo "$REINSTALL_DNS_V6" ;;
+        dual) echo "$REINSTALL_DNS_LIST" ;;
+        *)    echo "$REINSTALL_DNS_LIST" ;;
+    esac
+}
+
+reinstall_build_ipv4_stanza() {
+    local dns_line="$1"
+    case "$REINSTALL_IPV4_MODE" in
+        dhcp)
             cat <<'EOF'
-cat >> /etc/network/interfaces <<EOF_IPV6
-iface $iface inet6 dhcp
-    accept_ra 2
-    autoconf 1
-EOF_IPV6
+cat >> /etc/network/interfaces <<EOF_IPV4
+
+auto $iface4
+iface $iface4 inet dhcp
+EOF_IPV4
 EOF
             ;;
         static)
-            cat <<EOF
-cat >> /etc/network/interfaces <<EOF_IPV6
-iface \$iface inet6 static
-    address ${REINSTALL_IPV6_ADDR}/${REINSTALL_IPV6_PREFIX}
-    gateway ${REINSTALL_IPV6_GATE}
-EOF_IPV6
+            if reinstall_ipv4_in_same_subnet "$REINSTALL_IPV4_ADDR" "$REINSTALL_IPV4_PREFIX" "$REINSTALL_IPV4_GATE"; then
+                cat <<EOF
+cat >> /etc/network/interfaces <<EOF_IPV4
+
+auto \$iface4
+iface \$iface4 inet static
+    address ${REINSTALL_IPV4_ADDR}
+    netmask ${REINSTALL_IPV4_MASK}
+    gateway ${REINSTALL_IPV4_GATE}
+    dns-nameservers ${dns_line}
+EOF_IPV4
 EOF
-            ;;
-        *)
+            elif [[ "$REINSTALL_IPV4_PREFIX" == "32" ]]; then
+                cat <<EOF
+cat >> /etc/network/interfaces <<EOF_IPV4
+
+auto \$iface4
+iface \$iface4 inet static
+    address ${REINSTALL_IPV4_ADDR}
+    netmask 255.255.255.255
+    pointopoint ${REINSTALL_IPV4_GATE}
+    gateway ${REINSTALL_IPV4_GATE}
+    dns-nameservers ${dns_line}
+EOF_IPV4
+EOF
+            else
+                cat <<EOF
+cat >> /etc/network/interfaces <<EOF_IPV4
+
+auto \$iface4
+iface \$iface4 inet static
+    address ${REINSTALL_IPV4_ADDR}
+    netmask ${REINSTALL_IPV4_MASK}
+    post-up ip -4 route replace ${REINSTALL_IPV4_GATE} dev \\\$IFACE
+    post-up ip -4 route replace default via ${REINSTALL_IPV4_GATE} dev \\\$IFACE onlink
+    dns-nameservers ${dns_line}
+EOF_IPV4
+EOF
+            fi
             ;;
     esac
 }
 
-reinstall_write_post_install_script() {
-    local ipv6_block=''
-    ipv6_block=$(reinstall_build_ipv6_block)
+reinstall_build_ipv6_stanza() {
+    local include_auto="$1" dns_line="$2" auto_header=''
+    if [[ "$include_auto" == "1" ]]; then
+        auto_header='auto $iface6
+'
+    fi
+    case "$REINSTALL_IPV6_MODE" in
+        slaac)
+            cat <<EOF
+cat >> /etc/network/interfaces <<EOF_IPV6
 
-    cat > /tmp/boot/post-install.sh <<EOF || return 1
+${auto_header}iface \$iface6 inet6 auto
+    accept_ra 2
+    dns-nameservers ${dns_line}
+EOF_IPV6
+EOF
+            ;;
+        dhcp6)
+            cat <<EOF
+cat >> /etc/network/interfaces <<EOF_IPV6
+
+${auto_header}iface \$iface6 inet6 dhcp
+    accept_ra 2
+    dns-nameservers ${dns_line}
+EOF_IPV6
+EOF
+            ;;
+        static)
+            if [[ -z "$REINSTALL_IPV6_GATE" ]]; then
+                cat <<EOF
+cat >> /etc/network/interfaces <<EOF_IPV6
+
+${auto_header}iface \$iface6 inet6 static
+    address ${REINSTALL_IPV6_ADDR}/${REINSTALL_IPV6_PREFIX}
+    accept_ra 2
+    dns-nameservers ${dns_line}
+EOF_IPV6
+EOF
+            elif [[ "$(printf '%s' "$REINSTALL_IPV6_GATE" | tr '[:upper:]' '[:lower:]')" == fe80:* ]] ||
+                 reinstall_ipv6_in_same_subnet "$REINSTALL_IPV6_ADDR" "$REINSTALL_IPV6_PREFIX" "$REINSTALL_IPV6_GATE"; then
+                cat <<EOF
+cat >> /etc/network/interfaces <<EOF_IPV6
+
+${auto_header}iface \$iface6 inet6 static
+    address ${REINSTALL_IPV6_ADDR}/${REINSTALL_IPV6_PREFIX}
+    gateway ${REINSTALL_IPV6_GATE}
+    accept_ra 2
+    dns-nameservers ${dns_line}
+EOF_IPV6
+EOF
+            else
+                cat <<EOF
+cat >> /etc/network/interfaces <<EOF_IPV6
+
+${auto_header}iface \$iface6 inet6 static
+    address ${REINSTALL_IPV6_ADDR}/${REINSTALL_IPV6_PREFIX}
+    accept_ra 2
+    post-up ip -6 route replace ${REINSTALL_IPV6_GATE} dev \\\$IFACE
+    post-up ip -6 route replace default via ${REINSTALL_IPV6_GATE} dev \\\$IFACE onlink
+    dns-nameservers ${dns_line}
+EOF_IPV6
+EOF
+            fi
+            ;;
+    esac
+}
+
+reinstall_write_netcfg_hook() {
+    local boot_work_dir="$1" orig_postinst="$2"
+    local installer_mac='' installer_iface=''
+
+    [[ -s "$orig_postinst" ]] || return 1
+    mkdir -p "$boot_work_dir" || return 1
+
+    if [[ "$REINSTALL_INSTALLER_FAMILY" == "ipv6" ]]; then
+        installer_mac="$REINSTALL_IPV6_MAC"
+        installer_iface="$REINSTALL_IPV6_IFACE"
+    else
+        installer_mac="$REINSTALL_IPV4_MAC"
+        installer_iface="$REINSTALL_IPV4_IFACE"
+    fi
+
+    cat > "${boot_work_dir}/fix-netcfg-route.sh" <<EOF || return 1
+#!/bin/sh
+exec </dev/null >/dev/null 2>&1 3>&- || exec </dev/null >/dev/null 2>&1
+INSTALLER_MAC='${installer_mac}'
+INSTALLER_IFACE='${installer_iface}'
+INSTALLER_FAMILY='${REINSTALL_INSTALLER_FAMILY}'
+EFFECTIVE_STACK='${REINSTALL_EFFECTIVE_STACK:-}'
+IPV4_ADDR='${REINSTALL_IPV4_ADDR}'
+IPV4_PREFIX='${REINSTALL_IPV4_PREFIX}'
+IPV4_GATE='${REINSTALL_IPV4_GATE}'
+IPV6_ADDR='${REINSTALL_IPV6_ADDR}'
+IPV6_PREFIX='${REINSTALL_IPV6_PREFIX}'
+IPV6_GATE='${REINSTALL_IPV6_GATE}'
+DNS_V4='${REINSTALL_DNS_V4}'
+DNS_V6='${REINSTALL_DNS_V6}'
+EOF
+    cat >> "${boot_work_dir}/fix-netcfg-route.sh" <<'EOF' || return 1
+
+SYS_NET="${ZERO_SYS_NET_DIR:-/sys/class/net}"
+PROC_ROOT="${ZERO_PROC_DIR:-/proc}"
+IPV6_CONF_DIR="${PROC_ROOT}/sys/net/ipv6/conf"
+RESOLV_CONF="${ZERO_RESOLV_CONF:-/etc/resolv.conf}"
+tab_ch=$(printf '\t')
+cr_ch=$(printf '\r')
+ws=" ${tab_ch}${cr_ch}"
+
+resolve_iface() {
+    target_mac="$1"
+    fallback_iface="$2"
+    if [ -n "$target_mac" ]; then
+        tmac=$(printf '%s' "$target_mac" | tr '[:upper:]' '[:lower:]')
+        for p in "${SYS_NET}"/*/address; do
+            [ -r "$p" ] || continue
+            dev="${p#"${SYS_NET}/"}"
+            dev="${dev%/address}"
+            [ "$dev" = "lo" ] && continue
+            if [ -r "${SYS_NET}/${dev}/type" ]; then
+                ntype=$(cat "${SYS_NET}/${dev}/type" 2>/dev/null || true)
+                [ "$ntype" = "1" ] || continue
+            fi
+            amac=$(tr '[:upper:]' '[:lower:]' < "$p" 2>/dev/null || true)
+            if [ "$amac" = "$tmac" ]; then
+                printf '%s\n' "$dev"
+                return 0
+            fi
+        done
+    fi
+    for p in "${SYS_NET}"/*; do
+        [ -e "$p" ] || continue
+        dev="${p#"${SYS_NET}/"}"
+        [ "$dev" = "lo" ] && continue
+        if [ -r "${SYS_NET}/${dev}/type" ]; then
+            ntype=$(cat "${SYS_NET}/${dev}/type" 2>/dev/null || true)
+            [ "$ntype" = "1" ] || continue
+        fi
+        if ip link show dev "$dev" 2>/dev/null | grep -q 'UP'; then
+            printf '%s\n' "$dev"
+            return 0
+        fi
+    done
+    printf '%s\n' "$fallback_iface"
+}
+
+stop_other_dhcp() {
+    other_fam="$1"
+    for pid_dir in "${PROC_ROOT}"/[0-9]*; do
+        [ -r "${pid_dir}/cmdline" ] || continue
+        pid_num="${pid_dir#"${PROC_ROOT}/"}"
+        [ "$pid_num" = "$$" ] && continue
+        arg0=$(tr '\0' '\n' < "${pid_dir}/cmdline" 2>/dev/null | sed -n '1p')
+        prog="${arg0##*/}"
+        prog="${prog%% *}"
+        prog="${prog%:}"
+        cmdline=$(tr '\0' ' ' < "${pid_dir}/cmdline" 2>/dev/null || true)
+        if [ "$other_fam" = "ipv4" ]; then
+            case "$prog" in
+                udhcpc)
+                    kill "$pid_num" 2>/dev/null || true
+                    ;;
+                dhclient)
+                    case " $cmdline " in
+                        *" -6 "*) ;;
+                        *) kill "$pid_num" 2>/dev/null || true ;;
+                    esac
+                    ;;
+                dhcpcd)
+                    case " $cmdline " in
+                        *" -4 "*|*" --ipv4only "*)
+                            kill "$pid_num" 2>/dev/null || true
+                            ;;
+                        *"[ip4]"*)
+                            case " $cmdline " in
+                                *"[ip6]"*) ;;
+                                *) kill "$pid_num" 2>/dev/null || true ;;
+                            esac
+                            ;;
+                    esac
+                    ;;
+            esac
+        else
+            case "$prog" in
+                odhcp6c|dhcp6c)
+                    kill "$pid_num" 2>/dev/null || true
+                    ;;
+                dhclient)
+                    case " $cmdline " in
+                        *" -6 "*) kill "$pid_num" 2>/dev/null || true ;;
+                    esac
+                    ;;
+                dhcpcd)
+                    case " $cmdline " in
+                        *" -6 "*|*" --ipv6only "*)
+                            kill "$pid_num" 2>/dev/null || true
+                            ;;
+                        *"[ip6]"*)
+                            case " $cmdline " in
+                                *"[ip4]"*) ;;
+                                *) kill "$pid_num" 2>/dev/null || true ;;
+                            esac
+                            ;;
+                    esac
+                    ;;
+            esac
+        fi
+    done
+}
+
+has_default_route() {
+    rfam="$1"
+    {
+        ip "$rfam" route show default 2>/dev/null
+        ip "$rfam" route show 2>/dev/null
+    } | grep -Ev '^[[:space:]]*(unreachable|prohibit|blackhole|throw)([[:space:]]|$)' |
+        grep -Eq '(^|[[:space:]])(default|0\.0\.0\.0/0|::/0)([[:space:]]|$)'
+}
+
+del_default_routes() {
+    rfam="$1"
+    ip "$rfam" route flush default 2>/dev/null || true
+    ip "$rfam" route del default 2>/dev/null || true
+    r_i=0
+    while [ $r_i -lt 8 ]; do
+        rline=$({
+            ip "$rfam" route show default 2>/dev/null
+            ip "$rfam" route show 2>/dev/null
+        } | grep -Ev '^[[:space:]]*(unreachable|prohibit|blackhole|throw)([[:space:]]|$)' |
+            grep -E '(^|[[:space:]])(default|0\.0\.0\.0/0|::/0)([[:space:]]|$)' | sed -n '1p')
+        [ -n "$rline" ] || break
+        rgw=''
+        rdev=''
+        prev_tok=''
+        for tok in $rline; do
+            if [ "$prev_tok" = "via" ] && [ -z "$rgw" ]; then
+                rgw="$tok"
+            elif [ "$prev_tok" = "dev" ] && [ -z "$rdev" ]; then
+                rdev="$tok"
+            fi
+            prev_tok="$tok"
+        done
+        deleted_one=0
+        if [ -n "$rgw" ] && [ -n "$rdev" ]; then
+            ip "$rfam" route del default via "$rgw" dev "$rdev" 2>/dev/null && deleted_one=1 || true
+            if [ "$deleted_one" -eq 0 ] && [ "$rfam" = "-6" ]; then
+                ip -6 route del ::/0 via "$rgw" dev "$rdev" 2>/dev/null && deleted_one=1 || true
+            fi
+        fi
+        if [ "$deleted_one" -eq 0 ] && [ -n "$rdev" ]; then
+            ip "$rfam" route del default dev "$rdev" 2>/dev/null && deleted_one=1 || true
+            if [ "$deleted_one" -eq 0 ] && [ "$rfam" = "-6" ]; then
+                ip -6 route del ::/0 dev "$rdev" 2>/dev/null && deleted_one=1 || true
+            fi
+        fi
+        if [ "$deleted_one" -eq 0 ]; then
+            ip "$rfam" route del default 2>/dev/null && deleted_one=1 || break
+        fi
+        r_i=$((r_i + 1))
+    done
+}
+
+flush_ipv6_iface() {
+    tdev="$1"
+    [ -n "$tdev" ] && [ "$tdev" != "lo" ] || return 0
+    if [ "$EFFECTIVE_STACK" = "ipv4" ]; then
+        ip -6 addr flush dev "$tdev" 2>/dev/null || true
+        ip -6 addr show dev "$tdev" 2>/dev/null | while IFS= read -r aline; do
+            case "$aline" in
+                *inet6[${ws}]*)
+                    rest="${aline#*inet6}"
+                    rest="${rest#"${rest%%[!${ws}]*}"}"
+                    a6="${rest%%[${ws}]*}"
+                    [ -n "$a6" ] && ip -6 addr del "$a6" dev "$tdev" 2>/dev/null || true
+                    ;;
+            esac
+        done
+    else
+        ip -6 addr flush dev "$tdev" scope global 2>/dev/null || true
+        ip -6 addr show dev "$tdev" scope global 2>/dev/null | while IFS= read -r aline; do
+            case "$aline" in
+                *inet6[${ws}]*)
+                    rest="${aline#*inet6}"
+                    rest="${rest#"${rest%%[!${ws}]*}"}"
+                    a6="${rest%%[${ws}]*}"
+                    [ -n "$a6" ] && ip -6 addr del "$a6" dev "$tdev" 2>/dev/null || true
+                    ;;
+            esac
+        done
+    fi
+}
+
+flush_ipv4_iface() {
+    tdev="$1"
+    [ -n "$tdev" ] && [ "$tdev" != "lo" ] || return 0
+    ip -4 addr flush dev "$tdev" 2>/dev/null || true
+    ip -4 addr show dev "$tdev" 2>/dev/null | while IFS= read -r aline; do
+        case "$aline" in
+            *inet6[${ws}]*) continue ;;
+            *inet[${ws}]*)
+                rest="${aline#*inet}"
+                rest="${rest#"${rest%%[!${ws}]*}"}"
+                a4="${rest%%[${ws}]*}"
+                [ -n "$a4" ] && ip -4 addr del "$a4" dev "$tdev" 2>/dev/null || true
+                ;;
+        esac
+    done
+    ip -4 route flush dev "$tdev" 2>/dev/null || true
+}
+
+clean_resolv_conf() {
+    want_family="$1"
+    fallback_dns="$2"
+    tmp_resolv="${RESOLV_CONF}.zero.$$"
+    has_usable_ns=0
+    ll_ns_count=0
+
+    : > "$tmp_resolv" 2>/dev/null || return 0
+    if [ -r "$RESOLV_CONF" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            line="${line%"$cr_ch"}"
+            trimmed="${line#"${line%%[!${ws}]*}"}"
+            case "$trimmed" in
+                nameserver[${ws}]*)
+                    rest="${trimmed#nameserver}"
+                    rest="${rest#"${rest%%[!${ws}]*}"}"
+                    ns_addr="${rest%%[${ws}#;]*}"
+                    if [ "$want_family" = "ipv4" ]; then
+                        case "$ns_addr" in
+                            *:*) continue ;;
+                            127.*|0.*) continue ;;
+                            [0-9]*.[0-9]*.[0-9]*.[0-9]*)
+                                has_usable_ns=1
+                                printf 'nameserver %s\n' "$ns_addr" >> "$tmp_resolv"
+                                ;;
+                            *) continue ;;
+                        esac
+                    else
+                        case "$ns_addr" in
+                            *.*) continue ;;
+                            ::1|::|0:0:0:0:0:0:0:1|0:0:0:0:0:0:0:0|0000:0000:0000:0000:0000:0000:0000:0001|0000:0000:0000:0000:0000:0000:0000:0000)
+                                continue
+                                ;;
+                            *:*)
+                                case "$ns_addr" in
+                                    [Ff][Ee][89AaBb][0-9A-Fa-f]:*)
+                                        if [ "$ll_ns_count" -lt 1 ]; then
+                                            case "$ns_addr" in
+                                                *%*) ;;
+                                                *) [ -n "$iface" ] && ns_addr="${ns_addr}%${iface}" ;;
+                                            esac
+                                            printf 'nameserver %s\n' "$ns_addr" >> "$tmp_resolv"
+                                            ll_ns_count=$((ll_ns_count + 1))
+                                        fi
+                                        ;;
+                                    *)
+                                        has_usable_ns=1
+                                        printf 'nameserver %s\n' "$ns_addr" >> "$tmp_resolv"
+                                        ;;
+                                esac
+                                ;;
+                            *) continue ;;
+                        esac
+                    fi
+                    ;;
+                *)
+                    printf '%s\n' "$line" >> "$tmp_resolv"
+                    ;;
+            esac
+        done < "$RESOLV_CONF"
+    fi
+    if [ "$has_usable_ns" -eq 0 ]; then
+        for ns in $fallback_dns; do
+            printf 'nameserver %s\n' "$ns" >> "$tmp_resolv"
+        done
+    fi
+    cat "$tmp_resolv" > "$RESOLV_CONF" 2>/dev/null || mv -f "$tmp_resolv" "$RESOLV_CONF" 2>/dev/null || true
+    rm -f "$tmp_resolv" 2>/dev/null || true
+}
+
+if [ "${1:-}" = "--pre" ]; then
+    if [ "$INSTALLER_FAMILY" = "ipv4" ]; then
+        for k in "${IPV6_CONF_DIR}/all/accept_ra" "${IPV6_CONF_DIR}/default/accept_ra" "${IPV6_CONF_DIR}/all/autoconf" "${IPV6_CONF_DIR}/default/autoconf"; do
+            [ -w "$k" ] && echo 0 > "$k" 2>/dev/null || true
+        done
+        for d in "${IPV6_CONF_DIR}"/*; do
+            [ -d "$d" ] || continue
+            dev="${d#"${IPV6_CONF_DIR}/"}"
+            [ "$dev" = "lo" ] && continue
+            [ -w "${d}/accept_ra" ] && echo 0 > "${d}/accept_ra" 2>/dev/null || true
+            [ -w "${d}/autoconf" ] && echo 0 > "${d}/autoconf" 2>/dev/null || true
+        done
+    fi
+    exit 0
+fi
+
+iface=$(resolve_iface "$INSTALLER_MAC" "$INSTALLER_IFACE")
+[ -n "$iface" ] && ip link set dev "$iface" up 2>/dev/null || true
+
+if [ "$INSTALLER_FAMILY" = "ipv4" ]; then
+    stop_other_dhcp ipv6
+    for k in "${IPV6_CONF_DIR}/all/accept_ra" "${IPV6_CONF_DIR}/default/accept_ra" "${IPV6_CONF_DIR}/${iface}/accept_ra" "${IPV6_CONF_DIR}/all/autoconf" "${IPV6_CONF_DIR}/default/autoconf" "${IPV6_CONF_DIR}/${iface}/autoconf"; do
+        [ -w "$k" ] && echo 0 > "$k" 2>/dev/null || true
+    done
+    for d in "${IPV6_CONF_DIR}"/*; do
+        [ -d "$d" ] || continue
+        dev="${d#"${IPV6_CONF_DIR}/"}"
+        [ "$dev" = "lo" ] && continue
+        [ -w "${d}/accept_ra" ] && echo 0 > "${d}/accept_ra" 2>/dev/null || true
+        [ -w "${d}/autoconf" ] && echo 0 > "${d}/autoconf" 2>/dev/null || true
+        if [ "$EFFECTIVE_STACK" = "ipv4" ] && [ "$dev" != "all" ] && [ "$dev" != "default" ]; then
+            [ -w "${d}/disable_ipv6" ] && echo 1 > "${d}/disable_ipv6" 2>/dev/null || true
+        fi
+    done
+    if [ "$EFFECTIVE_STACK" = "ipv4" ] && [ -w "${IPV6_CONF_DIR}/lo/disable_ipv6" ]; then
+        echo 0 > "${IPV6_CONF_DIR}/lo/disable_ipv6" 2>/dev/null || true
+    fi
+    [ -n "$iface" ] && flush_ipv6_iface "$iface"
+    for p in "${SYS_NET}"/*; do
+        [ -e "$p" ] || continue
+        dev="${p#"${SYS_NET}/"}"
+        [ "$dev" = "lo" ] || [ "$dev" = "$iface" ] && continue
+        flush_ipv6_iface "$dev"
+    done
+    del_default_routes -6
+    if [ -n "$IPV4_ADDR" ]; then
+        if ! ip -4 addr show dev "$iface" 2>/dev/null | grep -q 'inet '; then
+            ip -4 addr add "${IPV4_ADDR}/${IPV4_PREFIX}" dev "$iface" 2>/dev/null || true
+        fi
+        if [ -n "$IPV4_GATE" ] && ! has_default_route -4; then
+            ip -4 route add "$IPV4_GATE" dev "$iface" scope link 2>/dev/null ||
+                ip -4 route add "$IPV4_GATE" dev "$iface" 2>/dev/null || true
+            ip -4 route add default via "$IPV4_GATE" dev "$iface" onlink 2>/dev/null ||
+                ip -4 route add default via "$IPV4_GATE" dev "$iface" 2>/dev/null || true
+        fi
+    fi
+    clean_resolv_conf ipv4 "$DNS_V4"
+else
+    stop_other_dhcp ipv4
+    del_default_routes -4
+    [ -n "$iface" ] && flush_ipv4_iface "$iface"
+    for p in "${SYS_NET}"/*; do
+        [ -e "$p" ] || continue
+        dev="${p#"${SYS_NET}/"}"
+        [ "$dev" = "lo" ] || [ "$dev" = "$iface" ] && continue
+        flush_ipv4_iface "$dev"
+    done
+    i=0
+    while [ $i -lt 8 ]; do
+        ip -6 addr show dev "$iface" 2>/dev/null | grep -q 'tentative' || break
+        sleep 1
+        i=$((i + 1))
+    done
+    if [ -n "$IPV6_ADDR" ] && ! ip -6 addr show dev "$iface" scope global 2>/dev/null | grep -q 'inet6 '; then
+        ip -6 addr add "${IPV6_ADDR}/${IPV6_PREFIX}" dev "$iface" 2>/dev/null || true
+        i=0
+        while [ $i -lt 5 ]; do
+            ip -6 addr show dev "$iface" 2>/dev/null | grep -q 'tentative' || break
+            sleep 1
+            i=$((i + 1))
+        done
+    fi
+    if [ -n "$IPV6_GATE" ] && ! has_default_route -6; then
+        case "$IPV6_GATE" in
+            [Ff][Ee][89AaBb][0-9A-Fa-f]:*)
+                ip -6 route add default via "$IPV6_GATE" dev "$iface" 2>/dev/null || true
+                ;;
+            *)
+                ip -6 route add "$IPV6_GATE" dev "$iface" 2>/dev/null || true
+                ip -6 route add default via "$IPV6_GATE" dev "$iface" onlink 2>/dev/null ||
+                    ip -6 route add default via "$IPV6_GATE" dev "$iface" 2>/dev/null || true
+                ;;
+        esac
+    fi
+    clean_resolv_conf ipv6 "$DNS_V6"
+fi
+exit 0
+EOF
+    chmod 755 "${boot_work_dir}/fix-netcfg-route.sh" || return 1
+
+    mkdir -p "${boot_work_dir}/var/lib/dpkg/info" || return 1
+    cp -f "$orig_postinst" "${boot_work_dir}/var/lib/dpkg/info/netcfg.postinst.real" || return 1
+    chmod 755 "${boot_work_dir}/var/lib/dpkg/info/netcfg.postinst.real" || return 1
+    cat > "${boot_work_dir}/var/lib/dpkg/info/netcfg.postinst" <<'EOF' || return 1
+#!/bin/sh
+[ -x /fix-netcfg-route.sh ] && /fix-netcfg-route.sh --pre || true
+/var/lib/dpkg/info/netcfg.postinst.real "$@"
+rc=$?
+[ -x /fix-netcfg-route.sh ] && /fix-netcfg-route.sh || true
+exit $rc
+EOF
+    chmod 755 "${boot_work_dir}/var/lib/dpkg/info/netcfg.postinst" || return 1
+}
+
+reinstall_write_apt_hook() {
+    local boot_work_dir="$1" is_archive_mirror="${2:-0}"
+    local force_family_line=''
+    if [[ "$REINSTALL_INSTALLER_FAMILY" == "ipv6" ]]; then
+        force_family_line='Acquire::ForceIPv6 "true";'
+    else
+        force_family_line='Acquire::ForceIPv4 "true";'
+    fi
+
+    mkdir -p "${boot_work_dir}/usr/lib/post-base-installer.d" || return 1
+    cat > "${boot_work_dir}/usr/lib/post-base-installer.d/05zero-apt-conf" <<EOF || return 1
+#!/bin/sh
+mkdir -p /target/etc/apt/apt.conf.d
+printf '%s\n' '${force_family_line}' > /target/etc/apt/apt.conf.d/99zero-reinstall
+chmod 644 /target/etc/apt/apt.conf.d/99zero-reinstall
+if [ '${is_archive_mirror}' = '1' ]; then
+    printf '%s\n' 'Acquire::Check-Valid-Until "false";' > /target/etc/apt/apt.conf.d/99archive-valid-until
+    chmod 644 /target/etc/apt/apt.conf.d/99archive-valid-until
+fi
+exit 0
+EOF
+    chmod 755 "${boot_work_dir}/usr/lib/post-base-installer.d/05zero-apt-conf" || return 1
+}
+
+reinstall_probe_apt_services() {
+    local mirror="$1" dist="$2" wget_fam="$3" mirror_host="$4"
+    local services='' sec_ok=0 upd_ok=0
+    if [[ "$mirror_host" == "archive.debian.org" ]]; then
+        printf 'd-i apt-setup/services-select multiselect\n'
+        return 0
+    fi
+    if wget "$wget_fam" --spider -q --timeout=4 --tries=1 "https://security.debian.org/debian-security/dists/${dist}-security/Release" >/dev/null 2>&1 ||
+       wget "$wget_fam" --spider -q --timeout=4 --tries=1 "http://security.debian.org/debian-security/dists/${dist}-security/Release" >/dev/null 2>&1; then
+        sec_ok=1
+    fi
+    if wget "$wget_fam" --spider -q --timeout=4 --tries=1 "${mirror}/dists/${dist}-updates/Release" >/dev/null 2>&1; then
+        upd_ok=1
+    fi
+    if (( sec_ok && upd_ok )); then
+        services='security, updates'
+    elif (( sec_ok )); then
+        services='security'
+    elif (( upd_ok )); then
+        services='updates'
+    fi
+    if [[ -n "$services" ]]; then
+        printf 'd-i apt-setup/services-select multiselect %s\n' "$services"
+    else
+        printf 'd-i apt-setup/services-select multiselect\n'
+    fi
+}
+
+reinstall_write_post_install_script() {
+    local boot_work_dir="${1:-/tmp/boot}"
+    local target_dns='' network_blocks='' sysctl_block=''
+    mkdir -p "$boot_work_dir" || return 1
+    target_dns=$(reinstall_target_dns_list "$REINSTALL_EFFECTIVE_STACK")
+
+    case "$REINSTALL_EFFECTIVE_STACK" in
+        ipv4)
+            network_blocks=$(reinstall_build_ipv4_stanza "$REINSTALL_DNS_V4")
+            sysctl_block='append_disable_ipv6_sysctl() {
+    cand_dev="$1"
+    [ -n "$cand_dev" ] || return 0
+    case "$seen_devs" in
+        *" ${cand_dev} "*) return 0 ;;
+    esac
+    case "$cand_dev" in
+        lo|all|default|tun*|tap*|wg*|warp*|CloudflareWARP*|tailscale*|zt*|docker*|br-*|veth*|virbr*|vnet*|fwbr*|fwpr*|fwln*|cni*|flannel*|cali*|cilium*|weave*|kube-*|podman*|incusbr*|lxcbr*|lxdbr*)
+            return 0
+            ;;
+    esac
+    if [ -r "/sys/class/net/${cand_dev}/type" ]; then
+        ntype=$(cat "/sys/class/net/${cand_dev}/type" 2>/dev/null || true)
+        if [ "$ntype" != "1" ] && [ "$cand_dev" != "$iface4" ] && [ "$cand_dev" != "$iface6" ]; then
+            return 0
+        fi
+    fi
+    seen_devs="${seen_devs}${cand_dev} "
+    sysctl_dev=$(printf "%s" "$cand_dev" | tr "." "/")
+    printf "net.ipv6.conf.%s.disable_ipv6 = 1\n" "$sysctl_dev"
+    printf "net.ipv6.conf.%s.accept_ra = 0\n" "$sysctl_dev"
+    printf "net.ipv6.conf.%s.autoconf = 0\n" "$sysctl_dev"
+}
+mkdir -p /etc/sysctl.d
+{
+    cat <<EOF_SYSCTL
+net.ipv6.conf.all.disable_ipv6 = 0
+net.ipv6.conf.default.disable_ipv6 = 0
+net.ipv6.conf.lo.disable_ipv6 = 0
+net.ipv6.conf.all.accept_ra = 0
+net.ipv6.conf.default.accept_ra = 0
+net.ipv6.conf.all.autoconf = 0
+net.ipv6.conf.default.autoconf = 0
+EOF_SYSCTL
+    seen_devs=" lo all default "
+    append_disable_ipv6_sysctl "$iface4"
+    append_disable_ipv6_sysctl "$iface6"
+    for p in /sys/class/net/*; do
+        [ -e "$p" ] || continue
+        append_disable_ipv6_sysctl "${p#/sys/class/net/}"
+    done
+} > /etc/sysctl.d/99-zero-reinstall-stack.conf
+chmod 644 /etc/sysctl.d/99-zero-reinstall-stack.conf
+mkdir -p /etc/network/if-pre-up.d
+cat > /etc/network/if-pre-up.d/zero-disable-ipv6 <<EOF_IFPREUP_HDR
+#!/bin/sh
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+TARGET_IFACE4="$iface4"
+TARGET_IFACE6="$iface6"
+EOF_IFPREUP_HDR
+cat >> /etc/network/if-pre-up.d/zero-disable-ipv6 <<'\''EOF_IFPREUP'\''
+PROC_IPV6_CONF="${ZERO_PROC_IPV6_CONF:-/proc/sys/net/ipv6/conf}"
+SYS_NET_DIR="${ZERO_SYS_NET_DIR:-/sys/class/net}"
+for k in all/disable_ipv6 default/disable_ipv6 lo/disable_ipv6; do
+    [ -w "${PROC_IPV6_CONF}/${k}" ] && echo 0 > "${PROC_IPV6_CONF}/${k}" 2>/dev/null || true
+done
+for k in all/accept_ra default/accept_ra all/autoconf default/autoconf; do
+    [ -w "${PROC_IPV6_CONF}/${k}" ] && echo 0 > "${PROC_IPV6_CONF}/${k}" 2>/dev/null || true
+done
+for d in "${PROC_IPV6_CONF}"/*; do
+    [ -d "$d" ] || continue
+    dev="${d#"${PROC_IPV6_CONF}/"}"
+    case "$dev" in
+        all|default|lo|tun*|tap*|wg*|warp*|CloudflareWARP*|tailscale*|zt*|docker*|br-*|veth*|virbr*|vnet*|fwbr*|fwpr*|fwln*|cni*|flannel*|cali*|cilium*|weave*|kube-*|podman*|incusbr*|lxcbr*|lxdbr*)
+            continue
+            ;;
+    esac
+    if [ -r "${SYS_NET_DIR}/${dev}/type" ]; then
+        ntype=$(cat "${SYS_NET_DIR}/${dev}/type" 2>/dev/null || true)
+        if [ "$ntype" != "1" ] &&
+           [ "$dev" != "${IFACE:-}" ] &&
+           [ "$dev" != "${INTERFACE:-}" ] &&
+           [ "$dev" != "${TARGET_IFACE4:-}" ] &&
+           [ "$dev" != "${TARGET_IFACE6:-}" ]; then
+            continue
+        fi
+    fi
+    [ -w "${d}/accept_ra" ] && echo 0 > "${d}/accept_ra" 2>/dev/null || true
+    [ -w "${d}/autoconf" ] && echo 0 > "${d}/autoconf" 2>/dev/null || true
+    [ -w "${d}/disable_ipv6" ] && echo 1 > "${d}/disable_ipv6" 2>/dev/null || true
+    ip -6 addr flush dev "$dev" 2>/dev/null || true
+done
+ip -6 route flush default 2>/dev/null || true
+ip -6 route del default 2>/dev/null || true
+exit 0
+EOF_IFPREUP
+chmod 755 /etc/network/if-pre-up.d/zero-disable-ipv6
+mkdir -p /etc/udev/rules.d
+cat > /etc/udev/rules.d/90-zero-disable-ipv6.rules <<'\''EOF_UDEV'\''
+ACTION=="add|change", SUBSYSTEM=="net", DEVPATH!="/devices/virtual/*", ATTR{type}=="1", RUN+="/etc/network/if-pre-up.d/zero-disable-ipv6"
+EOF_UDEV
+chmod 644 /etc/udev/rules.d/90-zero-disable-ipv6.rules
+if [ -f /etc/dhcpcd.conf ]; then
+    grep -Eq "^[[:space:]]*noipv6([[:space:]]|\$)" /etc/dhcpcd.conf || printf "\nnoipv6\nnoipv6rs\n" >> /etc/dhcpcd.conf
+fi'
+            ;;
+        ipv6)
+            network_blocks=$(reinstall_build_ipv6_stanza "1" "$REINSTALL_DNS_V6")
+            sysctl_block='if [ -f /etc/dhcpcd.conf ]; then
+    grep -Eq "^[[:space:]]*noipv4([[:space:]]|\$)" /etc/dhcpcd.conf || printf "\nnoipv4\nnoipv4ll\n" >> /etc/dhcpcd.conf
+fi'
+            ;;
+        dual)
+            local v4_part='' v6_part=''
+            v4_part=$(reinstall_build_ipv4_stanza "$REINSTALL_DNS_LIST")
+            v6_part=$(reinstall_build_ipv6_stanza "0" "$REINSTALL_DNS_V6")
+            network_blocks="${v4_part}
+if [ \"\$iface6\" != \"\$iface4\" ]; then
+    printf '\\nauto %s\\n' \"\$iface6\" >> /etc/network/interfaces
+fi
+${v6_part}"
+            ;;
+    esac
+
+    cat > "${boot_work_dir}/post-install.sh" <<EOF || return 1
 #!/bin/sh
 set -eu
 
-iface=\$(awk '/^(auto|allow-hotplug)[[:space:]]+/ {for (i = 2; i <= NF; i++) if (\$i != "lo") {print \$i; exit}}' /etc/network/interfaces 2>/dev/null || true)
-[ -n "\$iface" ] || iface='${REINSTALL_NETWORK_INTERFACE}'
+rm -f /etc/apt/apt.conf.d/99zero-reinstall
+
+if [ -L /etc/systemd/system/multi-user.target.wants/dhcpcd.service ] || [ -f /lib/systemd/system/dhcpcd.service ] || [ -f /usr/lib/systemd/system/dhcpcd.service ]; then
+    rm -f /etc/systemd/system/multi-user.target.wants/dhcpcd.service
+    command -v systemctl >/dev/null 2>&1 && systemctl disable dhcpcd.service >/dev/null 2>&1 || true
+fi
+
+resolve_nic() {
+    target_mac="\$1"
+    fallback_name="\$2"
+    default_from_ifaces="\$3"
+    if [ -n "\$target_mac" ]; then
+        tmac=\$(printf '%s' "\$target_mac" | tr '[:upper:]' '[:lower:]')
+        for p in /sys/class/net/*/address; do
+            [ -r "\$p" ] || continue
+            dev="\${p#/sys/class/net/}"
+            dev="\${dev%/address}"
+            [ "\$dev" = "lo" ] && continue
+            if [ -r "/sys/class/net/\${dev}/type" ]; then
+                ntype=\$(cat "/sys/class/net/\${dev}/type" 2>/dev/null || true)
+                [ "\$ntype" = "1" ] || continue
+            fi
+            amac=\$(tr '[:upper:]' '[:lower:]' < "\$p" 2>/dev/null || true)
+            if [ "\$amac" = "\$tmac" ]; then
+                printf '%s\n' "\$dev"
+                return 0
+            fi
+        done
+    fi
+    if [ -n "\$default_from_ifaces" ]; then
+        printf '%s\n' "\$default_from_ifaces"
+        return 0
+    fi
+    printf '%s\n' "\$fallback_name"
+}
+
+detected_iface=\$(awk '/^(auto|allow-hotplug)[[:space:]]+/ {for (i = 2; i <= NF; i++) if (\$i != "lo") {print \$i; exit}}' /etc/network/interfaces 2>/dev/null || true)
+iface4=\$(resolve_nic '${REINSTALL_IPV4_MAC}' '${REINSTALL_IPV4_IFACE:-${REINSTALL_NETWORK_INTERFACE}}' "\$detected_iface")
+iface6=\$(resolve_nic '${REINSTALL_IPV6_MAC}' '${REINSTALL_IPV6_IFACE:-${REINSTALL_NETWORK_INTERFACE}}' "\$detected_iface")
 
 update_sshd_option() {
     key="\$1"
     value="\$2"
-    if grep -Eiq "^[#[:space:]]*\${key}[[:space:]]+" /etc/ssh/sshd_config; then
-        sed -ri "s@^[#[:space:]]*\${key}[[:space:]].*@\${key} \${value}@I" /etc/ssh/sshd_config
-    else
-        echo "\${key} \${value}" >> /etc/ssh/sshd_config
+    if [ -d /etc/ssh/sshd_config.d ]; then
+        for f in /etc/ssh/sshd_config.d/*.conf; do
+            [ -f "\$f" ] || continue
+            awk -v k="\$key" '
+                BEGIN { lk = tolower(k) }
+                tolower(\$0) ~ ("^[#[:space:]]*" lk "([[:space:]]+|=)") { next }
+                { print }
+            ' "\$f" > "\${f}.tmp" && mv -f "\${f}.tmp" "\$f"
+        done
+    fi
+    if [ -f /etc/ssh/sshd_config ]; then
+        awk -v k="\$key" -v v="\$value" '
+            BEGIN { inserted = 0; lk = tolower(k) }
+            {
+                low = tolower(\$0)
+                if (low ~ ("^[#[:space:]]*" lk "([[:space:]]+|=)")) next
+                if (!inserted && low ~ "^[[:space:]]*match[[:space:]]+") {
+                    print k " " v
+                    inserted = 1
+                }
+                print
+            }
+            END {
+                if (!inserted) print k " " v
+            }
+        ' /etc/ssh/sshd_config > /etc/ssh/sshd_config.tmp && mv -f /etc/ssh/sshd_config.tmp /etc/ssh/sshd_config
+        chmod 644 /etc/ssh/sshd_config
     fi
 }
 
-cat > /etc/network/interfaces <<EOF_INTERFACES
+mkdir -p /etc/network
+cat > /etc/network/interfaces <<'EOF_INTERFACES'
 source /etc/network/interfaces.d/*
 
 auto lo
 iface lo inet loopback
-
-auto \$iface
-iface \$iface inet static
-    address ${REINSTALL_IPV4_ADDR}
-    netmask ${REINSTALL_IPV4_MASK}
-    gateway ${REINSTALL_IPV4_GATE}
-    dns-nameservers ${REINSTALL_DNS_LIST}
 EOF_INTERFACES
-${ipv6_block}
+${network_blocks}
+
+${sysctl_block}
+
+rm -f /etc/resolv.conf
+: > /etc/resolv.conf
+for ns in ${target_dns}; do
+    echo "nameserver \$ns" >> /etc/resolv.conf
+done
+chmod 644 /etc/resolv.conf
 
 update_sshd_option Port ${REINSTALL_SSH_PORT}
 update_sshd_option PermitRootLogin yes
 update_sshd_option PasswordAuthentication yes
 update_sshd_option PubkeyAuthentication yes
+
+for sock_unit in ssh.socket sshd.socket; do
+    if [ -L "/etc/systemd/system/sockets.target.wants/\${sock_unit}" ] ||
+       [ -L "/usr/lib/systemd/system/sockets.target.wants/\${sock_unit}" ] ||
+       [ -L "/lib/systemd/system/sockets.target.wants/\${sock_unit}" ]; then
+        mkdir -p "/etc/systemd/system/\${sock_unit}.d"
+        cat > "/etc/systemd/system/\${sock_unit}.d/zero-port.conf" <<EOF_SOCKET
+[Socket]
+ListenStream=
+ListenStream=${REINSTALL_SSH_PORT}
+EOF_SOCKET
+    fi
+done
 EOF
-    chmod 700 /tmp/boot/post-install.sh
+    chmod 700 "${boot_work_dir}/post-install.sh" || return 1
+    mkdir -p "${boot_work_dir}/usr/lib/finish-install.d" || return 1
+    cat > "${boot_work_dir}/usr/lib/finish-install.d/85zero-post-install" <<'EOF_FINISH' || return 1
+#!/bin/sh
+if [ -f /post-install.sh ] && [ -d /target/etc ]; then
+    cp /post-install.sh /target/root/reinstall-post.sh &&
+        chmod 700 /target/root/reinstall-post.sh &&
+        in-target /bin/sh /root/reinstall-post.sh || true
+    rm -f /target/root/reinstall-post.sh
+fi
+exit 0
+EOF_FINISH
+    chmod 755 "${boot_work_dir}/usr/lib/finish-install.d/85zero-post-install" || return 1
+}
+
+reinstall_build_preseed_netcfg() {
+    local preseed_gw='' ipv6_mask=''
+    if [[ "$REINSTALL_INSTALLER_FAMILY" == "ipv6" ]]; then
+        ipv6_mask=$(reinstall_ipv6_prefix_to_netmask "$REINSTALL_IPV6_PREFIX")
+        if [[ -n "$REINSTALL_IPV6_GATE" ]] &&
+           reinstall_ipv6_in_same_subnet "$REINSTALL_IPV6_ADDR" "$REINSTALL_IPV6_PREFIX" "$REINSTALL_IPV6_GATE"; then
+            preseed_gw="$REINSTALL_IPV6_GATE"
+        else
+            preseed_gw='none'
+        fi
+
+        if [[ "$REINSTALL_IPV6_MODE" == "static" ]]; then
+            cat <<EOF
+d-i netcfg/choose_interface select auto
+d-i netcfg/disable_autoconfig boolean true
+d-i netcfg/dhcp_failed note
+d-i netcfg/dhcp_options select Configure network manually
+d-i netcfg/get_ipaddress string ${REINSTALL_IPV6_ADDR}
+d-i netcfg/get_netmask string ${ipv6_mask}
+d-i netcfg/get_gateway string ${preseed_gw}
+d-i netcfg/get_nameservers string ${REINSTALL_DNS_V6}
+d-i netcfg/confirm_static boolean true
+EOF
+        else
+            cat <<EOF
+d-i netcfg/choose_interface select auto
+d-i netcfg/disable_autoconfig boolean false
+d-i netcfg/use_autoconfig boolean true
+d-i netcfg/dhcp_failed note
+d-i netcfg/dhcp_options select Configure network manually
+d-i netcfg/get_ipaddress string ${REINSTALL_IPV6_ADDR}
+d-i netcfg/get_netmask string ${ipv6_mask}
+d-i netcfg/get_gateway string ${preseed_gw}
+d-i netcfg/get_nameservers string ${REINSTALL_DNS_V6}
+d-i netcfg/confirm_static boolean true
+EOF
+        fi
+    else
+        if [[ -n "$REINSTALL_IPV4_GATE" ]] &&
+           reinstall_ipv4_in_same_subnet "$REINSTALL_IPV4_ADDR" "$REINSTALL_IPV4_PREFIX" "$REINSTALL_IPV4_GATE"; then
+            preseed_gw="$REINSTALL_IPV4_GATE"
+        else
+            preseed_gw='none'
+        fi
+
+        if [[ "$REINSTALL_IPV4_MODE" == "dhcp" ]]; then
+            cat <<EOF
+d-i netcfg/choose_interface select auto
+d-i netcfg/disable_autoconfig boolean false
+d-i netcfg/use_autoconfig boolean true
+d-i netcfg/dhcp_failed note
+d-i netcfg/dhcp_options select Configure network manually
+d-i netcfg/get_ipaddress string ${REINSTALL_IPV4_ADDR}
+d-i netcfg/get_netmask string ${REINSTALL_IPV4_MASK}
+d-i netcfg/get_gateway string ${preseed_gw}
+d-i netcfg/get_nameservers string ${REINSTALL_DNS_V4}
+d-i netcfg/confirm_static boolean true
+EOF
+        else
+            cat <<EOF
+d-i netcfg/choose_interface select auto
+d-i netcfg/disable_autoconfig boolean true
+d-i netcfg/dhcp_failed note
+d-i netcfg/dhcp_options select Configure network manually
+d-i netcfg/get_ipaddress string ${REINSTALL_IPV4_ADDR}
+d-i netcfg/get_netmask string ${REINSTALL_IPV4_MASK}
+d-i netcfg/get_gateway string ${preseed_gw}
+d-i netcfg/get_nameservers string ${REINSTALL_DNS_V4}
+d-i netcfg/confirm_static boolean true
+EOF
+        fi
+    fi
 }
 
 reinstall_install_target_system() (
-    local debian_version="$1"
-    local dist='' grub='' grub_dir='' grub_file='' grub_ver='' grub_backup=''
-    local mirror='' mirror_host='' mirror_folder='' target_disk="$2"
-    local read_grub='' load_num='' cfg0='' cfg1='' cfg2='' insert_grub=''
-    local type='' linux_kernel='' linux_img='' add_option='' boot_option='' grub_tmp='' grub_target=''
-    local root_password_hash='' partman_early_command='' late_command='' apt_non_free_firmware_line=''
+    local debian_version="$1" target_disk="$2"
+    local boot_root="${REINSTALL_BOOT_DIR:-/boot}" tmp_root="${REINSTALL_TMP_ROOT:-}"
+    local arch='' dist='' grub='' grub_dir='' grub_file='' grub_ver='' grub_backup=''
+    local mirror_info='' mirror='' mirror_host='' mirror_folder='' wget_fam='-4' is_archive_mirror=0
+    local load_num='' cfg0='' cfg1='' cfg2='' tmp_cfg='' insert_grub=''
+    local existing_kpath='' grub_boot_prefix='' linux_kernel='' linux_img=''
+    local installer_mac='' bootif_opt='' console_opts='' add_option='' boot_option=''
+    local vmlinuz_grub_path='' initrd_grub_path='' grub_target='' grub_bootdev=''
+    local root_password_hash='' partman_early_command='' late_command=''
+    local apt_non_free_firmware_line='' apt_services_line='' efi_partman_lines=''
+    local pkgsel_packages='' netcfg_preseed_block='' tmp_avail_kb=''
+    grub_tmp=''
+    read_grub=''
+    grub_new=''
+    boot_work_dir=''
+    extract_work_dir=''
+    overlay_gz=''
+    initrd_dl=''
+    vmlinuz_dl=''
+
+    if [[ -z "$tmp_root" ]]; then
+        tmp_avail_kb=$(df -Pk /tmp 2>/dev/null | awk 'NR == 2 {print $4}')
+        if [[ "$tmp_avail_kb" =~ ^[0-9]+$ ]] && (( tmp_avail_kb < 262144 )) && [[ -d /var/tmp ]]; then
+            tmp_root='/var/tmp'
+        else
+            tmp_root='/tmp'
+        fi
+    fi
+
+    arch=$(reinstall_get_arch) || {
+        echo -e "${RED}不支持的 CPU 架构: $(uname -m)${PLAIN}"
+        exit 1
+    }
 
     case "$debian_version" in
-        11) dist='bullseye' ;;
-        12) dist='bookworm' ;;
-        13) dist='trixie' ;;
+        11)
+            dist='bullseye'
+            pkgsel_packages='openssh-server isc-dhcp-client ifupdown ca-certificates'
+            ;;
+        12)
+            dist='bookworm'
+            pkgsel_packages='openssh-server isc-dhcp-client ifupdown ca-certificates'
+            apt_non_free_firmware_line='d-i apt-setup/non-free-firmware boolean true'
+            ;;
+        13)
+            dist='trixie'
+            pkgsel_packages='openssh-server isc-dhcp-client dhcpcd-base ifupdown ca-certificates'
+            apt_non_free_firmware_line='d-i apt-setup/non-free-firmware boolean true'
+            ;;
         *)
             echo -e "${RED}不支持的 Debian 版本: ${debian_version}${PLAIN}"
             exit 1
             ;;
     esac
 
-    reinstall_require_commands ip wget awk grep sed cut cat lsblk cpio gzip find dirname basename openssl findmnt xargs readlink grub-editenv
+    reinstall_require_commands ip wget awk grep sed cut cat dd od lsblk cpio gzip find dirname basename openssl findmnt readlink grub-editenv
     reinstall_gather_network_state
 
     [[ -n "$target_disk" ]] || {
@@ -759,8 +2403,7 @@ reinstall_install_target_system() (
         exit 1
     }
 
-    grub=$(reinstall_get_grub "/boot")
-    [[ -n "$grub" ]] || {
+    grub=$(reinstall_get_grub "$boot_root") || {
         echo -e "${RED}未找到 GRUB 配置。${PLAIN}"
         exit 1
     }
@@ -772,44 +2415,99 @@ reinstall_install_target_system() (
         exit 1
     }
 
-    mirror=$(reinstall_select_debian_mirror "$dist")
-    [[ -n "$mirror" ]] || {
-        echo -e "${RED}未找到可用 Debian 镜像。${PLAIN}"
+    mirror_info=$(reinstall_select_debian_mirror "$dist" "$arch" "$REINSTALL_EFFECTIVE_STACK") || {
+        echo -e "${RED}未找到当前网络模式 (${REINSTALL_EFFECTIVE_STACK}) 下可达的 Debian ${debian_version} (${arch}) 镜像。${PLAIN}"
         exit 1
     }
+    REINSTALL_INSTALLER_FAMILY="${mirror_info%%|*}"
+    mirror="${mirror_info#*|}"
+    [[ "$REINSTALL_INSTALLER_FAMILY" == "ipv6" ]] && wget_fam='-6' || wget_fam='-4'
 
-    if [[ "$debian_version" != '11' ]]; then
-        apt_non_free_firmware_line='d-i apt-setup/non-free-firmware boolean true'
-    fi
-
-    root_password_hash=$(openssl passwd -1 "$REINSTALL_ROOT_PASSWORD") || {
+    root_password_hash=$(reinstall_hash_password "$REINSTALL_ROOT_PASSWORD")
+    [[ -n "$root_password_hash" ]] || {
         echo -e "${RED}生成 root 密码哈希失败。${PLAIN}"
         exit 1
     }
 
-    clear
+    if [[ -z "${REINSTALL_NO_CLEAR:-}" ]]; then
+        clear
+    fi
     echo -e "\n${BLUE}# Install${PLAIN}\n"
-    echo -e "${YELLOW}目标系统: Debian ${debian_version} (${dist})${PLAIN}"
+    echo -e "${YELLOW}目标系统: Debian ${debian_version} (${dist}) [${arch}]${PLAIN}"
+    echo -e "${YELLOW}网络模式: $(reinstall_stack_label "$REINSTALL_EFFECTIVE_STACK") (安装拉取通道: ${REINSTALL_INSTALLER_FAMILY})${PLAIN}"
     echo -e "${YELLOW}目标磁盘: ${target_disk}${PLAIN}"
-    echo -e "${YELLOW}IPv4: ${REINSTALL_IPV4_ADDR}/${REINSTALL_IPV4_PREFIX} gw ${REINSTALL_IPV4_GATE}${PLAIN}"
-    case "$REINSTALL_IPV6_MODE" in
-        auto) echo -e "${YELLOW}IPv6: 自动继承 ${REINSTALL_IPV6_ADDR}/${REINSTALL_IPV6_PREFIX}（当前环境检测为自动下发）${PLAIN}" ;;
-        static) echo -e "${YELLOW}IPv6: 静态继承 ${REINSTALL_IPV6_ADDR}/${REINSTALL_IPV6_PREFIX} gw ${REINSTALL_IPV6_GATE}${PLAIN}" ;;
-        none) echo -e "${YELLOW}IPv6: 当前未检测到可继承配置${PLAIN}" ;;
-    esac
+    if [[ "$REINSTALL_EFFECTIVE_STACK" == "ipv4" || "$REINSTALL_EFFECTIVE_STACK" == "dual" ]]; then
+        if [[ "$REINSTALL_IPV4_MODE" == "dhcp" ]]; then
+            echo -e "${YELLOW}IPv4: DHCP 自动获取 (${REINSTALL_IPV4_IFACE}: ${REINSTALL_IPV4_ADDR}/${REINSTALL_IPV4_PREFIX})${PLAIN}"
+        else
+            echo -e "${YELLOW}IPv4: 静态继承 (${REINSTALL_IPV4_IFACE}: ${REINSTALL_IPV4_ADDR}/${REINSTALL_IPV4_PREFIX} gw ${REINSTALL_IPV4_GATE})${PLAIN}"
+        fi
+    else
+        echo -e "${YELLOW}IPv4: 禁用（仅 IPv6 模式）${PLAIN}"
+    fi
+    if [[ "$REINSTALL_EFFECTIVE_STACK" == "ipv6" || "$REINSTALL_EFFECTIVE_STACK" == "dual" ]]; then
+        case "$REINSTALL_IPV6_MODE" in
+            slaac)  echo -e "${YELLOW}IPv6: SLAAC 自动配置 (${REINSTALL_IPV6_IFACE}: ${REINSTALL_IPV6_ADDR}/${REINSTALL_IPV6_PREFIX})${PLAIN}" ;;
+            dhcp6)  echo -e "${YELLOW}IPv6: DHCPv6 自动配置 (${REINSTALL_IPV6_IFACE}: ${REINSTALL_IPV6_ADDR}/${REINSTALL_IPV6_PREFIX})${PLAIN}" ;;
+            static) echo -e "${YELLOW}IPv6: 静态继承 (${REINSTALL_IPV6_IFACE}: ${REINSTALL_IPV6_ADDR}/${REINSTALL_IPV6_PREFIX}${REINSTALL_IPV6_GATE:+ gw ${REINSTALL_IPV6_GATE}})${PLAIN}" ;;
+        esac
+    else
+        echo -e "${YELLOW}IPv6: 禁用自动下发（仅 IPv4 模式）${PLAIN}"
+    fi
 
     mirror_host=$(echo "$mirror" | awk -F'://|/' '{print $2}')
     mirror_folder=$(echo "$mirror" | awk -F"${mirror_host}" '{print $2}')
     [[ -n "$mirror_folder" ]] || mirror_folder='/'
+    [[ "$mirror_host" == "archive.debian.org" ]] && is_archive_mirror=1
+    apt_services_line=$(reinstall_probe_apt_services "$mirror" "$dist" "$wget_fam" "$mirror_host")
 
-    wget -4 -qO /tmp/initrd.img "${mirror}/dists/${dist}/main/installer-amd64/current/images/netboot/debian-installer/amd64/initrd.gz" || {
-        echo -e "${RED}下载 initrd 失败。${PLAIN}"
+    if reinstall_is_efi || [[ "$arch" == "arm64" ]]; then
+        efi_partman_lines='d-i partman-efi/non_efi_system boolean true
+d-i partman-partitioning/choose_label select gpt
+d-i partman-partitioning/default_label string gpt'
+        grub_bootdev='default'
+    else
+        grub_bootdev="$target_disk"
+    fi
+
+    mkdir -p "$tmp_root" || exit 1
+    read_grub="${tmp_root}/grub.read"
+    grub_new="${tmp_root}/grub.new"
+    boot_work_dir="${tmp_root}/boot"
+    extract_work_dir="${tmp_root}/initrd.extract"
+    overlay_gz="${tmp_root}/initrd.overlay.gz"
+    initrd_dl="${tmp_root}/initrd.img"
+    vmlinuz_dl="${tmp_root}/vmlinuz"
+
+    cleanup_reinstall_stage() {
+        [[ -n "${grub_tmp:-}" ]] && rm -f -- "$grub_tmp"
+        [[ -n "${boot_work_dir:-}" ]] && rm -rf -- "$boot_work_dir"
+        [[ -n "${extract_work_dir:-}" ]] && rm -rf -- "$extract_work_dir"
+        [[ -n "${overlay_gz:-}" ]] && rm -f -- "$overlay_gz"
+        [[ -n "${initrd_dl:-}" ]] && rm -f -- "$initrd_dl"
+        [[ -n "${vmlinuz_dl:-}" ]] && rm -f -- "$vmlinuz_dl"
+        [[ -n "${read_grub:-}" ]] && rm -f -- "$read_grub"
+        [[ -n "${grub_new:-}" ]] && rm -f -- "$grub_new"
+        return 0
+    }
+    trap cleanup_reinstall_stage EXIT
+
+    wget "$wget_fam" --timeout=30 --tries=3 -qO "$initrd_dl" "${mirror}/dists/${dist}/main/installer-${arch}/current/images/netboot/debian-installer/${arch}/initrd.gz" || {
+        echo -e "${RED}下载 initrd (${arch}) 失败。${PLAIN}"
         exit 1
     }
-    wget -4 -qO /tmp/vmlinuz "${mirror}/dists/${dist}/main/installer-amd64/current/images/netboot/debian-installer/amd64/linux" || {
-        echo -e "${RED}下载内核失败。${PLAIN}"
+    wget "$wget_fam" --timeout=30 --tries=3 -qO "$vmlinuz_dl" "${mirror}/dists/${dist}/main/installer-${arch}/current/images/netboot/debian-installer/${arch}/linux" || {
+        echo -e "${RED}下载内核 (${arch}) 失败。${PLAIN}"
         exit 1
     }
+    if ! reinstall_validate_kernel_image "$vmlinuz_dl" "$arch"; then
+        echo -e "${RED}校验内核镜像 (${arch}) 失败，原引导配置未修改。${PLAIN}"
+        exit 1
+    fi
+    if ! gzip -t "$initrd_dl" >/dev/null 2>&1; then
+        echo -e "${RED}校验 initrd (${arch}) 压缩完整性失败，原引导配置未修改。${PLAIN}"
+        exit 1
+    fi
 
     [[ -f "${grub_dir}/${grub_file}" ]] || {
         echo -e "${RED}找不到 ${grub_file}。${PLAIN}"
@@ -821,7 +2519,6 @@ reinstall_install_target_system() (
         exit 1
     }
 
-    read_grub='/tmp/grub.read'
     awk '
     /^[[:space:]]*menuentry[[:space:]]/ {
       if (found) exit
@@ -839,12 +2536,12 @@ reinstall_install_target_system() (
     }
     ' "${grub_dir}/${grub_file}" > "$read_grub"
 
-    load_num=$(grep -c 'menuentry ' "$read_grub")
-    if [[ "$load_num" -eq '1' ]]; then
-        sed '/^$/d' "$read_grub" > /tmp/grub.new || exit 1
-    elif [[ "$load_num" -gt '1' ]]; then
-        cfg0=$(awk '/menuentry / {print NR}' "$read_grub" | head -n1)
-        cfg2=$(awk '/menuentry / {print NR}' "$read_grub" | head -n2 | tail -n1)
+    load_num=$(grep -c '^[[:space:]]*menuentry[[:space:]]' "$read_grub" || true)
+    if [[ "$load_num" -eq 1 ]]; then
+        awk 'NF > 0' "$read_grub" > "$grub_new" || exit 1
+    elif [[ "$load_num" -gt 1 ]]; then
+        cfg0=$(awk '/^[[:space:]]*menuentry[[:space:]]/ {print NR; exit}' "$read_grub")
+        cfg2=$(awk '/^[[:space:]]*menuentry[[:space:]]/ {c++; if (c == 2) {print NR; exit}}' "$read_grub")
         cfg1=''
         for tmp_cfg in $(awk '/}/ {print NR}' "$read_grub"); do
             [[ "$tmp_cfg" -gt "$cfg0" && "$tmp_cfg" -lt "$cfg2" ]] && cfg1="$tmp_cfg"
@@ -853,86 +2550,160 @@ reinstall_install_target_system() (
             echo -e "${RED}解析 GRUB 菜单失败。${PLAIN}"
             exit 1
         }
-        sed -n "${cfg0},${cfg1}p" "$read_grub" > /tmp/grub.new || exit 1
+        sed -n "${cfg0},${cfg1}p" "$read_grub" > "$grub_new" || exit 1
     else
         echo -e "${RED}未找到可复用的 GRUB 菜单项。${PLAIN}"
         exit 1
     fi
 
-    sed -i "/menuentry.*/c\\menuentry\\ 'Install OS [${dist} amd64]' --class debian --class gnu-linux --class gnu --class os {" /tmp/grub.new || exit 1
-    sed -i "/echo.*Loading/d" /tmp/grub.new || exit 1
-    insert_grub=$(awk '/menuentry / {print NR}' "${grub_dir}/${grub_file}" | head -n1)
+    insert_grub=$(awk '/^[[:space:]]*menuentry[[:space:]]/ {print NR; exit}' "${grub_dir}/${grub_file}")
     [[ -n "$insert_grub" && "$insert_grub" -gt 0 ]] || {
         echo -e "${RED}定位 GRUB 插入位置失败。${PLAIN}"
         exit 1
     }
 
-    if grep -E 'linux(efi|16)?[[:space:]].*/|kernel.*/' /tmp/grub.new | awk '{print $2}' | tail -n1 | grep -q '^/boot/'; then
-        type='InBoot'
+    existing_kpath=$(grep -E '^[[:space:]]*(linux(efi|16)?|kernel)[[:space:]]+' "$grub_new" | awk '{print $2}' | tail -n1)
+    if [[ "$existing_kpath" == */* ]]; then
+        grub_boot_prefix="${existing_kpath%/*}"
     else
-        type='NoBoot'
+        grub_boot_prefix=''
     fi
-    linux_kernel=$(grep -E 'linux(efi|16)?[[:space:]].*/|kernel.*/' /tmp/grub.new | awk '{print $1}' | head -n1)
+    vmlinuz_grub_path="${grub_boot_prefix}/zero-install-vmlinuz"
+    initrd_grub_path="${grub_boot_prefix}/zero-install-initrd.img"
+
+    linux_kernel=$(grep -E '^[[:space:]]*(linux(efi|16)?|kernel)[[:space:]]+' "$grub_new" | awk '{print $1}' | head -n1)
     [[ -n "$linux_kernel" ]] || {
         echo -e "${RED}读取 GRUB 内核项失败。${PLAIN}"
         exit 1
     }
-    linux_img=$(grep 'initrd.*/' /tmp/grub.new | awk '{print $1}' | tail -n1)
+    linux_img=$(grep -E '^[[:space:]]*initrd(efi|16)?[[:space:]]+' "$grub_new" | awk '{print $1}' | tail -n1 || true)
     if [[ -z "$linux_img" ]]; then
-        sed -i "/$linux_kernel.*\//a\\\tinitrd /" /tmp/grub.new || exit 1
-        linux_img='initrd'
+        case "$linux_kernel" in
+            linuxefi) linux_img='initrdefi' ;;
+            linux16)  linux_img='initrd16' ;;
+            *)        linux_img='initrd' ;;
+        esac
+    fi
+
+    console_opts=$(grep -E '^[[:space:]]*(linux(efi|16)?|kernel)[[:space:]]+' "$grub_new" | head -n1 | awk '
+        {
+            out = ""
+            for (i = 3; i <= NF; i++) {
+                if ($i ~ /^console=[A-Za-z0-9_,.:\/-]+$/) {
+                    out = (out == "" ? $i : out " " $i)
+                }
+            }
+            print out
+        }
+    ')
+
+    if [[ "$REINSTALL_INSTALLER_FAMILY" == "ipv6" ]]; then
+        installer_mac="$REINSTALL_IPV6_MAC"
+    else
+        installer_mac="$REINSTALL_IPV4_MAC"
+    fi
+    if [[ -n "$installer_mac" ]]; then
+        bootif_opt=" BOOTIF=01-${installer_mac//:/-}"
     fi
 
     add_option=''
     reinstall_low_mem || add_option=' lowmem=+0'
-    boot_option="auto=true${add_option} hostname=debian domain= quiet"
+    boot_option="auto=true priority=critical locale=en_US.UTF-8 keymap=us${add_option}${bootif_opt} hostname=debian domain=${console_opts:+ ${console_opts}} --- quiet${console_opts:+ ${console_opts}}"
 
-    if [[ "$type" == 'InBoot' ]]; then
-        sed -i "/$linux_kernel.*\//c\\\t$linux_kernel\t/boot/zero-install-vmlinuz $boot_option" /tmp/grub.new || exit 1
-        sed -i "/$linux_img.*\//c\\\t$linux_img\t/boot/zero-install-initrd.img" /tmp/grub.new || exit 1
-    else
-        sed -i "/$linux_kernel.*\//c\\\t$linux_kernel\t/zero-install-vmlinuz $boot_option" /tmp/grub.new || exit 1
-        sed -i "/$linux_img.*\//c\\\t$linux_img\t/zero-install-initrd.img" /tmp/grub.new || exit 1
-    fi
-    sed -i '$a\\n' /tmp/grub.new || exit 1
+    awk -v title="Install OS [${dist} ${arch}]" \
+        -v kcmd="$linux_kernel" \
+        -v kpath="$vmlinuz_grub_path" \
+        -v bopt="$boot_option" \
+        -v icmd="$linux_img" \
+        -v ipath="$initrd_grub_path" '
+        BEGIN {
+            print "set default=\"0\""
+            header_done = 0
+            kernel_done = 0
+            initrd_done = 0
+        }
+        !header_done && /^[[:space:]]*menuentry[[:space:]]/ {
+            print "menuentry \047" title "\047 --class debian --class gnu-linux --class gnu --class os {"
+            header_done = 1
+            next
+        }
+        /^[[:space:]]*echo[[:space:]].*Loading/ { next }
+        !kernel_done && $1 == kcmd {
+            print "\t" kcmd "\t" kpath " " bopt
+            kernel_done = 1
+            next
+        }
+        !initrd_done && $1 ~ /^initrd(efi|16)?$/ {
+            print "\t" icmd "\t" ipath
+            initrd_done = 1
+            next
+        }
+        /^[[:space:]]*}[[:space:]]*$/ && kernel_done && !initrd_done {
+            print "\t" icmd "\t" ipath
+            initrd_done = 1
+        }
+        { print }
+        END { print "" }
+    ' "$grub_new" > "${grub_new}.built" && mv -f "${grub_new}.built" "$grub_new" || exit 1
 
     grub_target=$(readlink -f "${grub_dir}/${grub_file}") || exit 1
     grub_tmp=$(mktemp "${grub_target}.installnet.tmp.XXXXXX") || exit 1
-    trap 'rm -f -- "$grub_tmp"' EXIT
-    if ! head -n $((insert_grub - 1)) "${grub_dir}/${grub_file}" > "$grub_tmp" ||
-       ! cat /tmp/grub.new >> "$grub_tmp" ||
+    if ! {
+        if (( insert_grub > 1 )); then
+            head -n $((insert_grub - 1)) "${grub_dir}/${grub_file}" > "$grub_tmp"
+        else
+            : > "$grub_tmp"
+        fi
+    } ||
+       ! cat "$grub_new" >> "$grub_tmp" ||
        ! tail -n +"$insert_grub" "${grub_dir}/${grub_file}" >> "$grub_tmp" ||
+       ! printf '\nset default="0"\nset timeout=5\n' >> "$grub_tmp" ||
        ! reinstall_validate_grub_config "$grub_tmp"; then
         echo -e "${RED}生成或校验 GRUB 配置失败，原配置未修改。${PLAIN}"
         exit 1
     fi
 
-    rm -rf /tmp/boot && mkdir -p /tmp/boot && cd /tmp/boot || exit 1
-    mv -f /tmp/initrd.img /tmp/initrd.img.gz || exit 1
-    if ! (set -o pipefail; gzip -d < /tmp/initrd.img.gz | cpio --extract --verbose --make-directories --no-absolute-filenames >/dev/null 2>&1); then
-        echo -e "${RED}解包安装镜像失败，原引导配置未修改。${PLAIN}"
+    rm -rf -- "$boot_work_dir" "$extract_work_dir" && mkdir -p "$boot_work_dir" "$extract_work_dir" || exit 1
+    if cpio --version 2>/dev/null | grep -qi 'gnu'; then
+        (cd "$extract_work_dir" && gzip -dc "$initrd_dl" 2>/dev/null | cpio -idm --no-absolute-filenames 'var/lib/dpkg/info/netcfg.postinst' './var/lib/dpkg/info/netcfg.postinst' >/dev/null 2>&1) || true
+    else
+        (cd "$extract_work_dir" && gzip -dc "$initrd_dl" 2>/dev/null | cpio -idm 'var/lib/dpkg/info/netcfg.postinst' './var/lib/dpkg/info/netcfg.postinst' >/dev/null 2>&1) || true
+    fi
+    if [[ ! -s "${extract_work_dir}/var/lib/dpkg/info/netcfg.postinst" ]]; then
+        echo -e "${RED}解包或校验安装镜像失败（非有效 debian-installer 镜像），原引导配置未修改。${PLAIN}"
         exit 1
     fi
 
-    reinstall_write_post_install_script || exit 1
+    reinstall_write_netcfg_hook "$boot_work_dir" "${extract_work_dir}/var/lib/dpkg/info/netcfg.postinst" || {
+        echo -e "${RED}写入安装器网络钩子失败，原引导配置未修改。${PLAIN}"
+        exit 1
+    }
+    rm -rf -- "$extract_work_dir"
+    extract_work_dir=''
 
-    partman_early_command="debconf-set partman-auto/disk $target_disk"
-    late_command='cp /post-install.sh /target/root/reinstall-post.sh; chmod 700 /target/root/reinstall-post.sh; in-target /bin/sh /root/reinstall-post.sh; rm -f /target/root/reinstall-post.sh'
+    reinstall_write_apt_hook "$boot_work_dir" "$is_archive_mirror" || {
+        echo -e "${RED}写入安装器 APT 钩子失败，原引导配置未修改。${PLAIN}"
+        exit 1
+    }
+    reinstall_write_post_install_script "$boot_work_dir" || {
+        echo -e "${RED}写入安装后置脚本失败，原引导配置未修改。${PLAIN}"
+        exit 1
+    }
 
-    cat > /tmp/boot/preseed.cfg <<EOF || { echo -e "${RED}写入 preseed 配置失败。${PLAIN}"; exit 1; }
+    netcfg_preseed_block=$(reinstall_build_preseed_netcfg)
+    partman_early_command="if [ -b ${target_disk} ]; then debconf-set partman-auto/disk ${target_disk}; else debconf-set partman-auto/disk \"\$(list-devices disk | head -n1)\"; fi"
+    late_command='for s in /usr/lib/finish-install.d/50config-target-network /usr/lib/finish-install.d/55netcfg-copy-config; do if [ -x "$s" ]; then "$s" || true; rm -f "$s"; fi; done; cp /post-install.sh /target/root/reinstall-post.sh; chmod 700 /target/root/reinstall-post.sh; in-target /bin/sh /root/reinstall-post.sh; rm -f /target/root/reinstall-post.sh'
+
+    cat > "${boot_work_dir}/preseed.cfg" <<EOF || { echo -e "${RED}写入 preseed 配置失败。${PLAIN}"; exit 1; }
+d-i debconf/priority select critical
+d-i lowmem/low note
 d-i debian-installer/locale string en_US
 d-i console-setup/layoutcode string us
 d-i keyboard-configuration/xkb-keymap string us
 
-d-i netcfg/choose_interface select auto
-d-i netcfg/disable_autoconfig boolean true
-d-i netcfg/dhcp_failed note
-d-i netcfg/dhcp_options select Configure network manually
-d-i netcfg/get_ipaddress string ${REINSTALL_IPV4_ADDR}
-d-i netcfg/get_netmask string ${REINSTALL_IPV4_MASK}
-d-i netcfg/get_gateway string ${REINSTALL_IPV4_GATE}
-d-i netcfg/get_nameservers string ${REINSTALL_DNS_LIST}
-d-i netcfg/confirm_static boolean true
+${netcfg_preseed_block}
+d-i netcfg/get_hostname string debian
+d-i netcfg/get_domain string
 
 d-i hw-detect/load_firmware boolean true
 
@@ -943,6 +2714,7 @@ d-i mirror/http/proxy string
 d-i apt-setup/contrib boolean true
 d-i apt-setup/non-free boolean true
 ${apt_non_free_firmware_line}
+${apt_services_line}
 
 d-i passwd/root-login boolean true
 d-i passwd/make-user boolean false
@@ -953,6 +2725,8 @@ d-i time/zone string Etc/UTC
 d-i clock-setup/ntp boolean false
 
 d-i partman/early_command string ${partman_early_command}
+${efi_partman_lines}
+d-i partman/unmount_active boolean true
 d-i partman-partitioning/confirm_write_new_label boolean true
 d-i partman/mount_style select uuid
 d-i partman/choose_partition select finish
@@ -967,29 +2741,40 @@ d-i partman/confirm boolean true
 d-i partman/confirm_nooverwrite boolean true
 
 tasksel tasksel/first multiselect standard
-d-i pkgsel/include string openssh-server isc-dhcp-client ifupdown
+d-i pkgsel/include string ${pkgsel_packages}
 d-i pkgsel/upgrade select none
 
 popularity-contest popularity-contest/participate boolean false
 
 d-i grub-installer/only_debian boolean true
 d-i grub-installer/with_other_os boolean true
-d-i grub-installer/bootdev string ${target_disk}
+d-i grub-installer/bootdev string ${grub_bootdev}
 d-i grub-installer/force-efi-extra-removable boolean true
 d-i finish-install/reboot_in_progress note
 d-i debian-installer/exit/reboot boolean true
 d-i preseed/late_command string ${late_command}
 EOF
 
-    if ! (set -o pipefail; find . | cpio -H newc --create --verbose | gzip -9 > /tmp/initrd.img); then
+    if ! (
+        set -o pipefail
+        cd "$boot_work_dir" &&
+            find . | { cpio -H newc -o -R 0:0 2>/dev/null || cpio -H newc -o 2>/dev/null; } | gzip -9 > "$overlay_gz"
+    ) || [[ ! -s "$overlay_gz" ]] || ! cat "$overlay_gz" >> "$initrd_dl"; then
         echo -e "${RED}打包安装镜像失败，原引导配置未修改。${PLAIN}"
         exit 1
     fi
-    if ! cp -f /tmp/initrd.img /boot/zero-install-initrd.img || ! cp -f /tmp/vmlinuz /boot/zero-install-vmlinuz; then
+    rm -rf -- "$boot_work_dir" "$overlay_gz"
+    boot_work_dir=''
+    overlay_gz=''
+
+    if ! cp -f "$initrd_dl" "${boot_root}/zero-install-initrd.img" || ! cp -f "$vmlinuz_dl" "${boot_root}/zero-install-vmlinuz"; then
         echo -e "${RED}保存安装镜像失败，原引导配置未修改。${PLAIN}"
         exit 1
     fi
-    chown root:root "$grub_tmp" && chmod 444 "$grub_tmp" || exit 1
+    if [[ "${EUID:-0}" -eq 0 ]]; then
+        chown root:root "$grub_tmp" || exit 1
+    fi
+    chmod 444 "$grub_tmp" || exit 1
     if [[ -f "${grub_dir}/grubenv" ]]; then
         grub-editenv "${grub_dir}/grubenv" unset saved_entry next_entry || {
             echo -e "${RED}清除 GRUB 启动选择失败，原引导配置未修改。${PLAIN}"
@@ -997,55 +2782,189 @@ EOF
         }
     fi
     mv -f -- "$grub_tmp" "$grub_target" || exit 1
+    grub_tmp=''
 
     echo -e "${GREEN}[信息]${PLAIN} 安装引导已写入，系统将在 3 秒后自动重启继续安装。"
-    sleep 3
+    sleep "${REINSTALL_REBOOT_DELAY:-3}"
     reboot || sudo reboot >/dev/null 2>&1
 )
 
 reinstall_debian() {
-    local debian_version="$1" pw='' pw2='' confirm='' target_disk=''
+    local debian_version="$1" pw='' pw2='' confirm='' target_disk='' arch='' target_dns='' inline_choice=''
+    local REINSTALL_STACK_PREF="${REINSTALL_STACK_PREF:-auto}"
 
-    read -r -s -p " 请设置 root 密码: " pw
+    arch=$(reinstall_get_arch) || {
+        echo -e "${RED}当前重装模块仅支持 amd64/x86_64 与 arm64/aarch64${PLAIN}"
+        press_any_key_to_continue
+        return 1
+    }
+
+    reinstall_probe_network_state
+    if [[ "$REINSTALL_STACK_PREF" == "auto" ]] && (( REINSTALL_HAS_IPV4 == 1 && REINSTALL_HAS_IPV6 == 1 )); then
+        while true; do
+            [[ -z "${REINSTALL_NO_CLEAR:-}" ]] && clear
+            echo -e "${BLUE}检测到当前主机支持双栈网络，请选择重装网络模式:${PLAIN}"
+            echo -e " ${GREEN}1.${PLAIN} 双栈 (IPv4 + IPv6) [默认]"
+            echo -e " ${GREEN}2.${PLAIN} 仅 IPv4"
+            echo -e " ${GREEN}3.${PLAIN} 仅 IPv6"
+            echo -e " ${YELLOW}0.${PLAIN} 返回上级"
+            read -r -p "${BLUE} 请选择网络模式 [1-3, 回车默认 1]: ${PLAIN}" inline_choice || [[ -n "$inline_choice" ]] || return 1
+            inline_choice=$(trim_input "$inline_choice")
+            [[ -z "$inline_choice" ]] && inline_choice='1'
+            inline_choice=$(normalize_numeric_choice "$inline_choice")
+            case "$inline_choice" in
+                1) REINSTALL_STACK_PREF='dual'; break ;;
+                2) REINSTALL_STACK_PREF='ipv4'; break ;;
+                3) REINSTALL_STACK_PREF='ipv6'; break ;;
+                0) return 0 ;;
+                *) show_invalid_option "请输入正确数字 [0-3]" "1" ;;
+            esac
+        done
+    fi
+
+    if ! reinstall_resolve_stack_mode "$REINSTALL_STACK_PREF"; then
+        echo -e "${RED}${REINSTALL_STACK_ERROR}${PLAIN}"
+        press_any_key_to_continue
+        return 1
+    fi
+
+    IFS= read -r -s -p " 请设置 root 密码: " pw
     echo
     [[ -n "$pw" ]] || {
         echo -e "${RED}密码不能为空。${PLAIN}"
-        return
+        sleep 1
+        return 1
     }
 
-    read -r -s -p " 请再次输入 root 密码: " pw2
+    IFS= read -r -s -p " 请再次输入 root 密码: " pw2
     echo
     [[ "$pw" == "$pw2" ]] || {
         echo -e "${RED}两次输入密码不一致。${PLAIN}"
-        return
+        sleep 1
+        return 1
     }
 
     REINSTALL_SSH_PORT=$(reinstall_detect_current_ssh_port)
     REINSTALL_ROOT_PASSWORD="$pw"
     target_disk=$(reinstall_get_target_disk)
+    target_dns=$(reinstall_target_dns_list "$REINSTALL_EFFECTIVE_STACK")
 
-    echo -e "${YELLOW} 将使用 Debian ${debian_version} 执行重装。${PLAIN}"
+    echo -e "${YELLOW} 将使用 Debian ${debian_version} (${arch}) 执行重装。${PLAIN}"
+    echo -e "${YELLOW} 网络模式: $(reinstall_stack_label "$REINSTALL_EFFECTIVE_STACK")${PLAIN}"
     echo -e "${YELLOW} 目标磁盘: ${target_disk:-未检测到}${PLAIN}"
     echo -e "${YELLOW} 重装后 SSH 端口将保持为: ${REINSTALL_SSH_PORT}${PLAIN}"
-    echo -e "${YELLOW} 默认 DNS: ${REINSTALL_DNS_LIST}${PLAIN}"
+    echo -e "${YELLOW} 默认 DNS: ${target_dns}${PLAIN}"
     echo -e "${YELLOW} 输入 YES 后将写入安装引导并自动重启。${PLAIN}"
     read -r -p " 输入「YES」确认开始重装，其它键取消: " confirm
     [[ "$confirm" == "YES" ]] || {
         echo -e "${YELLOW} 已取消重装。${PLAIN}"
-        return
+        sleep 1
+        return 0
     }
 
-    reinstall_install_target_system "$debian_version" "$target_disk"
+    if ! reinstall_install_target_system "$debian_version" "$target_disk"; then
+        press_any_key_to_continue
+        return 1
+    fi
+}
+
+reinstall_stack_mode_menu() {
+    local sub_choice=''
+    while true; do
+        clear
+        reinstall_probe_network_state
+        echo -e "${BLUE}————————————网络栈模式————————————${PLAIN}"
+        echo -e " 当前主机 IPv4: $( (( REINSTALL_HAS_IPV4 )) && echo "${GREEN}${REINSTALL_IPV4_IFACE} ${REINSTALL_IPV4_ADDR}/${REINSTALL_IPV4_PREFIX}${PLAIN}" || echo "${RED}未检测到${PLAIN}" )"
+        echo -e " 当前主机 IPv6: $( (( REINSTALL_HAS_IPV6 )) && echo "${GREEN}${REINSTALL_IPV6_IFACE} ${REINSTALL_IPV6_ADDR}/${REINSTALL_IPV6_PREFIX}${PLAIN}" || echo "${RED}未检测到${PLAIN}" )"
+        echo -e " 当前选择模式: ${GREEN}$(reinstall_stack_label "${REINSTALL_STACK_PREF:-auto}")${PLAIN}"
+        echo -e "${BLUE}——————————————————————————————————${PLAIN}"
+        echo -e " ${GREEN}1.${PLAIN} 自动识别 (推荐)"
+        echo -e " ${GREEN}2.${PLAIN} 双栈 (IPv4 + IPv6)"
+        echo -e " ${GREEN}3.${PLAIN} 仅 IPv4"
+        echo -e " ${GREEN}4.${PLAIN} 仅 IPv6"
+        echo -e " ${YELLOW}0.${PLAIN} 返回上级"
+        echo
+        sub_choice=$(read_menu_choice " 请输入数字 [0-4]: ") || return 1
+        case "$sub_choice" in
+            1)
+                REINSTALL_STACK_PREF='auto'
+                return 0
+                ;;
+            2)
+                if (( REINSTALL_HAS_IPV4 != 1 || REINSTALL_HAS_IPV6 != 1 )); then
+                    echo -e "${RED}当前主机未同时具备可用的公网 IPv4 与 IPv6，无法选择「双栈」模式${PLAIN}"
+                    sleep 1.2
+                else
+                    REINSTALL_STACK_PREF='dual'
+                    return 0
+                fi
+                ;;
+            3)
+                if (( REINSTALL_HAS_IPV4 != 1 )); then
+                    echo -e "${RED}当前主机未检测到可用的公网 IPv4，无法选择「仅 IPv4」模式${PLAIN}"
+                    sleep 1.2
+                else
+                    REINSTALL_STACK_PREF='ipv4'
+                    return 0
+                fi
+                ;;
+            4)
+                if (( REINSTALL_HAS_IPV6 != 1 )); then
+                    echo -e "${RED}当前主机未检测到可用的公网 IPv6，无法选择「仅 IPv6」模式${PLAIN}"
+                    sleep 1.2
+                else
+                    REINSTALL_STACK_PREF='ipv6'
+                    return 0
+                fi
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                show_invalid_option "请输入正确数字 [0-4]" "1"
+                ;;
+        esac
+    done
 }
 
 reinstall_start_menu() {
+    local arch='' boot_mode='BIOS' detected_desc='' mode_display=''
+    arch=$(reinstall_get_arch || uname -m)
+    if reinstall_is_efi || [[ "$arch" == "arm64" ]]; then
+        boot_mode='UEFI'
+    fi
+    reinstall_probe_network_state
+    if (( REINSTALL_HAS_IPV4 == 1 && REINSTALL_HAS_IPV6 == 1 )); then
+        detected_desc="${GREEN}双栈${PLAIN} (v4: ${REINSTALL_IPV4_ADDR}/${REINSTALL_IPV4_PREFIX} | v6: ${REINSTALL_IPV6_ADDR}/${REINSTALL_IPV6_PREFIX})"
+    elif (( REINSTALL_HAS_IPV4 == 1 )); then
+        detected_desc="${GREEN}仅 IPv4${PLAIN} (${REINSTALL_IPV4_ADDR}/${REINSTALL_IPV4_PREFIX})"
+    elif (( REINSTALL_HAS_IPV6 == 1 )); then
+        detected_desc="${GREEN}仅 IPv6${PLAIN} (${REINSTALL_IPV6_ADDR}/${REINSTALL_IPV6_PREFIX})"
+    else
+        detected_desc="${RED}未检测到可用公网网络${PLAIN}"
+    fi
+
+    if reinstall_resolve_stack_mode "${REINSTALL_STACK_PREF:-auto}"; then
+        if [[ "${REINSTALL_STACK_PREF:-auto}" == "auto" ]]; then
+            mode_display="${GREEN}自动识别 -> $(reinstall_stack_label "$REINSTALL_EFFECTIVE_STACK")${PLAIN}"
+        else
+            mode_display="${GREEN}$(reinstall_stack_label "$REINSTALL_EFFECTIVE_STACK")${PLAIN}"
+        fi
+    else
+        mode_display="${RED}$(reinstall_stack_label "${REINSTALL_STACK_PREF:-auto}") (不可用)${PLAIN}"
+    fi
+
     clear
     echo -e "${BLUE}一键网络重装管理脚本${PLAIN}"
+    echo -e " 当前架构: ${GREEN}${arch} (${boot_mode})${PLAIN}"
+    echo -e " 主机网络: ${detected_desc}"
+    echo -e " 重装模式: ${mode_display}"
     echo
     echo -e "${BLUE}————————————重装系统————————————${PLAIN}"
-    echo -e " ${GREEN}1.${PLAIN} 重装 Debian 11"
-    echo -e " ${GREEN}2.${PLAIN} 重装 Debian 12"
-    echo -e " ${GREEN}3.${PLAIN} 重装 Debian 13"
+    echo -e " ${GREEN}1.${PLAIN} 重装 Debian 11 (Bullseye)"
+    echo -e " ${GREEN}2.${PLAIN} 重装 Debian 12 (Bookworm)"
+    echo -e " ${GREEN}3.${PLAIN} 重装 Debian 13 (Trixie)"
+    echo -e " ${GREEN}4.${PLAIN} 切换网络模式 (仅v4 / 仅v6 / 双栈)"
     echo -e " ${YELLOW}0.${PLAIN} 返回菜单"
     echo
 }
@@ -1054,29 +2973,31 @@ reinstall_main_loop() {
     local num=''
     while true; do
         reinstall_start_menu
-        read -r -p " 请输入数字 [0-3]: " num || return 1
-        num=$(echo "$num" | grep -oE '^[0-9]+$')
+        num=$(read_menu_choice " 请输入数字 [0-4]: ") || return 1
         case "$num" in
             1) reinstall_debian 11 ;;
             2) reinstall_debian 12 ;;
             3) reinstall_debian 13 ;;
+            4) reinstall_stack_mode_menu ;;
             0) break ;;
             *)
-                echo -e "${RED}请输入正确数字 [0-3]${PLAIN}"
-                sleep 1
+                show_invalid_option "请输入正确数字 [0-4]" "1"
                 ;;
         esac
     done
 }
 
 reinstall_menu() {
-    PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:~/bin
+    local d
+    for d in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
+        case ":$PATH:" in *":$d:"*) ;; *) PATH="${PATH:+$PATH:}$d" ;; esac
+    done
     export PATH
     reinstall_check_sys
     [[ "$EUID" -ne '0' ]] && echo -e "${RED}请使用 root 权限运行此脚本${PLAIN}" && return
     [[ -z "${reinstall_release:-}" ]] && echo -e "${RED}暂不支持当前系统${PLAIN}" && press_any_key_to_continue && return
-    if [[ "$(uname -m)" != "x86_64" && "$(uname -m)" != "amd64" ]]; then
-        echo -e "${RED}当前重装模块仅支持 amd64/x86_64${PLAIN}"
+    if ! reinstall_get_arch >/dev/null 2>&1; then
+        echo -e "${RED}当前重装模块仅支持 amd64/x86_64 与 arm64/aarch64${PLAIN}"
         press_any_key_to_continue
         return 1
     fi
@@ -1088,72 +3009,81 @@ reinstall_menu() {
     reinstall_main_loop
 }
 
+tz_is_valid() {
+    local tz="$1"
+    [[ -n "$tz" && "$tz" != /* && "$tz" != *..* && ! "$tz" =~ [[:space:]] ]] || return 1
+    [[ -f "/usr/share/zoneinfo/$tz" ]] && return 0
+    timedatectl list-timezones 2>/dev/null | grep -Fxq -- "$tz"
+}
+
+tz_get_system() {
+    local sys_tz=""
+    if [[ -L /etc/localtime ]]; then
+        sys_tz=$(readlink /etc/localtime 2>/dev/null || true)
+        [[ "$sys_tz" == */zoneinfo/* ]] && sys_tz="${sys_tz##*/zoneinfo/}" || sys_tz=""
+    fi
+    [[ -n "$sys_tz" ]] || sys_tz=$(trim_input "$(timedatectl show -p Timezone --value 2>/dev/null)")
+    printf '%s\n' "${sys_tz:-未知}"
+}
+
+tz_get_zone_tab() {
+    local zone_tab="/usr/share/zoneinfo/zone1970.tab"
+    [[ -f "$zone_tab" ]] || zone_tab="/usr/share/zoneinfo/zone.tab"
+    [[ -f "$zone_tab" ]] || return 1
+    printf '%s\n' "$zone_tab"
+}
+
+tz_detect_recommended() {
+    local tz=""
+    if ! command -v curl >/dev/null 2>&1; then
+        echo -e "${YELLOW}未安装 curl，无法自动检测时区${PLAIN}" >&2
+        return 1
+    fi
+
+    tz=$(curl -A 'Zero.sh/2.4' -fsSL --connect-timeout 3 --max-time 5 \
+        'https://ipwho.is/?fields=timezone.id' 2>/dev/null \
+        | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        | head -n1)
+    tz=$(trim_input "$tz")
+    if ! tz_is_valid "$tz"; then
+        tz=$(curl -A 'Zero.sh/2.4' -fsSL --connect-timeout 3 --max-time 5 \
+            'https://ipapi.co/timezone' 2>/dev/null | head -n1)
+        tz=$(trim_input "$tz")
+        tz_is_valid "$tz" || return 1
+    fi
+    printf '%s\n' "$tz"
+}
+
+tz_apply() {
+    local tz="$1" skip_validate="${2:-0}"
+    if (( skip_validate == 0 )) && ! tz_is_valid "$tz"; then
+        echo -e "${RED}无效的时区名称: ${tz}${PLAIN}"
+        return 1
+    fi
+
+    echo -e "${YELLOW}正在设置时区为 ${tz} ...${PLAIN}"
+    if timedatectl set-timezone "$tz"; then
+        echo -e "${GREEN}✔ 设置成功! 当前时间: $(date)${PLAIN}"
+        return 0
+    fi
+
+    echo -e "${RED}✘ 设置失败${PLAIN}"
+    return 1
+}
+
 change_timezone() {
-    local choice input_code zone_tab tz_idx sel_tz manual_tz detected_tz
-    local sys_tz pause_after
+    local choice input_code zone_tab tz_idx sel_tz manual_tz detected_tz sys_tz pause_after i
     local -a lines=()
 
-    if ! command -v timedatectl >/dev/null; then
+    if ! command -v timedatectl >/dev/null 2>&1; then
         echo -e "${RED}未安装 timedatectl,无法自动设置时区${PLAIN}"
         press_any_key_to_continue
         return
     fi
 
-    _timezone_is_valid() {
-        local tz="$1"
-        [[ -n "$tz" ]] || return 1
-        timedatectl list-timezones 2>/dev/null | grep -Fxq -- "$tz"
-    }
-
-    _timezone_get_system_tz() {
-        local sys_tz
-        sys_tz=$(trim_input "$(timedatectl show -p Timezone --value 2>/dev/null)")
-        echo "${sys_tz:-未知}"
-    }
-
-    _timezone_get_zone_tab() {
-        local zone_tab="/usr/share/zoneinfo/zone1970.tab"
-        [[ -f "$zone_tab" ]] || zone_tab="/usr/share/zoneinfo/zone.tab"
-        [[ -f "$zone_tab" ]] || return 1
-        echo "$zone_tab"
-    }
-
-    _timezone_detect_recommended() {
-        local tz=""
-        if ! command -v curl >/dev/null; then
-            echo -e "${YELLOW}未安装 curl，无法自动检测时区${PLAIN}" >&2
-            return 1
-        fi
-
-        tz=$(curl -A 'Zero.sh/2.4' -fsSL --connect-timeout 5 --max-time 8 \
-            'https://ipwho.is/?fields=timezone.id' 2>/dev/null \
-            | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-            | head -n1)
-        tz=$(trim_input "$tz")
-        _timezone_is_valid "$tz" || return 1
-        echo "$tz"
-    }
-
-    _timezone_apply() {
-        local tz="$1"
-        if ! _timezone_is_valid "$tz"; then
-            echo -e "${RED}无效的时区名称: ${tz}${PLAIN}"
-            return 1
-        fi
-
-        echo -e "${YELLOW}正在设置时区为 ${tz} ...${PLAIN}"
-        if timedatectl set-timezone "$tz"; then
-            echo -e "${GREEN}✔ 设置成功! 当前时间: $(date)${PLAIN}"
-            return 0
-        fi
-
-        echo -e "${RED}✘ 设置失败${PLAIN}"
-        return 1
-    }
-
     while true; do
         pause_after=0
-        sys_tz=$(_timezone_get_system_tz)
+        sys_tz=$(tz_get_system)
         clear
         echo -e "${BLUE}======= 时区管理 =====${PLAIN}"
         echo -e "${YELLOW}当前 ${sys_tz}${PLAIN}"
@@ -1161,16 +3091,16 @@ change_timezone() {
         echo -e "${GREEN}1.${PLAIN}自动检测  ${GREEN}2.${PLAIN}国家代码"
         echo -e "${GREEN}3.${PLAIN}手动输入  ${YELLOW}0.${PLAIN}返回菜单"
         echo -e "${BLUE}======================${PLAIN}"
-        
+
         choice=$(read_menu_choice "请输入选项 [0-3]: ") || return 1
-        
+
         case "$choice" in
             1)
                 echo -e "${YELLOW}正在检测时区...${PLAIN}"
-                detected_tz=$(_timezone_detect_recommended || true)
+                detected_tz=$(tz_detect_recommended || true)
                 if [[ -n "$detected_tz" ]]; then
                     echo -e "${GREEN}检测结果: ${detected_tz}${PLAIN}"
-                    _timezone_apply "$detected_tz"
+                    tz_apply "$detected_tz" 1
                 else
                     echo -e "${YELLOW}自动检测失败，请使用国家代码或手动输入${PLAIN}"
                 fi
@@ -1178,25 +3108,25 @@ change_timezone() {
                 ;;
             2)
                 clear
-                read -r -p "$(echo -e "${BLUE}请输入国家代码 (如 CN,US,JP): ${PLAIN}")" input_code
+                read -r -p "${BLUE}请输入国家代码 (如 CN,US,JP): ${PLAIN}" input_code || return 1
                 input_code=$(trim_input "$input_code")
                 input_code=$(printf '%s' "$input_code" | tr '[:lower:]' '[:upper:]')
-                [ -z "$input_code" ] && continue
+                [[ -z "$input_code" ]] && continue
                 if [[ ! "$input_code" =~ ^[A-Z]{2}$ ]]; then
                     echo -e "${RED}国家代码必须是两个英文字母${PLAIN}"
                     press_any_key_to_continue
                     continue
                 fi
 
-                zone_tab=$(_timezone_get_zone_tab || true)
-                if [ -z "$zone_tab" ]; then
+                zone_tab=$(tz_get_zone_tab || true)
+                if [[ -z "$zone_tab" ]]; then
                     echo -e "${RED}系统缺失时区索引文件 (zone1970.tab/zone.tab)，无法自动列表。${PLAIN}"
                     pause_after=1
                 else
                     lines=()
-                    mapfile -t lines < <(awk -v code="$input_code" '$1 ~ ("(^|,)" code "(,|$)") {print $3}' "$zone_tab" | sort -u)
+                    mapfile -t lines < <(awk -v code="$input_code" '$1 !~ /^#/ && $1 ~ ("(^|,)" code "(,|$)") {print $3}' "$zone_tab" | sort -u)
 
-                    if [ "${#lines[@]}" -eq 0 ]; then
+                    if (( ${#lines[@]} == 0 )); then
                         echo -e "${RED}未找到代码 [$input_code] 对应的时区信息。${PLAIN}"
                         sleep 1
                         continue
@@ -1211,7 +3141,7 @@ change_timezone() {
                     tz_idx=$(read_menu_choice "请选择编号: ") || return 1
                     if valid_list_index "$tz_idx" "${#lines[@]}"; then
                         sel_tz="${lines[$((tz_idx-1))]}"
-                        _timezone_apply "$sel_tz"
+                        tz_apply "$sel_tz" 1
                     else
                         echo -e "${RED}无效编号${PLAIN}"
                     fi
@@ -1219,10 +3149,10 @@ change_timezone() {
                 fi
                 ;;
             3)
-                read -r -p "$(echo -e "${BLUE}请输入时区全称 (例: Asia/Shanghai): ${PLAIN}")" manual_tz
+                read -r -p "${BLUE}请输入时区全称 (例: Asia/Shanghai): ${PLAIN}" manual_tz || return 1
                 manual_tz=$(trim_input "$manual_tz")
-                if [ -n "$manual_tz" ]; then
-                    _timezone_apply "$manual_tz"
+                if [[ -n "$manual_tz" ]]; then
+                    tz_apply "$manual_tz"
                 fi
                 pause_after=1
                 ;;
@@ -1237,140 +3167,94 @@ change_timezone() {
     done
 }
 
-REINSTALL_DNS_LIST='8.8.8.8 1.1.1.1 2001:4860:4860::8888 2606:4700:4700::1111'
+GAI_CONF_PATH="/etc/gai.conf"
+GAI_BACKUP_PATH="/etc/gai.conf.zero.bak"
+GAI_MANAGED_BEGIN="# Zero.sh IP Priority BEGIN"
+GAI_MANAGED_END="# Zero.sh IP Priority END"
 
-set_ip_priority() {
-    local gai_conf="/etc/gai.conf"
-    local backup_conf="/etc/gai.conf.zero.bak"
-    local managed_begin="# Zero.sh IP Priority BEGIN"
-    local managed_end="# Zero.sh IP Priority END"
-    local choice current_priority
-
-    _priority_rule_exists() {
-        local precedence_value="$1"
-        [[ -f "$gai_conf" ]] || return 1
-        sed -n "/^${managed_begin}$/,/^${managed_end}$/p" "$gai_conf" |
-            grep -qE "^precedence[[:space:]]+::ffff:0:0/96[[:space:]]+${precedence_value}[[:space:]]*$"
+ip_priority_inspect() {
+    local conf="${1:-$GAI_CONF_PATH}"
+    [[ -f "$conf" ]] || {
+        printf 'default|0|0\n'
+        return 0
     }
+    awk -v begin="$GAI_MANAGED_BEGIN" -v end="$GAI_MANAGED_END" '
+        $0 == begin { in_zero = 1; has_zero = 1; next }
+        $0 == end   { in_zero = 0; next }
+        in_zero && $0 ~ /^precedence[[:space:]]+::ffff:0:0\/96[[:space:]]+100[[:space:]]*$/ { v4 = 1 }
+        in_zero && $0 ~ /^precedence[[:space:]]+::ffff:0:0\/96[[:space:]]+10[[:space:]]*$/  { v6 = 1 }
+        !in_zero && $0 ~ /^[[:space:]]*precedence[[:space:]]+/ { unmanaged = 1 }
+        END {
+            if (v4) label = "IPv4 优先"
+            else if (v6) label = "IPv6 优先"
+            else if (has_zero) label = "Zero.sh 自定义"
+            else if (unmanaged) label = "用户自定义"
+            else label = "IPv6 优先（系统默认）"
+            printf "%s|%d|%d\n", label, has_zero, unmanaged
+        }
+    ' "$conf"
+}
 
-    _managed_priority_exists() {
-        [[ -f "$gai_conf" ]] && grep -Fxq -- "$managed_begin" "$gai_conf"
-    }
+ip_priority_write_config() {
+    local mode="$1" conf="${2:-$GAI_CONF_PATH}" backup="${3:-$GAI_BACKUP_PATH}"
+    local temp_file ipv4_precedence=""
 
-    _unmanaged_priority_exists() {
-        [[ -f "$gai_conf" ]] || return 1
-        awk -v begin="$managed_begin" -v end="$managed_end" '
+    case "$mode" in
+        ipv4) ipv4_precedence=100 ;;
+        ipv6) ipv4_precedence=10 ;;
+        default) ipv4_precedence="" ;;
+        *) return 1 ;;
+    esac
+
+    temp_file=$(mktemp "${conf}.zero.XXXXXX") || return 1
+    if [[ -f "$conf" ]]; then
+        if [[ ! -f "$backup" ]] && ! grep -Fxq "$GAI_MANAGED_BEGIN" "$conf" 2>/dev/null; then
+            cp -p "$conf" "$backup" 2>/dev/null || cp "$conf" "$backup" || { rm -f "$temp_file"; return 1; }
+        fi
+        if ! awk -v begin="$GAI_MANAGED_BEGIN" -v end="$GAI_MANAGED_END" '
             $0 == begin { managed = 1; next }
             $0 == end   { managed = 0; next }
-            !managed && $0 ~ /^[[:space:]]*precedence[[:space:]]+/ { found = 1 }
-            END { exit(found ? 0 : 1) }
-        ' "$gai_conf"
-    }
-
-    _get_current_priority() {
-        if _priority_rule_exists 100; then
-            echo "IPv4 优先"
-        elif _priority_rule_exists 10; then
-            echo "IPv6 优先"
-        elif _managed_priority_exists; then
-            echo "Zero.sh 自定义"
-        elif _unmanaged_priority_exists; then
-            echo "用户自定义"
-        else
-            echo "IPv6 优先（系统默认）"
-        fi
-    }
-
-    _write_priority_config() {
-        local mode="$1"
-        local temp_file ipv4_precedence
-
-        temp_file=$(mktemp /etc/gai.conf.zero.XXXXXX) || return 1
-        if [[ -f "$gai_conf" ]]; then
-            cp -p "$gai_conf" "$backup_conf" || {
-                rm -f "$temp_file"
-                return 1
-            }
-            if ! awk -v begin="$managed_begin" -v end="$managed_end" '
-                $0 == begin { managed = 1; next }
-                $0 == end   { managed = 0; next }
-                !managed    { print }
-                END         { if (managed) exit 1 }
-            ' "$gai_conf" > "$temp_file"; then
-                rm -f "$temp_file"
-                echo -e "${RED}检测到不完整的 Zero.sh 配置块，未修改 ${gai_conf}${PLAIN}"
-                return 1
-            fi
-        else
-            : > "$temp_file"
-        fi
-
-        case "$mode" in
-            ipv4) ipv4_precedence=100 ;;
-            ipv6) ipv4_precedence=10 ;;
-            default) ipv4_precedence="" ;;
-            *)
-                rm -f "$temp_file"
-                return 1
-                ;;
-        esac
-
-        if [[ -n "$ipv4_precedence" ]]; then
-            if ! {
-                echo
-                echo "$managed_begin"
-                echo "precedence ::1/128 50"
-                echo "precedence ::/0 40"
-                echo "precedence 2002::/16 30"
-                echo "precedence ::/96 20"
-                echo "precedence ::ffff:0:0/96 ${ipv4_precedence}"
-                echo "$managed_end"
-            } >> "$temp_file"; then
-                rm -f "$temp_file"
-                return 1
-            fi
-        fi
-
-        chmod 644 "$temp_file" || {
+            !managed    { print }
+            END         { if (managed) exit 1 }
+        ' "$conf" > "$temp_file"; then
             rm -f "$temp_file"
-            return 1
-        }
-        if ! mv -f "$temp_file" "$gai_conf"; then
-            rm -f "$temp_file"
+            echo -e "${RED}检测到不完整的 Zero.sh 配置块，未修改 ${conf}${PLAIN}"
             return 1
         fi
+    else
+        : > "$temp_file"
+    fi
+
+    if [[ -n "$ipv4_precedence" ]]; then
+        {
+            echo
+            echo "$GAI_MANAGED_BEGIN"
+            echo "precedence ::1/128 50"
+            echo "precedence ::/0 40"
+            echo "precedence 2002::/16 30"
+            echo "precedence ::/96 20"
+            echo "precedence ::ffff:0:0/96 ${ipv4_precedence}"
+            echo "precedence 2001::/32 5"
+            echo "precedence fc00::/7 3"
+            echo "$GAI_MANAGED_END"
+        } >> "$temp_file" || { rm -f "$temp_file"; return 1; }
+    fi
+
+    chmod 644 "$temp_file" && mv -f "$temp_file" "$conf" || {
+        rm -f "$temp_file"
+        return 1
     }
+}
 
-    _apply_priority_mode() {
-        local mode="$1"
-        local label="$2"
-
-        if [[ "$mode" == "default" ]] && ! _managed_priority_exists; then
-            if _unmanaged_priority_exists; then
-                echo -e "${YELLOW}当前由用户自定义规则管理，Zero.sh 没有可移除的配置${PLAIN}"
-            else
-                echo -e "${GREEN}当前已是 IPv6 优先（系统默认）${PLAIN}"
-            fi
-            press_any_key_to_continue
-            return 0
-        fi
-
-        if _write_priority_config "$mode"; then
-            if [[ "$mode" == "default" ]] && _unmanaged_priority_exists; then
-                echo -e "${GREEN}✔ 已移除 Zero.sh 设置，保留用户自定义规则${PLAIN}"
-            else
-                echo -e "${GREEN}✔ 已设置为 ${label}${PLAIN}"
-            fi
-            [[ -f "$backup_conf" ]] && echo -e "${YELLOW}备份: ${backup_conf}${PLAIN}"
-        else
-            echo -e "${RED}✘ IP 连接优先级设置失败${PLAIN}"
-        fi
-        press_any_key_to_continue
-    }
+set_ip_priority() {
+    local choice state_line current_priority has_managed has_unmanaged mode label
 
     while true; do
         clear
-        current_priority=$(_get_current_priority)
+        state_line=$(ip_priority_inspect "$GAI_CONF_PATH")
+        IFS='|' read -r current_priority has_managed has_unmanaged <<< "$state_line"
+        [[ "$current_priority" == "default" ]] && current_priority="IPv6 优先（系统默认）"
+
         echo -e "${BLUE}=== IP连接优先级 ===${PLAIN}"
         echo -e "${YELLOW}当前优先级: ${GREEN}${current_priority}${PLAIN}"
         echo -e "${BLUE}======================${PLAIN}"
@@ -1379,26 +3263,39 @@ set_ip_priority() {
         echo -e "${GREEN}3.${PLAIN}系统默认"
         echo -e "${YELLOW}0.${PLAIN}返回菜单"
         echo -e "${BLUE}======================${PLAIN}"
-        read -rp "$(echo -e "${BLUE}请输入选项 [0-3]: ${PLAIN}")" choice || return 1
+        choice=$(read_menu_choice "请输入选项 [0-3]: ") || return 1
 
+        mode=""
+        label=""
         case "$choice" in
-            1)
-                _apply_priority_mode "ipv4" "IPv4优先"
-                ;;
-            2)
-                _apply_priority_mode "ipv6" "IPv6优先"
-                ;;
-            3)
-                _apply_priority_mode "default" "IPv6优先（系统默认）"
-                ;;
-            0)
-                return
-                ;;
-            *)
-                echo -e "${RED}无效选项${PLAIN}"
-                sleep 0.5
-                ;;
+            1) mode="ipv4"; label="IPv4优先" ;;
+            2) mode="ipv6"; label="IPv6优先" ;;
+            3) mode="default"; label="IPv6优先（系统默认）" ;;
+            0) return ;;
+            *) show_invalid_option; continue ;;
         esac
+
+        if [[ "$mode" == "default" && "$has_managed" == "0" ]]; then
+            if [[ "$has_unmanaged" == "1" ]]; then
+                echo -e "${YELLOW}当前由用户自定义规则管理，Zero.sh 没有可移除的配置${PLAIN}"
+            else
+                echo -e "${GREEN}当前已是 IPv6 优先（系统默认）${PLAIN}"
+            fi
+            press_any_key_to_continue
+            continue
+        fi
+
+        if ip_priority_write_config "$mode" "$GAI_CONF_PATH" "$GAI_BACKUP_PATH"; then
+            if [[ "$mode" == "default" && "$has_unmanaged" == "1" ]]; then
+                echo -e "${GREEN}✔ 已移除 Zero.sh 设置，保留用户自定义规则${PLAIN}"
+            else
+                echo -e "${GREEN}✔ 已设置为 ${label}${PLAIN}"
+            fi
+            [[ -f "$GAI_BACKUP_PATH" ]] && echo -e "${YELLOW}备份: ${GAI_BACKUP_PATH}${PLAIN}"
+        else
+            echo -e "${RED}✘ IP 连接优先级设置失败${PLAIN}"
+        fi
+        press_any_key_to_continue
     done
 }
 
@@ -1412,11 +3309,7 @@ BBR_SPEEDTEST_BIN="/usr/local/bin/speedtest"
 BBR_SPEEDTEST_MARKER="/usr/local/bin/.zero-bbr-speedtest.sha256"
 
 bbr_get_arch() {
-    case "$(uname -m)" in
-        x86_64|amd64) echo "amd64" ;;
-        aarch64|arm64) echo "arm64" ;;
-        *) return 1 ;;
-    esac
+    zero_get_arch
 }
 
 bbr_get_speedtest_arch() {
@@ -1454,20 +3347,35 @@ bbr_prompt_reboot() {
 }
 
 bbr_xanmod_installed() {
-    dpkg -l 2>/dev/null | grep -qE '^ii[[:space:]]+linux-image-.*xanmod'
+    if compgen -G '/boot/vmlinuz-*' >/dev/null 2>&1; then
+        compgen -G '/boot/vmlinuz-*xanmod*' >/dev/null 2>&1
+        return $?
+    fi
+    command -v dpkg-query >/dev/null 2>&1 || return 1
+    dpkg-query -W -f='${db:Status-Abbrev}\n' 'linux-image-*xanmod*' 2>/dev/null | grep -q '^ii'
 }
 
 bbr_read_runtime_status() {
-    local current_kernel cc qdisc available_cc xanmod_installed="no"
+    local current_kernel cc="" qdisc="" available_cc="" xanmod_installed="no"
 
     current_kernel=$(uname -r 2>/dev/null)
-    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
-    available_cc=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)
-
-    if bbr_xanmod_installed; then
-        xanmod_installed="yes"
+    if [[ -r /proc/sys/net/ipv4/tcp_congestion_control ]]; then
+        IFS= read -r cc < /proc/sys/net/ipv4/tcp_congestion_control
+    else
+        cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     fi
+    if [[ -r /proc/sys/net/core/default_qdisc ]]; then
+        IFS= read -r qdisc < /proc/sys/net/core/default_qdisc
+    else
+        qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+    fi
+    if [[ -r /proc/sys/net/ipv4/tcp_available_congestion_control ]]; then
+        IFS= read -r available_cc < /proc/sys/net/ipv4/tcp_available_congestion_control
+    else
+        available_cc=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)
+    fi
+
+    bbr_xanmod_installed "$current_kernel" && xanmod_installed="yes"
 
     printf '%s\n' \
         "$current_kernel" \
@@ -1589,7 +3497,10 @@ bbr_select_xanmod_package() {
 
 bbr_fetch_xanmod_key() {
     local output_file="$1" log_file="$2"
-    curl -fsSL "https://gitlab.com/afrd.gpg" -o "$output_file" >"$log_file" 2>&1 && [[ -s "$output_file" ]]
+    if curl -fsSL --connect-timeout 8 --max-time 20 "https://dl.xanmod.org/archive.key" -o "$output_file" >"$log_file" 2>&1 && [[ -s "$output_file" ]]; then
+        return 0
+    fi
+    curl -fsSL --connect-timeout 8 --max-time 20 "https://gitlab.com/afrd.gpg" -o "$output_file" >>"$log_file" 2>&1 && [[ -s "$output_file" ]]
 }
 
 bbr_check_disk_space() {
@@ -1863,99 +3774,30 @@ bbr_calculate_buffer_size() {
     local region="${2:-asia}"
     local profile="${3:-balanced}"
     local mem_total="${4:-0}"
-    local buffer_mb
+    local buffer_mb=0 table="" item limit val
 
     if ! [[ "$bandwidth" =~ ^[0-9]+$ ]] || (( bandwidth <= 0 )); then
         case "$profile:$region" in
             download:overseas) buffer_mb=48 ;;
-            download:*) buffer_mb=24 ;;
-            *:overseas) buffer_mb=32 ;;
-            *) buffer_mb=16 ;;
+            download:*)        buffer_mb=24 ;;
+            *:overseas)        buffer_mb=32 ;;
+            *)                 buffer_mb=16 ;;
         esac
-    elif [[ "$profile" == "download" ]]; then
-        if [[ "$region" == "overseas" ]]; then
-            if (( bandwidth <= 100 )); then
-                buffer_mb=8
-            elif (( bandwidth <= 200 )); then
-                buffer_mb=16
-            elif (( bandwidth <= 300 )); then
-                buffer_mb=24
-            elif (( bandwidth <= 500 )); then
-                buffer_mb=32
-            elif (( bandwidth <= 700 )); then
-                buffer_mb=40
-            elif (( bandwidth <= 1000 )); then
-                buffer_mb=48
-            elif (( bandwidth <= 1500 )); then
-                buffer_mb=64
-            elif (( bandwidth <= 2500 )); then
-                buffer_mb=80
-            else
-                buffer_mb=96
-            fi
-        else
-            if (( bandwidth <= 100 )); then
-                buffer_mb=6
-            elif (( bandwidth <= 200 )); then
-                buffer_mb=8
-            elif (( bandwidth <= 300 )); then
-                buffer_mb=12
-            elif (( bandwidth <= 500 )); then
-                buffer_mb=16
-            elif (( bandwidth <= 700 )); then
-                buffer_mb=20
-            elif (( bandwidth <= 1000 )); then
-                buffer_mb=24
-            elif (( bandwidth <= 1500 )); then
-                buffer_mb=32
-            elif (( bandwidth <= 2000 )); then
-                buffer_mb=40
-            elif (( bandwidth <= 2500 )); then
-                buffer_mb=48
-            else
-                buffer_mb=64
-            fi
-        fi
     else
-        if [[ "$region" == "overseas" ]]; then
-            if (( bandwidth <= 100 )); then
-                buffer_mb=8
-            elif (( bandwidth <= 200 )); then
-                buffer_mb=12
-            elif (( bandwidth <= 300 )); then
-                buffer_mb=16
-            elif (( bandwidth <= 500 )); then
-                buffer_mb=20
-            elif (( bandwidth <= 700 )); then
-                buffer_mb=28
-            elif (( bandwidth <= 1000 )); then
-                buffer_mb=32
-            elif (( bandwidth <= 1500 )); then
-                buffer_mb=40
-            else
-                buffer_mb=48
+        case "$profile:$region" in
+            download:overseas) table="100:8 200:16 300:24 500:32 700:40 1000:48 1500:64 2500:80 *:96" ;;
+            download:*)        table="100:6 200:8 300:12 500:16 700:20 1000:24 1500:32 2000:40 2500:48 *:64" ;;
+            *:overseas)        table="100:8 200:12 300:16 500:20 700:28 1000:32 1500:40 *:48" ;;
+            *)                 table="100:4 200:6 300:8 500:10 700:12 1000:16 1500:20 2000:24 *:32" ;;
+        esac
+        for item in $table; do
+            limit="${item%:*}"
+            val="${item#*:}"
+            if [[ "$limit" == "*" ]] || (( bandwidth <= limit )); then
+                buffer_mb="$val"
+                break
             fi
-        else
-            if (( bandwidth <= 100 )); then
-                buffer_mb=4
-            elif (( bandwidth <= 200 )); then
-                buffer_mb=6
-            elif (( bandwidth <= 300 )); then
-                buffer_mb=8
-            elif (( bandwidth <= 500 )); then
-                buffer_mb=10
-            elif (( bandwidth <= 700 )); then
-                buffer_mb=12
-            elif (( bandwidth <= 1000 )); then
-                buffer_mb=16
-            elif (( bandwidth <= 1500 )); then
-                buffer_mb=20
-            elif (( bandwidth <= 2000 )); then
-                buffer_mb=24
-            else
-                buffer_mb=32
-            fi
-        fi
+        done
     fi
 
     local raw_buffer_mb mem_cap profile_label
@@ -2331,10 +4173,14 @@ bbr_install_xanmod_kernel() {
         return 1
     fi
 
-    apt-get update || {
-        bbr_fail_and_pause "apt-get update 失败"
-        return 1
-    }
+    if ! apt-get update; then
+        echo -e "${YELLOW}使用代号 ${distro_codename} 更新失败，尝试 XanMod 通用 releases 源...${PLAIN}"
+        echo "deb [signed-by=${BBR_KEYRING}] http://deb.xanmod.org releases main" > "$BBR_REPO_FILE"
+        apt-get update || {
+            bbr_fail_and_pause "apt-get update 失败"
+            return 1
+        }
+    fi
 
     local package_info package_status
 
@@ -2373,9 +4219,10 @@ bbr_uninstall_xanmod_kernel() {
     fi
 
     echo -e "${YELLOW}警告: 即将卸载 XanMod 内核${PLAIN}"
-    local non_xanmod_kernels
-    non_xanmod_kernels=$(dpkg -l 2>/dev/null | grep '^ii' | grep 'linux-image-' | grep -v 'xanmod' | grep -v 'dbg' | wc -l)
-    if [[ "$non_xanmod_kernels" -eq 0 ]]; then
+    local non_xanmod_kernels=0
+    non_xanmod_kernels=$(dpkg-query -W -f='${db:Status-Abbrev}\t${binary:Package}\n' 'linux-image-[0-9]*' 2>/dev/null |
+        awk '$1 == "ii" && $2 !~ /xanmod/ && $2 !~ /-dbg$/ { c++ } END { print c + 0 }')
+    if (( non_xanmod_kernels == 0 )); then
         local default_kernel_package="linux-image-amd64"
         [[ "$(bbr_get_arch 2>/dev/null || true)" == "arm64" ]] && default_kernel_package="linux-image-arm64"
         echo -e "${RED}安全检查未通过：未检测到非 XanMod 的回退内核${PLAIN}"
@@ -2392,7 +4239,6 @@ bbr_uninstall_xanmod_kernel() {
             bbr_fail_and_pause "卸载 XanMod 相关包失败"
             return 1
         fi
-        update-grub 2>/dev/null || true
         rm -f "$BBR_REPO_FILE" "$BBR_KEYRING" /usr/share/keyrings/xanmod-archive-keyring.gpg
         rm -f "$BBR_SYSCTL_CONF" /etc/sysctl.d/99-zero-bbr.conf
         bbr_apply_mss_clamp disable || { bbr_fail_and_pause "移除 Zero.sh MSS 规则失败"; return 1; }
@@ -2431,17 +4277,20 @@ bbr_restore_original_network_config() {
     press_any_key_to_continue
 }
 
-bbr_menu_status_line() {
-    local current_kernel cc qdisc xanmod_state xanmod_installed
-    local -a bbr_status
+bbr_show_manage_menu() {
+    local bbr_arch="${1:-}"
+    local current_kernel cc qdisc xanmod_state xanmod_installed xanmod_action="安装XanMod"
+    local -a bbr_status=()
 
+    [[ -n "$bbr_arch" ]] || bbr_arch=$(bbr_get_arch 2>/dev/null || true)
     mapfile -t bbr_status < <(bbr_read_runtime_status)
-    current_kernel="${bbr_status[0]}"
-    cc="${bbr_status[1]}"
-    qdisc="${bbr_status[2]}"
-    xanmod_installed="${bbr_status[4]}"
+    current_kernel="${bbr_status[0]:-}"
+    cc="${bbr_status[1]:-}"
+    qdisc="${bbr_status[2]:-}"
+    xanmod_installed="${bbr_status[4]:-no}"
+    [[ "$xanmod_installed" == "yes" ]] && xanmod_action="更新XanMod"
 
-    if [[ "$(bbr_get_arch 2>/dev/null || true)" == "arm64" ]]; then
+    if [[ "$bbr_arch" == "arm64" ]]; then
         xanmod_state="${YELLOW}ARM64不适用${PLAIN}"
     elif [[ "$xanmod_installed" == "yes" ]]; then
         xanmod_state="${GREEN}已安装${PLAIN}"
@@ -2449,19 +4298,12 @@ bbr_menu_status_line() {
         xanmod_state="${YELLOW}未安装${PLAIN}"
     fi
 
-    echo -e "${BLUE}内核: ${YELLOW}${current_kernel:-unknown}${PLAIN}"
-    echo -e "${BLUE}状态: XanMod ${xanmod_state} | BBR ${GREEN}${cc:-unknown}${PLAIN} | 队列 ${GREEN}${qdisc:-unknown}${PLAIN}"
-}
-
-bbr_show_manage_menu() {
-    local xanmod_action="安装XanMod"
-
-    bbr_xanmod_installed && xanmod_action="更新XanMod"
     clear
     echo -e "${BLUE}=========== BBR ===========${PLAIN}"
-    bbr_menu_status_line
+    echo -e "${BLUE}内核: ${YELLOW}${current_kernel:-unknown}${PLAIN}"
+    echo -e "${BLUE}状态: XanMod ${xanmod_state} | BBR ${GREEN}${cc:-unknown}${PLAIN} | 队列 ${GREEN}${qdisc:-unknown}${PLAIN}"
     echo -e "${BLUE}===========================${PLAIN}"
-    if [[ "$(bbr_get_arch 2>/dev/null || true)" != "arm64" ]]; then
+    if [[ "$bbr_arch" != "arm64" ]]; then
         echo -e "${GREEN}1.BBR调优${PLAIN}         ${GREEN}2.${xanmod_action}${PLAIN}"
         echo -e "${RED}3.卸载XanMod${PLAIN}      ${YELLOW}0.返回菜单${PLAIN}"
     else
@@ -2471,7 +4313,12 @@ bbr_show_manage_menu() {
 }
 
 handle_bbr_manage_choice() {
-    case "$1" in
+    local choice="$1" bbr_arch="${2:-}"
+    if [[ "$bbr_arch" == "arm64" && ( "$choice" == "2" || "$choice" == "3" ) ]]; then
+        show_invalid_option
+        return 0
+    fi
+    case "$choice" in
         1) clear; bbr_configure_direct ;;
         2) clear; bbr_install_xanmod_kernel ;;
         3) clear; bbr_uninstall_xanmod_kernel ;;
@@ -2483,30 +4330,734 @@ handle_bbr_manage_choice() {
 }
 
 bbr_manage_menu() {
-    local opt
+    local opt bbr_arch
+    bbr_arch=$(bbr_get_arch 2>/dev/null || true)
     while true; do
-        bbr_show_manage_menu
-        if [[ "$(bbr_get_arch 2>/dev/null || true)" == "arm64" ]]; then
+        bbr_show_manage_menu "$bbr_arch"
+        if [[ "$bbr_arch" == "arm64" ]]; then
             opt=$(read_menu_choice "请输入选项 [0-1]: ") || return 1
         else
             opt=$(read_menu_choice "请输入选项 [0-3]: ") || return 1
         fi
-        handle_bbr_manage_choice "$opt" || return
+        handle_bbr_manage_choice "$opt" "$bbr_arch" || return
     done
 }
 
 DNS_RESOLV_CONF="/etc/resolv.conf"
 DNS_RESOLV_BACKUP="/etc/resolv.conf.zero.bak"
+DNS_DHCLIENT_CONF="/etc/dhcp/dhclient.conf"
+DNS_DHCLIENT_BACKUP="/etc/dhcp/dhclient.conf.zero.bak"
+DNS_DHCLIENT_HOOK_DIR="/etc/dhcp/dhclient-enter-hooks.d"
+DNS_DHCLIENT_HOOK_FILE="$DNS_DHCLIENT_HOOK_DIR/zz-zero-dns"
+DNS_DHCPCD_CONF="/etc/dhcpcd.conf"
+DNS_DHCPCD_BACKUP="/etc/dhcpcd.conf.zero.bak"
 DNS_RESOLVED_DROPIN_DIR="/etc/systemd/resolved.conf.d"
 DNS_RESOLVED_DROPIN_FILE="$DNS_RESOLVED_DROPIN_DIR/zz-zero-dns.conf"
 DNS_RESOLVED_PREVIOUS_FILE="$DNS_RESOLVED_DROPIN_DIR/90-zero-dns.conf"
 DNS_RESOLVED_RESOLV_BACKUP="/etc/resolv.conf.zero-resolved.bak"
 DNS_RESOLVED_STUB="/run/systemd/resolve/stub-resolv.conf"
 
+dns_parent_dir() {
+    local p="${1%/}"
+    if [[ "$p" == */* ]]; then
+        p="${p%/*}"
+        printf '%s\n' "${p:-/}"
+    else
+        printf '.\n'
+    fi
+}
+
+dns_resolv_backup_path() {
+    [[ "$DNS_RESOLV_BACKUP" == "/etc/resolv.conf.zero.bak" && "$DNS_RESOLV_CONF" != "/etc/resolv.conf" ]] &&
+        printf '%s.zero.bak\n' "$DNS_RESOLV_CONF" || printf '%s\n' "$DNS_RESOLV_BACKUP"
+}
+
+dns_resolved_resolv_backup_path() {
+    [[ "$DNS_RESOLVED_RESOLV_BACKUP" == "/etc/resolv.conf.zero-resolved.bak" && "$DNS_RESOLV_CONF" != "/etc/resolv.conf" ]] &&
+        printf '%s.zero-resolved.bak\n' "$DNS_RESOLV_CONF" || printf '%s\n' "$DNS_RESOLVED_RESOLV_BACKUP"
+}
+
+dns_dhclient_conf_path() {
+    [[ -n "${DNS_DHCLIENT_CONF:-}" ]] || return 0
+    [[ "$DNS_DHCLIENT_CONF" == "/etc/dhcp/dhclient.conf" && "$DNS_RESOLV_CONF" != "/etc/resolv.conf" ]] &&
+        printf '%s/dhcp/dhclient.conf\n' "$(dns_parent_dir "$DNS_RESOLV_CONF")" || printf '%s\n' "$DNS_DHCLIENT_CONF"
+}
+
+dns_dhclient_backup_path() {
+    [[ "$DNS_DHCLIENT_BACKUP" == "/etc/dhcp/dhclient.conf.zero.bak" && "$1" != "/etc/dhcp/dhclient.conf" ]] &&
+        printf '%s.zero.bak\n' "$1" || printf '%s\n' "$DNS_DHCLIENT_BACKUP"
+}
+
+dns_dhclient_hook_dir_path() {
+    [[ "$DNS_DHCLIENT_HOOK_DIR" == "/etc/dhcp/dhclient-enter-hooks.d" && "$1" != "/etc/dhcp/dhclient.conf" ]] &&
+        printf '%s/dhclient-enter-hooks.d\n' "$(dns_parent_dir "$1")" || printf '%s\n' "$DNS_DHCLIENT_HOOK_DIR"
+}
+
+dns_dhclient_hook_file_path() {
+    [[ "$DNS_DHCLIENT_HOOK_FILE" == "/etc/dhcp/dhclient-enter-hooks.d/zz-zero-dns" && "$1" != "/etc/dhcp/dhclient-enter-hooks.d" ]] &&
+        printf '%s/zz-zero-dns\n' "$1" || printf '%s\n' "$DNS_DHCLIENT_HOOK_FILE"
+}
+
+dns_dhcpcd_conf_path() {
+    [[ -n "${DNS_DHCPCD_CONF:-}" ]] || return 0
+    [[ "$DNS_DHCPCD_CONF" == "/etc/dhcpcd.conf" && "$DNS_RESOLV_CONF" != "/etc/resolv.conf" ]] &&
+        printf '%s/dhcpcd.conf\n' "$(dns_parent_dir "$DNS_RESOLV_CONF")" || printf '%s\n' "$DNS_DHCPCD_CONF"
+}
+
+dns_dhcpcd_backup_path() {
+    [[ "$DNS_DHCPCD_BACKUP" == "/etc/dhcpcd.conf.zero.bak" && "$1" != "/etc/dhcpcd.conf" ]] &&
+        printf '%s.zero.bak\n' "$1" || printf '%s\n' "$DNS_DHCPCD_BACKUP"
+}
+
+dns_should_sync_dhclient() {
+    local conf_path dhclient_dir backup_file hook_dir hook_file
+    conf_path=$(dns_dhclient_conf_path)
+    [[ -n "$conf_path" ]] || return 1
+    dhclient_dir=$(dns_parent_dir "$conf_path")
+    backup_file=$(dns_dhclient_backup_path "$conf_path")
+    hook_dir=$(dns_dhclient_hook_dir_path "$conf_path")
+    hook_file=$(dns_dhclient_hook_file_path "$hook_dir")
+
+    [[ -e "$conf_path" || -L "$conf_path" || -e "$backup_file" || -L "$backup_file" ||
+       -e "$hook_file" || -L "$hook_file" || -d "$dhclient_dir" || -d "$hook_dir" ||
+       "$DNS_DHCLIENT_CONF" != "/etc/dhcp/dhclient.conf" ]] && return 0
+    [[ "$DNS_RESOLV_CONF" == "/etc/resolv.conf" ]] &&
+        { command -v dhclient >/dev/null 2>&1 || [[ -x /sbin/dhclient || -x /usr/sbin/dhclient ]]; }
+}
+
+dns_should_sync_dhcpcd() {
+    local conf_path backup_file
+    conf_path=$(dns_dhcpcd_conf_path)
+    [[ -n "$conf_path" ]] || return 1
+    backup_file=$(dns_dhcpcd_backup_path "$conf_path")
+
+    [[ -e "$conf_path" || -L "$conf_path" || -e "$backup_file" || -L "$backup_file" ||
+       "$DNS_DHCPCD_CONF" != "/etc/dhcpcd.conf" ]] && return 0
+    [[ "$DNS_RESOLV_CONF" == "/etc/resolv.conf" ]] &&
+        { command -v dhcpcd >/dev/null 2>&1 || [[ -x /sbin/dhcpcd || -x /usr/sbin/dhcpcd ]]; }
+}
+
+dns_is_valid_ipv4() {
+    local ip="$1" IFS=.
+    local o1 o2 o3 o4 o
+
+    [[ -n "$ip" && ! "$ip" =~ [[:space:]] && "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    read -r o1 o2 o3 o4 <<< "$ip"
+    for o in "$o1" "$o2" "$o3" "$o4"; do
+        [[ "$o" == "0" || "$o" =~ ^[1-9][0-9]{0,2}$ ]] || return 1
+        (( 10#$o <= 255 )) || return 1
+    done
+    return 0
+}
+
+dns_is_valid_ipv6() {
+    local ip="$1" address="" zone="" ipv4_part="" left="" right="" part=""
+    local -a lparts=() rparts=()
+
+    [[ -n "$ip" && ! "$ip" =~ [[:space:]] && "$ip" == *:* && "$ip" != *:::* ]] || return 1
+    if [[ "$ip" == *%* ]]; then
+        [[ "$ip" != *%*%* ]] || return 1
+        address="${ip%%%*}"
+        zone="${ip#*%}"
+        [[ -n "$zone" && "$zone" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
+    else
+        address="$ip"
+    fi
+    [[ -n "$address" && "$address" == *:* && "$address" != *:::* ]] || return 1
+
+    if [[ "$address" == *.* ]]; then
+        ipv4_part="${address##*:}"
+        dns_is_valid_ipv4 "$ipv4_part" || return 1
+        address="${address%"$ipv4_part"}0:0"
+    fi
+
+    [[ "$address" == :* && "$address" != ::* ]] && return 1
+    [[ "$address" == *: && "$address" != *:: ]] && return 1
+
+    if [[ "$address" == *::* ]]; then
+        [[ "${address#*::}" != *::* ]] || return 1
+        left="${address%%::*}"
+        right="${address#*::}"
+        [[ -n "$left" ]] && IFS=':' read -r -a lparts <<< "$left"
+        [[ -n "$right" ]] && IFS=':' read -r -a rparts <<< "$right"
+        (( ${#lparts[@]} + ${#rparts[@]} <= 7 )) || return 1
+        for part in ${lparts[@]+"${lparts[@]}"} ${rparts[@]+"${rparts[@]}"}; do
+            [[ "$part" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+        done
+    else
+        IFS=':' read -r -a lparts <<< "$address"
+        (( ${#lparts[@]} == 8 )) || return 1
+        for part in "${lparts[@]}"; do
+            [[ "$part" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+        done
+    fi
+    return 0
+}
+
+dns_is_valid_ip() {
+    local ip="$1"
+    [[ -n "$ip" && ! "$ip" =~ [[:space:]\"\'\`\\] ]] || return 1
+    dns_is_valid_ipv4 "$ip" || dns_is_valid_ipv6 "$ip"
+}
+
+dns_has_ipv4() {
+    command -v ip >/dev/null 2>&1 || return 2
+    local route_out="" first_line="" def_v4=""
+    route_out=$(ip -4 route get 1.1.1.1 2>/dev/null || true)
+    if [[ -n "$route_out" ]]; then
+        IFS= read -r first_line <<< "$route_out"
+        [[ "$first_line" =~ (^|[[:space:]])(unreachable|prohibit|blackhole|throw|dev[[:space:]]+lo)([[:space:]]|$) ]] && return 1
+        return 0
+    fi
+    def_v4=$(ip -4 route show default 2>/dev/null | grep -Ev '^[[:space:]]*(unreachable|prohibit|blackhole|throw)|(^|[[:space:]])dev[[:space:]]+lo([[:space:]]|$)' || true)
+    [[ -n "$def_v4" ]] && ip -4 -o addr show scope global 2>/dev/null | grep -q .
+}
+
+dns_has_ipv6() {
+    command -v ip >/dev/null 2>&1 || return 2
+    local route_out="" first_line="" src_ip="" def_v6=""
+    route_out=$(ip -6 route get 2001:4860:4860::8888 2>/dev/null || true)
+    if [[ -n "$route_out" ]]; then
+        IFS= read -r first_line <<< "$route_out"
+        [[ "$first_line" =~ (^|[[:space:]])(unreachable|prohibit|blackhole|throw|dev[[:space:]]+lo)([[:space:]]|$) ]] && return 1
+        if [[ "$first_line" =~ (^|[[:space:]])src[[:space:]]+([^[:space:]]+) ]]; then
+            src_ip="${BASH_REMATCH[2]%%%*}"
+            case "$src_ip" in
+                ::|::1|0:0:0:0:0:0:0:0|0:0:0:0:0:0:0:1|[Ff][Ee][89AaBb][0-9A-Fa-f]:*) return 1 ;;
+            esac
+            return 0
+        fi
+        ip -6 -o addr show scope global 2>/dev/null | grep -Evq '(^|[[:space:]])(tentative|dadfailed)([[:space:]]|$)'
+        return $?
+    fi
+    def_v6=$(ip -6 route show default 2>/dev/null | grep -Ev '^[[:space:]]*(unreachable|prohibit|blackhole|throw)|(^|[[:space:]])dev[[:space:]]+lo([[:space:]]|$)' || true)
+    [[ -n "$def_v6" ]] && ip -6 -o addr show scope global 2>/dev/null | grep -Evq '(^|[[:space:]])(tentative|dadfailed)([[:space:]]|$)'
+}
+
+dns_detect_stack() {
+    case "${DNS_STACK_MODE:-}" in
+        dual|ipv4|ipv6|none|unknown) printf '%s\n' "$DNS_STACK_MODE"; return 0 ;;
+    esac
+    local rc4=0 rc6=0
+    dns_has_ipv4 || rc4=$?
+    dns_has_ipv6 || rc6=$?
+    if (( rc4 == 0 && rc6 == 0 )); then
+        printf 'dual\n'
+    elif (( rc4 == 0 )); then
+        printf 'ipv4\n'
+    elif (( rc6 == 0 )); then
+        printf 'ipv6\n'
+    elif (( rc4 == 2 && rc6 == 2 )); then
+        printf 'unknown\n'
+    else
+        printf 'none\n'
+    fi
+}
+
+dns_stack_label() {
+    case "$1" in
+        dual) printf '%s' "${GREEN}双栈 (IPv4 + IPv6)${PLAIN}" ;;
+        ipv4) printf '%s' "${GREEN}仅 IPv4${PLAIN}" ;;
+        ipv6) printf '%s' "${GREEN}纯 IPv6${PLAIN}" ;;
+        none) printf '%s' "${RED}未检测到默认路由${PLAIN}" ;;
+        *)    printf '%s' "${YELLOW}未知${PLAIN}" ;;
+    esac
+}
+
+dns_systemd_resolved_active() {
+    command -v systemctl >/dev/null 2>&1 && systemctl is-active systemd-resolved >/dev/null 2>&1
+}
+
+dns_get_immutable_flags() {
+    local target="${1:-$DNS_RESOLV_CONF}" attr_col="" flags=""
+    [[ ! -L "$target" && -f "$target" ]] && command -v lsattr >/dev/null 2>&1 || return 1
+    attr_col=$(lsattr -d -- "$target" 2>/dev/null | awk 'NR==1 {print $1}')
+    [[ "$attr_col" == *-* && "$attr_col" =~ ^[A-Za-z-]+$ ]] || return 1
+    [[ "$attr_col" == *i* ]] && flags+="i"
+    [[ "$attr_col" == *a* ]] && flags+="a"
+    [[ -n "$flags" ]] && printf '%s\n' "$flags"
+}
+
+dns_unlock_resolv_if_needed() {
+    local target="${1:-$DNS_RESOLV_CONF}" flags=""
+    flags=$(dns_get_immutable_flags "$target" || true)
+    [[ -n "$flags" ]] || return 0
+    echo -e "${YELLOW}检测到 ${target} 被文件属性锁定 (chattr +${flags})，正在自动解除锁定...${PLAIN}" >&2
+    if ! command -v chattr >/dev/null 2>&1 || ! chattr "-${flags}" -- "$target" 2>/dev/null; then
+        echo -e "${RED}无法解除 ${target} 的 chattr +${flags} 锁定，请检查权限${PLAIN}" >&2
+        return 1
+    fi
+    [[ -z "$(dns_get_immutable_flags "$target" || true)" ]]
+}
+
+dns_copy_preserve() {
+    local src="$1" dst="$2" link_target=""
+    if [[ -L "$src" ]]; then
+        link_target=$(readlink "$src") || return 1
+        ln -sfn "$link_target" "$dst"
+    else
+        cp -p "$src" "$dst" 2>/dev/null || cp "$src" "$dst"
+    fi
+}
+
+dns_replace_resolv() {
+    local source="$1" conf_dir="" temp="" link_target=""
+    [[ ! -d "$DNS_RESOLV_CONF" ]] || return 1
+    conf_dir=$(dns_parent_dir "$DNS_RESOLV_CONF")
+    if [[ -L "$source" ]]; then
+        link_target=$(readlink "$source") || return 1
+        temp=$(mktemp "$conf_dir/.resolv.link.XXXXXX") || return 1
+        ln -sfn "$link_target" "$temp" && mv -f "$temp" "$DNS_RESOLV_CONF" || { rm -f "$temp"; ln -sfn "$link_target" "$DNS_RESOLV_CONF"; }
+        return $?
+    fi
+    temp=$(mktemp "$conf_dir/.resolv.zero.XXXXXX") || return 1
+    if (cp -p "$source" "$temp" 2>/dev/null || cp "$source" "$temp") && mv -f "$temp" "$DNS_RESOLV_CONF"; then
+        return 0
+    fi
+    rm -f "$temp"
+    return 1
+}
+
+dns_sync_dhclient() {
+    local v4_csv="$1" v6_csv="$2"
+    shift 2
+    local conf_path conf_dir backup_file hook_dir hook_file tmp_conf tmp_hook src_file="/dev/null" created=0 esc_resolv ns
+
+    conf_path=$(dns_dhclient_conf_path)
+    [[ -n "$conf_path" ]] || return 0
+    conf_dir=$(dns_parent_dir "$conf_path")
+    backup_file=$(dns_dhclient_backup_path "$conf_path")
+    hook_dir=$(dns_dhclient_hook_dir_path "$conf_path")
+    hook_file=$(dns_dhclient_hook_file_path "$hook_dir")
+
+    if [[ -L "$conf_path" || ( -e "$conf_path" && ! -f "$conf_path" ) ||
+          -L "$backup_file" || ( -e "$backup_file" && ! -f "$backup_file" ) ||
+          -L "$hook_file" || ( -e "$hook_file" && ! -f "$hook_file" ) ]]; then
+        echo -e "${RED}dhclient 配置路径异常，已停止同步${PLAIN}" >&2
+        return 1
+    fi
+
+    mkdir -p "$conf_dir" "$hook_dir" || return 1
+    if [[ -f "$conf_path" ]]; then
+        src_file="$conf_path"
+        if LC_ALL=C grep -Eq '^[[:space:]]*# Created by Zero\.sh[[:space:]]*$' "$conf_path" 2>/dev/null; then
+            created=1
+        elif [[ ! -f "$backup_file" ]]; then
+            dns_copy_preserve "$conf_path" "$backup_file" || return 1
+        fi
+    else
+        created=1
+    fi
+
+    tmp_conf=$(mktemp "${conf_path}.zero.XXXXXX") || return 1
+    chmod --reference="$conf_path" "$tmp_conf" 2>/dev/null || chmod 644 "$tmp_conf"
+    if ! LC_ALL=C awk -v v4="$v4_csv" -v v6="$v6_csv" -v created="$created" '
+        BEGIN { if (created) print "# Created by Zero.sh" }
+        function emit_block() {
+            if (emitted) return
+            print "# BEGIN Zero.sh DNS"
+            if (v4 != "") print "supersede domain-name-servers " v4 ";"
+            if (v6 != "") print "supersede dhcp6.name-servers " v6 ";"
+            print "# END Zero.sh DNS"
+            emitted = 1
+        }
+        /^[[:space:]]*# Created by Zero\.sh[[:space:]]*$/ { next }
+        /^[[:space:]]*# BEGIN Zero\.sh DNS[[:space:]]*$/ { in_zero = 1; next }
+        in_zero { if (/^[[:space:]]*# END Zero\.sh DNS[[:space:]]*$/) in_zero = 0; next }
+        skip_stmt { if (/;/) skip_stmt = 0; next }
+        /^[[:space:]]*(supersede|prepend|append|default)[[:space:]]+(domain-name-servers|dhcp6\.name-servers)([[:space:];]|$)/ {
+            if ($0 !~ /;/) skip_stmt = 1
+            next
+        }
+        !emitted && /^[[:space:]]*(interface|pseudo|alias|lease)([[:space:]"{]|$)/ {
+            emit_block()
+            print ""
+        }
+        { print }
+        END {
+            if (!emitted) emit_block()
+        }
+    ' "$src_file" > "$tmp_conf"; then
+        rm -f "$tmp_conf"
+        return 1
+    fi
+
+    esc_resolv="${DNS_RESOLV_CONF//\'/\'\\\'\'}"
+    tmp_hook=$(mktemp "${hook_file}.zero.XXXXXX") || { rm -f "$tmp_conf"; return 1; }
+    chmod 644 "$tmp_hook"
+    {
+        printf '# Managed by Zero.sh\n'
+        printf 'make_resolv_conf() {\n'
+        printf "    local r='%s' t\n" "$esc_resolv"
+        printf '    t="${r}.dhclient.$$"\n'
+        printf '    {\n'
+        printf "        printf '# Managed by Zero.sh\\n'\n"
+        for ns in "$@"; do
+            printf "        printf 'nameserver %s\\n'\n" "$ns"
+        done
+        printf '    } > "$t" 2>/dev/null && chmod 644 "$t" 2>/dev/null && mv -f "$t" "$r" 2>/dev/null || rm -f "$t" 2>/dev/null\n'
+        printf '    return 0\n'
+        printf '}\n'
+    } > "$tmp_hook" || { rm -f "$tmp_conf" "$tmp_hook"; return 1; }
+
+    mv -f "$tmp_conf" "$conf_path" && mv -f "$tmp_hook" "$hook_file" || {
+        rm -f "$tmp_conf" "$tmp_hook"
+        return 1
+    }
+}
+
+dns_sync_dhcpcd() {
+    local conf_path conf_dir backup_file tmp_conf src_file="/dev/null" created=0
+    conf_path=$(dns_dhcpcd_conf_path)
+    [[ -n "$conf_path" ]] || return 0
+    conf_dir=$(dns_parent_dir "$conf_path")
+    backup_file=$(dns_dhcpcd_backup_path "$conf_path")
+
+    if [[ -L "$conf_path" || ( -e "$conf_path" && ! -f "$conf_path" ) ||
+          -L "$backup_file" || ( -e "$backup_file" && ! -f "$backup_file" ) ]]; then
+        echo -e "${RED}dhcpcd 配置路径异常，已停止同步${PLAIN}" >&2
+        return 1
+    fi
+
+    mkdir -p "$conf_dir" || return 1
+    if [[ -f "$conf_path" ]]; then
+        src_file="$conf_path"
+        if LC_ALL=C grep -Eq '^[[:space:]]*# Created by Zero\.sh[[:space:]]*$' "$conf_path" 2>/dev/null; then
+            created=1
+        elif [[ ! -f "$backup_file" ]]; then
+            dns_copy_preserve "$conf_path" "$backup_file" || return 1
+        fi
+    else
+        created=1
+    fi
+
+    tmp_conf=$(mktemp "${conf_path}.zero.XXXXXX") || return 1
+    chmod --reference="$conf_path" "$tmp_conf" 2>/dev/null || chmod 644 "$tmp_conf"
+    if LC_ALL=C awk -v created="$created" '
+        BEGIN { if (created) print "# Created by Zero.sh" }
+        function emit_block() {
+            if (emitted) return
+            print "# BEGIN Zero.sh DNS"
+            print "nohook resolv.conf"
+            print "# END Zero.sh DNS"
+            emitted = 1
+        }
+        /^[[:space:]]*# Created by Zero\.sh[[:space:]]*$/ { next }
+        /^[[:space:]]*# BEGIN Zero\.sh DNS[[:space:]]*$/ { in_zero = 1; next }
+        in_zero { if (/^[[:space:]]*# END Zero\.sh DNS[[:space:]]*$/) in_zero = 0; next }
+        !emitted && /^[[:space:]]*(interface|ssid)([[:space:]]|$)/ {
+            emit_block()
+            print ""
+        }
+        { print }
+        END { if (!emitted) emit_block() }
+    ' "$src_file" > "$tmp_conf" && mv -f "$tmp_conf" "$conf_path"; then
+        return 0
+    fi
+    rm -f "$tmp_conf"
+    return 1
+}
+
+dns_unsync_dhclient() {
+    local conf_path backup_file hook_dir hook_file tmp_conf changed=0
+    conf_path=$(dns_dhclient_conf_path)
+    [[ -n "$conf_path" ]] || return 0
+    backup_file=$(dns_dhclient_backup_path "$conf_path")
+    hook_dir=$(dns_dhclient_hook_dir_path "$conf_path")
+    hook_file=$(dns_dhclient_hook_file_path "$hook_dir")
+
+    if [[ -f "$backup_file" ]]; then
+        dns_copy_preserve "$backup_file" "$conf_path" || return 1
+        rm -f "$backup_file"
+        changed=1
+    elif [[ -f "$conf_path" ]] && LC_ALL=C grep -Eq '^[[:space:]]*# Created by Zero\.sh[[:space:]]*$' "$conf_path" 2>/dev/null; then
+        rm -f "$conf_path"
+        changed=1
+    elif [[ -f "$conf_path" ]] && LC_ALL=C grep -Eq '^[[:space:]]*# BEGIN Zero\.sh DNS[[:space:]]*$' "$conf_path" 2>/dev/null; then
+        tmp_conf=$(mktemp "${conf_path}.zero.XXXXXX") || return 1
+        chmod --reference="$conf_path" "$tmp_conf" 2>/dev/null || chmod 644 "$tmp_conf"
+        LC_ALL=C awk '
+            /^[[:space:]]*# BEGIN Zero\.sh DNS[[:space:]]*$/ { in_zero = 1; next }
+            in_zero { if (/^[[:space:]]*# END Zero\.sh DNS[[:space:]]*$/) in_zero = 0; next }
+            { print }
+        ' "$conf_path" > "$tmp_conf" && mv -f "$tmp_conf" "$conf_path" || { rm -f "$tmp_conf"; return 1; }
+        changed=1
+    fi
+
+    if [[ -f "$hook_file" ]] && LC_ALL=C grep -qx '# Managed by Zero.sh' "$hook_file" 2>/dev/null; then
+        rm -f "$hook_file"
+        changed=1
+    fi
+    (( changed == 1 )) && DNS_SUB_RESTORED=1
+    return 0
+}
+
+dns_unsync_dhcpcd() {
+    local conf_path backup_file tmp_conf changed=0
+    conf_path=$(dns_dhcpcd_conf_path)
+    [[ -n "$conf_path" ]] || return 0
+    backup_file=$(dns_dhcpcd_backup_path "$conf_path")
+
+    if [[ -f "$backup_file" ]]; then
+        dns_copy_preserve "$backup_file" "$conf_path" || return 1
+        rm -f "$backup_file"
+        changed=1
+    elif [[ -f "$conf_path" ]] && LC_ALL=C grep -Eq '^[[:space:]]*# Created by Zero\.sh[[:space:]]*$' "$conf_path" 2>/dev/null; then
+        rm -f "$conf_path"
+        changed=1
+    elif [[ -f "$conf_path" ]] && LC_ALL=C grep -Eq '^[[:space:]]*# BEGIN Zero\.sh DNS[[:space:]]*$' "$conf_path" 2>/dev/null; then
+        tmp_conf=$(mktemp "${conf_path}.zero.XXXXXX") || return 1
+        chmod --reference="$conf_path" "$tmp_conf" 2>/dev/null || chmod 644 "$tmp_conf"
+        LC_ALL=C awk '
+            /^[[:space:]]*# BEGIN Zero\.sh DNS[[:space:]]*$/ { in_zero = 1; next }
+            in_zero { if (/^[[:space:]]*# END Zero\.sh DNS[[:space:]]*$/) in_zero = 0; next }
+            { print }
+        ' "$conf_path" > "$tmp_conf" && mv -f "$tmp_conf" "$conf_path" || { rm -f "$tmp_conf"; return 1; }
+        changed=1
+    fi
+    (( changed == 1 )) && DNS_SUB_RESTORED=1
+    return 0
+}
+
+dns_migrate_resolved_config() {
+    if [[ -e "$DNS_RESOLVED_PREVIOUS_FILE" || -L "$DNS_RESOLVED_PREVIOUS_FILE" ]]; then
+        if [[ -L "$DNS_RESOLVED_PREVIOUS_FILE" || -e "$DNS_RESOLVED_DROPIN_FILE" || -L "$DNS_RESOLVED_DROPIN_FILE" ]] ||
+           ! LC_ALL=C grep -qx '# Managed by Zero.sh' "$DNS_RESOLVED_PREVIOUS_FILE" 2>/dev/null; then
+            echo -e "${RED}检测到冲突 DNS 配置: ${DNS_RESOLVED_PREVIOUS_FILE}${PLAIN}" >&2
+            return 1
+        fi
+        mv -f "$DNS_RESOLVED_PREVIOUS_FILE" "$DNS_RESOLVED_DROPIN_FILE" || return 1
+    fi
+}
+
+dns_apply_static() {
+    local ip v4_csv="" v6_csv="" conf_dir resolv_backup temp header="# Managed by Zero.sh"
+    local had_existing=0 created_backup=0 prev_copy=""
+
+    [[ $# -gt 0 ]] || return 1
+    [[ ! -d "$DNS_RESOLV_CONF" ]] || { echo -e "${RED}${DNS_RESOLV_CONF} 是目录，无法写入${PLAIN}" >&2; return 1; }
+
+    for ip in "$@"; do
+        if dns_is_valid_ipv4 "$ip"; then
+            v4_csv+="${v4_csv:+, }$ip"
+        else
+            v6_csv+="${v6_csv:+, }$ip"
+        fi
+    done
+
+    dns_unlock_resolv_if_needed "$DNS_RESOLV_CONF" || return 1
+    conf_dir=$(dns_parent_dir "$DNS_RESOLV_CONF")
+    mkdir -p "$conf_dir" || return 1
+    resolv_backup=$(dns_resolv_backup_path)
+
+    if [[ -L "$DNS_RESOLV_CONF" || -f "$DNS_RESOLV_CONF" ]]; then
+        had_existing=1
+        if [[ ! -L "$DNS_RESOLV_CONF" ]] && LC_ALL=C grep -Eq '^[[:space:]]*# Created by Zero\.sh[[:space:]]*$' "$DNS_RESOLV_CONF" 2>/dev/null; then
+            header="# Created by Zero.sh"
+        elif [[ ! -L "$resolv_backup" && ! -f "$resolv_backup" ]]; then
+            dns_copy_preserve "$DNS_RESOLV_CONF" "$resolv_backup" || return 1
+            created_backup=1
+        fi
+        prev_copy=$(mktemp "$conf_dir/.resolv.prev.XXXXXX") || return 1
+        dns_copy_preserve "$DNS_RESOLV_CONF" "$prev_copy" || { rm -f "$prev_copy"; return 1; }
+    else
+        header="# Created by Zero.sh"
+    fi
+
+    temp=$(mktemp "$conf_dir/.resolv.new.XXXXXX") || { rm -f "$prev_copy"; return 1; }
+    chmod 644 "$temp"
+    {
+        printf '%s\n' "$header"
+        for ip in "$@"; do
+            printf 'nameserver %s\n' "$ip"
+        done
+    } > "$temp" || { rm -f "$temp" "$prev_copy"; return 1; }
+
+    if ! mv -f "$temp" "$DNS_RESOLV_CONF"; then
+        rm -f "$temp" "$prev_copy"
+        (( created_backup == 1 )) && rm -f "$resolv_backup"
+        return 1
+    fi
+
+    if { dns_should_sync_dhclient && ! dns_sync_dhclient "$v4_csv" "$v6_csv" "$@"; } ||
+       { dns_should_sync_dhcpcd && ! dns_sync_dhcpcd; }; then
+        if (( had_existing == 1 )); then
+            dns_replace_resolv "$prev_copy" 2>/dev/null || true
+        else
+            rm -f "$DNS_RESOLV_CONF"
+        fi
+        (( created_backup == 1 )) && rm -f "$resolv_backup"
+        rm -f "$prev_copy"
+        return 1
+    fi
+
+    rm -f "$prev_copy"
+    return 0
+}
+
+dns_apply_resolved() {
+    local resolv_backup resolved_backup temp_dropin link_target=""
+    [[ $# -gt 0 ]] || return 1
+
+    dns_migrate_resolved_config || return 1
+    dns_unlock_resolv_if_needed "$DNS_RESOLV_CONF" || return 1
+    mkdir -p "$DNS_RESOLVED_DROPIN_DIR" || return 1
+
+    temp_dropin=$(mktemp "$DNS_RESOLVED_DROPIN_DIR/.zz-zero-dns.XXXXXX") || return 1
+    chmod 644 "$temp_dropin"
+    {
+        printf '# Managed by Zero.sh\n[Resolve]\nDNS=%s\nFallbackDNS=\n' "$*"
+    } > "$temp_dropin" && mv -f "$temp_dropin" "$DNS_RESOLVED_DROPIN_FILE" || {
+        rm -f "$temp_dropin"
+        return 1
+    }
+
+    resolv_backup=$(dns_resolv_backup_path)
+    resolved_backup=$(dns_resolved_resolv_backup_path)
+    if [[ -e "$DNS_RESOLVED_STUB" ]]; then
+        link_target=$(readlink "$DNS_RESOLV_CONF" 2>/dev/null || true)
+        if [[ "$link_target" != *"systemd/resolve/stub-resolv.conf" && "$link_target" != *"systemd/resolve/resolv.conf" ]]; then
+            if [[ ! -L "$resolved_backup" && ! -f "$resolved_backup" ]]; then
+                if [[ -L "$resolv_backup" || -f "$resolv_backup" ]]; then
+                    mv -f "$resolv_backup" "$resolved_backup" || return 1
+                elif [[ -L "$DNS_RESOLV_CONF" || -f "$DNS_RESOLV_CONF" ]]; then
+                    dns_copy_preserve "$DNS_RESOLV_CONF" "$resolved_backup" || return 1
+                fi
+            fi
+            ln -sfn "$DNS_RESOLVED_STUB" "$DNS_RESOLV_CONF" || return 1
+        fi
+    fi
+
+    dns_unsync_dhclient || true
+    dns_unsync_dhcpcd || true
+
+    if ! systemctl restart systemd-resolved 2>/dev/null || ! dns_systemd_resolved_active; then
+        echo -e "${RED}systemd-resolved 重启失败${PLAIN}" >&2
+        return 1
+    fi
+    command -v resolvectl >/dev/null 2>&1 && resolvectl flush-caches >/dev/null 2>&1 || true
+    return 0
+}
+
+dns_apply() {
+    local ip seen=" "
+    local -a ok=()
+
+    for ip in "$@"; do
+        ip=$(trim_input "$ip")
+        [[ -n "$ip" ]] || continue
+        if ! dns_is_valid_ip "$ip"; then
+            echo -e "${RED}无效的 DNS 地址: ${ip}${PLAIN}" >&2
+            return 1
+        fi
+        case "$seen" in *" $ip "*) continue ;; esac
+        seen+="${ip} "
+        ok+=("$ip")
+    done
+
+    if (( ${#ok[@]} == 0 )); then
+        echo -e "${RED}未提供有效的 DNS 地址${PLAIN}" >&2
+        return 1
+    fi
+
+    if ! dns_systemd_resolved_active && (( ${#ok[@]} > 3 )); then
+        echo -e "${YELLOW}提示: 当前为静态 resolv.conf 模式，glibc 最多使用前 3 个 DNS (MAXNS=3)${PLAIN}"
+    fi
+
+    if dns_systemd_resolved_active; then
+        dns_apply_resolved "${ok[@]}"
+    else
+        dns_apply_static "${ok[@]}"
+    fi
+}
+
+dns_restore() {
+    local changed=0 resolv_backup resolved_backup dhclient_conf dhclient_backup dhcpcd_conf dhcpcd_backup
+    local has_resolv_backup=0 has_resolv_created=0 restored_resolved=0
+
+    dns_migrate_resolved_config || return 1
+    resolv_backup=$(dns_resolv_backup_path)
+    resolved_backup=$(dns_resolved_resolv_backup_path)
+    dhclient_conf=$(dns_dhclient_conf_path)
+    dhcpcd_conf=$(dns_dhcpcd_conf_path)
+
+    if [[ ( ! -L "$resolv_backup" && -e "$resolv_backup" && ! -f "$resolv_backup" ) ||
+          ( ! -L "$resolved_backup" && -e "$resolved_backup" && ! -f "$resolved_backup" ) ]]; then
+        echo -e "${RED}DNS 备份路径异常，已取消恢复${PLAIN}"
+        return 1
+    fi
+    if [[ -n "$dhclient_conf" ]]; then
+        dhclient_backup=$(dns_dhclient_backup_path "$dhclient_conf")
+        if [[ -L "$dhclient_backup" || ( -e "$dhclient_backup" && ! -f "$dhclient_backup" ) ]] ||
+           { [[ -f "$dhclient_backup" ]] && [[ -L "$dhclient_conf" || ( -e "$dhclient_conf" && ! -f "$dhclient_conf" ) ]]; }; then
+            echo -e "${RED}dhclient 配置或备份路径异常，已取消恢复${PLAIN}"
+            return 1
+        fi
+    fi
+    if [[ -n "$dhcpcd_conf" ]]; then
+        dhcpcd_backup=$(dns_dhcpcd_backup_path "$dhcpcd_conf")
+        if [[ -L "$dhcpcd_backup" || ( -e "$dhcpcd_backup" && ! -f "$dhcpcd_backup" ) ]] ||
+           { [[ -f "$dhcpcd_backup" ]] && [[ -L "$dhcpcd_conf" || ( -e "$dhcpcd_conf" && ! -f "$dhcpcd_conf" ) ]]; }; then
+            echo -e "${RED}dhcpcd 配置或备份路径异常，已取消恢复${PLAIN}"
+            return 1
+        fi
+    fi
+
+    [[ -L "$resolv_backup" || -f "$resolv_backup" ]] && has_resolv_backup=1
+    if (( has_resolv_backup == 0 )) && [[ ! -L "$DNS_RESOLV_CONF" && -f "$DNS_RESOLV_CONF" ]] &&
+       LC_ALL=C grep -Eq '^[[:space:]]*# Created by Zero\.sh[[:space:]]*$' "$DNS_RESOLV_CONF" 2>/dev/null; then
+        has_resolv_created=1
+    fi
+
+    if [[ -f "$DNS_RESOLVED_DROPIN_FILE" || -L "$resolved_backup" || -f "$resolved_backup" ]]; then
+        dns_unlock_resolv_if_needed "$DNS_RESOLV_CONF" || return 1
+        rm -f "$DNS_RESOLVED_DROPIN_FILE" || return 1
+        if [[ -L "$resolved_backup" || -f "$resolved_backup" ]]; then
+            dns_replace_resolv "$resolved_backup" || return 1
+            rm -f "$resolved_backup"
+            restored_resolved=1
+        fi
+        if dns_systemd_resolved_active; then
+            systemctl restart systemd-resolved 2>/dev/null || return 1
+        fi
+        changed=1
+    fi
+
+    if (( has_resolv_backup == 1 )); then
+        if [[ -L "$DNS_RESOLV_CONF" && $restored_resolved -eq 1 ]]; then
+            rm -f "$resolv_backup"
+        elif [[ -L "$DNS_RESOLV_CONF" && ! -L "$resolv_backup" ]]; then
+            echo -e "${YELLOW}${DNS_RESOLV_CONF} 当前为符号链接，未覆盖静态备份${PLAIN}"
+            return 1
+        else
+            dns_unlock_resolv_if_needed "$DNS_RESOLV_CONF" || return 1
+            dns_replace_resolv "$resolv_backup" || return 1
+            rm -f "$resolv_backup"
+            changed=1
+        fi
+    elif (( has_resolv_created == 1 )); then
+        dns_unlock_resolv_if_needed "$DNS_RESOLV_CONF" || return 1
+        rm -f "$DNS_RESOLV_CONF" || return 1
+        changed=1
+    fi
+
+    DNS_SUB_RESTORED=0
+    dns_unsync_dhclient || return 1
+    dns_unsync_dhcpcd || return 1
+    (( DNS_SUB_RESTORED == 1 )) && changed=1
+
+    if (( changed == 0 )); then
+        echo -e "${YELLOW}未找到 Zero.sh 创建的 DNS 配置或备份${PLAIN}"
+        return 2
+    fi
+
+    command -v resolvectl >/dev/null 2>&1 && resolvectl flush-caches >/dev/null 2>&1 || true
+    return 0
+}
+
 dns_read_runtime_status() {
     local active="0" iface="" dns_list=""
-
-    if command -v systemctl >/dev/null 2>&1 && systemctl is-active systemd-resolved >/dev/null 2>&1; then
+    if dns_systemd_resolved_active; then
         active="1"
         iface="$(get_default_interface)"
         if command -v resolvectl >/dev/null 2>&1; then
@@ -2519,44 +5070,113 @@ dns_read_runtime_status() {
             ')"
         fi
     fi
-
     printf '%s\n' "$active" "$iface"
     [[ -n "$dns_list" ]] && printf '%s\n' "$dns_list"
 }
 
-dns_show_current() {
-    local iface dns_list resolved_active dns
-    local -a dns_status
+dns_zero_persistence_summary() {
+    local resolv_backup resolved_backup dhclient_conf dhclient_backup hook_dir hook_file dhcpcd_conf dhcpcd_backup
+    local has_backup=0 mode_text="" backup_text=""
+    local -a components=()
 
-    echo -e "${YELLOW}当前DNS配置:${PLAIN}\n"
+    resolv_backup=$(dns_resolv_backup_path)
+    resolved_backup=$(dns_resolved_resolv_backup_path)
+    dhclient_conf=$(dns_dhclient_conf_path)
+    dhcpcd_conf=$(dns_dhcpcd_conf_path)
+
+    if [[ -f "$DNS_RESOLVED_DROPIN_FILE" || -f "$DNS_RESOLVED_PREVIOUS_FILE" ]]; then
+        components+=("systemd-resolved")
+    fi
+    if [[ ! -L "$DNS_RESOLV_CONF" && -f "$DNS_RESOLV_CONF" ]] &&
+       LC_ALL=C grep -Eq '^[[:space:]]*# (Managed|Created) by Zero\.sh[[:space:]]*$' "$DNS_RESOLV_CONF" 2>/dev/null; then
+        components+=("静态 resolv.conf")
+    fi
+    if [[ -n "$dhclient_conf" ]]; then
+        dhclient_backup=$(dns_dhclient_backup_path "$dhclient_conf")
+        hook_dir=$(dns_dhclient_hook_dir_path "$dhclient_conf")
+        hook_file=$(dns_dhclient_hook_file_path "$hook_dir")
+        if { [[ -f "$dhclient_conf" ]] && LC_ALL=C grep -Eq '^[[:space:]]*# (Created by Zero\.sh|BEGIN Zero\.sh DNS)[[:space:]]*$' "$dhclient_conf" 2>/dev/null; } ||
+           { [[ -f "$hook_file" ]] && LC_ALL=C grep -qx '# Managed by Zero.sh' "$hook_file" 2>/dev/null; }; then
+            components+=("dhclient")
+        fi
+        [[ -f "$dhclient_backup" ]] && has_backup=1
+    fi
+    if [[ -n "$dhcpcd_conf" ]]; then
+        dhcpcd_backup=$(dns_dhcpcd_backup_path "$dhcpcd_conf")
+        if [[ -f "$dhcpcd_conf" ]] && LC_ALL=C grep -Eq '^[[:space:]]*# (Created by Zero\.sh|BEGIN Zero\.sh DNS)[[:space:]]*$' "$dhcpcd_conf" 2>/dev/null; then
+            components+=("dhcpcd")
+        fi
+        [[ -f "$dhcpcd_backup" ]] && has_backup=1
+    fi
+    [[ -L "$resolv_backup" || -f "$resolv_backup" || -L "$resolved_backup" || -f "$resolved_backup" ]] && has_backup=1
+
+    if (( ${#components[@]} > 0 )); then
+        local IFS=" + "
+        mode_text="${GREEN}已接管 (${components[*]})${PLAIN}"
+        backup_text=" | 原始备份: ${GREEN}可恢复${PLAIN}"
+    elif (( has_backup == 1 )); then
+        mode_text="${YELLOW}存在备份 (当前配置已被外部修改)${PLAIN}"
+        backup_text=" | 原始备份: ${GREEN}可恢复${PLAIN}"
+    else
+        mode_text="${YELLOW}未接管 (系统原始配置)${PLAIN}"
+    fi
+    printf '%s%s\n' "$mode_text" "$backup_text"
+}
+
+dns_show_current() {
+    local iface="" dns_list="" resolved_active="0" dns="" trimmed=""
+    local stack_mode="${1:-}" link_target="" imm_flags="" ns_count=0 is_resolved_stub=0
+    local -a dns_status=()
+
+    [[ -n "$stack_mode" ]] || stack_mode=$(dns_detect_stack)
+    echo -e "${YELLOW}当前DNS配置:${PLAIN}"
+    echo -e "${BLUE}网络环境:${PLAIN} $(dns_stack_label "$stack_mode")"
+    echo -e "${BLUE}托管状态:${PLAIN} $(dns_zero_persistence_summary)"
+    echo
 
     echo -e "${BLUE}resolv.conf:${PLAIN}"
-    if [[ -f "$DNS_RESOLV_CONF" ]]; then
-        while read -r dns; do
-            [[ "$dns" =~ ^[[:space:]]*nameserver[[:space:]]+ ]] || continue
-            echo -e "  ${GREEN}${dns}${PLAIN}"
-        done < "$DNS_RESOLV_CONF"
+    if [[ -L "$DNS_RESOLV_CONF" ]]; then
+        link_target=$(readlink "$DNS_RESOLV_CONF" 2>/dev/null || echo "unknown")
+        [[ "$link_target" == *"systemd/resolve/stub-resolv.conf" ]] && is_resolved_stub=1
+        if [[ -e "$DNS_RESOLV_CONF" ]]; then
+            echo -e "  符号链接: ${YELLOW}${link_target}${PLAIN}"
+        else
+            echo -e "  符号链接: ${RED}${link_target} (目标不存在)${PLAIN}"
+        fi
     else
+        imm_flags=$(dns_get_immutable_flags "$DNS_RESOLV_CONF" || true)
+        [[ -n "$imm_flags" ]] && echo -e "  文件锁定: ${YELLOW}chattr +${imm_flags}${PLAIN}"
+    fi
+
+    if [[ -f "$DNS_RESOLV_CONF" ]]; then
+        while IFS= read -r dns || [[ -n "$dns" ]]; do
+            [[ "$dns" =~ ^[[:space:]]*nameserver[[:space:]]+ ]] || continue
+            trimmed=$(trim_input "$dns")
+            ns_count=$((ns_count + 1))
+            echo -e "  ${GREEN}${trimmed}${PLAIN}"
+        done < "$DNS_RESOLV_CONF"
+        if (( ns_count == 0 )); then
+            echo -e "  (未配置 nameserver)"
+        elif (( ns_count > 3 && is_resolved_stub == 0 )); then
+            echo -e "  ${YELLOW}(提示: 共 ${ns_count} 条，glibc 静态解析最多仅使用前 3 条 MAXNS=3)${PLAIN}"
+        fi
+    elif [[ ! -L "$DNS_RESOLV_CONF" ]]; then
         echo -e "  (不存在)"
     fi
     echo
 
     echo -e "${BLUE}systemd-resolved:${PLAIN}"
     mapfile -t dns_status < <(dns_read_runtime_status)
-    resolved_active="${dns_status[0]}"
-    iface="${dns_status[1]}"
-    dns_list=$(printf '%s\n' "${dns_status[@]:2}")
+    resolved_active="${dns_status[0]:-0}"
+    iface="${dns_status[1]:-}"
+    (( ${#dns_status[@]} > 2 )) && dns_list=$(printf '%s\n' "${dns_status[@]:2}")
 
     if [[ "$resolved_active" == "1" ]]; then
-        if [[ -n "$iface" ]]; then
-            echo -e "  默认网卡: ${GREEN}${iface}${PLAIN}"
-        else
-            echo -e "  (未检测到默认网卡)"
-        fi
+        [[ -n "$iface" ]] && echo -e "  默认网卡: ${GREEN}${iface}${PLAIN}" || echo -e "  (未检测到默认网卡)"
         if [[ -n "$dns_list" ]]; then
             echo -e "  可见 DNS Servers:"
-            while read -r dns; do
-                echo -e "    ${GREEN}- ${dns}${PLAIN}"
+            while IFS= read -r dns || [[ -n "$dns" ]]; do
+                [[ -n "$dns" ]] && echo -e "    ${GREEN}- ${dns}${PLAIN}"
             done <<< "$dns_list"
         else
             echo -e "  (未检测到 systemd-resolved DNS)"
@@ -2565,276 +5185,6 @@ dns_show_current() {
         echo -e "  (systemd-resolved 未运行)"
     fi
     echo
-}
-
-dns_is_valid_ipv4() {
-    local ip="$1" IFS=.
-    local o1 o2 o3 o4 o
-
-    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-    read -r o1 o2 o3 o4 <<< "$ip"
-    for o in "$o1" "$o2" "$o3" "$o4"; do
-        [[ "$o" == "0" || "$o" =~ ^[1-9][0-9]{0,2}$ ]] || return 1
-        (( 10#$o <= 255 )) || return 1
-    done
-    return 0
-}
-
-dns_is_valid_ipv6() {
-    local ip="$1" address zone=""
-
-    [[ "$ip" == *:* ]] || return 1
-    if [[ "$ip" == *%* ]]; then
-        [[ "$ip" != *%*%* ]] || return 1
-        address="${ip%%%*}"
-        zone="${ip#*%}"
-        [[ "$zone" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
-    else
-        address="$ip"
-    fi
-
-    command -v perl >/dev/null 2>&1 || return 1
-    perl -MSocket=AF_INET6,inet_pton -e 'exit(inet_pton(AF_INET6, $ARGV[0]) ? 0 : 1)' "$address" >/dev/null 2>&1
-}
-
-dns_is_valid_ip() {
-    local ip="$1"
-    [[ "$ip" =~ [[:space:]] ]] && return 1
-    [[ "$ip" == *\"* || "$ip" == *\'* || "$ip" == *\\* ]] && return 1
-    dns_is_valid_ipv4 "$ip" && return 0
-    dns_is_valid_ipv6 "$ip" && return 0
-    return 1
-}
-
-dns_systemd_resolved_active() {
-    command -v systemctl >/dev/null 2>&1 && systemctl is-active systemd-resolved >/dev/null 2>&1
-}
-
-dns_migrate_resolved_config() {
-    if [[ -e "$DNS_RESOLVED_PREVIOUS_FILE" ]]; then
-        if [[ -e "$DNS_RESOLVED_DROPIN_FILE" ]] || ! grep -qx '# Managed by Zero.sh' "$DNS_RESOLVED_PREVIOUS_FILE"; then
-            echo -e "${RED}检测到冲突 DNS 配置: ${DNS_RESOLVED_PREVIOUS_FILE}${PLAIN}"
-            return 1
-        fi
-        mv "$DNS_RESOLVED_PREVIOUS_FILE" "$DNS_RESOLVED_DROPIN_FILE" || return 1
-    fi
-}
-
-dns_replace_resolv() {
-    local source="$1" temp
-    [[ ! -d "$DNS_RESOLV_CONF" ]] || return 1
-    temp=$(mktemp "${DNS_RESOLV_CONF}.zero.XXXXXX") || return 1
-    if cp -a "$source" "$temp" && mv -f "$temp" "$DNS_RESOLV_CONF"; then
-        return 0
-    fi
-    rm -f "$temp"
-    return 1
-}
-
-dns_apply_resolved() {
-    local work_dir had_previous=0 new_backup=0
-
-    [[ -f "$DNS_RESOLVED_STUB" ]] || {
-        echo -e "${RED}找不到 systemd-resolved 本地解析文件${PLAIN}"
-        return 1
-    }
-    dns_migrate_resolved_config || return 1
-    mkdir -p "$DNS_RESOLVED_DROPIN_DIR" || return 1
-    work_dir=$(mktemp -d "$DNS_RESOLVED_DROPIN_DIR/.zero-dns.XXXXXX") || return 1
-    if ! cp -a "$DNS_RESOLV_CONF" "$work_dir/resolv.conf"; then
-        rm -rf "$work_dir"
-        return 1
-    fi
-    if [[ -e "$DNS_RESOLVED_DROPIN_FILE" ]]; then
-        cp -p "$DNS_RESOLVED_DROPIN_FILE" "$work_dir/previous.conf" || {
-            rm -rf "$work_dir"
-            return 1
-        }
-        had_previous=1
-    fi
-    if [[ ! -e "$DNS_RESOLVED_RESOLV_BACKUP" && ! -L "$DNS_RESOLVED_RESOLV_BACKUP" ]]; then
-        cp -a "$DNS_RESOLV_CONF" "$DNS_RESOLVED_RESOLV_BACKUP" || {
-            rm -rf "$work_dir"
-            return 1
-        }
-        new_backup=1
-    fi
-    {
-        echo "# Managed by Zero.sh"
-        echo "[Resolve]"
-        echo "DNS="
-        printf 'DNS=%s\n' "$*"
-        echo "Domains=~."
-        echo "FallbackDNS="
-        echo "DNSStubListener=yes"
-    } > "$work_dir/new.conf" || {
-        (( new_backup == 1 )) && rm -f "$DNS_RESOLVED_RESOLV_BACKUP"
-        rm -rf "$work_dir"
-        return 1
-    }
-
-    if ! { chmod 644 "$work_dir/new.conf" &&
-        mv -f "$work_dir/new.conf" "$DNS_RESOLVED_DROPIN_FILE" &&
-        ln -sfn "$DNS_RESOLVED_STUB" "$DNS_RESOLV_CONF" &&
-        systemctl restart systemd-resolved 2>/dev/null && dns_systemd_resolved_active; }; then
-        if ! {
-            if (( had_previous == 1 )); then
-                cp -p "$work_dir/previous.conf" "$DNS_RESOLVED_DROPIN_FILE"
-            else
-                rm -f "$DNS_RESOLVED_DROPIN_FILE"
-            fi && dns_replace_resolv "$work_dir/resolv.conf"
-        }; then
-            echo -e "${RED}DNS 配置恢复失败，备份保留在 ${work_dir}${PLAIN}"
-            return 1
-        fi
-        (( new_backup == 1 )) && rm -f "$DNS_RESOLVED_RESOLV_BACKUP"
-        rm -rf "$work_dir"
-        systemctl restart systemd-resolved >/dev/null 2>&1 || true
-        echo -e "${RED}systemd-resolved 重启失败，已回滚 DNS 配置${PLAIN}"
-        return 1
-    fi
-
-    rm -rf "$work_dir"
-    command -v resolvectl >/dev/null 2>&1 && resolvectl flush-caches >/dev/null 2>&1 || true
-    return 0
-}
-
-dns_apply_static() {
-    local temp_file dns conf_dir
-
-    if [[ -L "$DNS_RESOLV_CONF" ]]; then
-        echo -e "${RED}${DNS_RESOLV_CONF} 由其他网络管理器通过符号链接接管，已停止修改${PLAIN}"
-        echo -e "${YELLOW}当前指向: $(readlink "$DNS_RESOLV_CONF" 2>/dev/null || echo unknown)${PLAIN}"
-        return 1
-    fi
-    if [[ ! -f "$DNS_RESOLV_CONF" ]]; then
-        echo -e "${RED}找不到可修改的 ${DNS_RESOLV_CONF}${PLAIN}"
-        return 1
-    fi
-
-    if [[ ! -f "$DNS_RESOLV_BACKUP" ]]; then
-        cp -p "$DNS_RESOLV_CONF" "$DNS_RESOLV_BACKUP" || return 1
-    fi
-
-    conf_dir=$(dirname "$DNS_RESOLV_CONF")
-    temp_file=$(mktemp "$conf_dir/.resolv.conf.zero.XXXXXX") || return 1
-    if ! awk '!/^[[:space:]]*nameserver[[:space:]]+/' "$DNS_RESOLV_CONF" > "$temp_file"; then
-        rm -f "$temp_file"
-        return 1
-    fi
-    for dns in "$@"; do
-        printf 'nameserver %s\n' "$dns" >> "$temp_file" || {
-            rm -f "$temp_file"
-            return 1
-        }
-    done
-    chmod --reference="$DNS_RESOLV_CONF" "$temp_file" || {
-        rm -f "$temp_file"
-        return 1
-    }
-    chown --reference="$DNS_RESOLV_CONF" "$temp_file" || {
-        rm -f "$temp_file"
-        return 1
-    }
-    mv -f "$temp_file" "$DNS_RESOLV_CONF" || {
-        rm -f "$temp_file"
-        return 1
-    }
-}
-
-dns_apply() {
-    local dns_list=("$@")
-    local ok=() bad=()
-    local dns
-    local -A seen=()
-
-    for dns in "${dns_list[@]}"; do
-        if dns_is_valid_ip "$dns"; then
-            if [[ -z "${seen[$dns]+x}" ]]; then
-                ok+=("$dns")
-                seen["$dns"]=1
-            fi
-        else
-            bad+=("$dns")
-        fi
-    done
-    dns_list=("${ok[@]}")
-
-    if [[ ${#dns_list[@]} -eq 0 ]]; then
-        echo -e "${RED}未检测到有效的DNS IP（请输入IPv4/IPv6地址）${PLAIN}"
-        return 1
-    fi
-    if [[ ${#bad[@]} -gt 0 ]]; then
-        echo -e "${YELLOW}已忽略无效DNS：${bad[*]}${PLAIN}"
-    fi
-
-    if dns_systemd_resolved_active; then
-        dns_apply_resolved "${dns_list[@]}"
-    else
-        dns_apply_static "${dns_list[@]}"
-    fi
-}
-
-dns_restore() {
-    local changed=0 temp_file conf_dir work_dir had_previous=0 was_active=0
-
-    dns_migrate_resolved_config || return 1
-    if [[ -f "$DNS_RESOLVED_DROPIN_FILE" || -e "$DNS_RESOLVED_RESOLV_BACKUP" || -L "$DNS_RESOLVED_RESOLV_BACKUP" ]]; then
-        work_dir=$(mktemp -d "$DNS_RESOLVED_DROPIN_DIR/.zero-dns.restore.XXXXXX") || return 1
-        cp -a "$DNS_RESOLV_CONF" "$work_dir/resolv.conf" || {
-            rm -rf "$work_dir"
-            return 1
-        }
-        if [[ -f "$DNS_RESOLVED_DROPIN_FILE" ]]; then
-            cp -p "$DNS_RESOLVED_DROPIN_FILE" "$work_dir/previous.conf" || { rm -rf "$work_dir"; return 1; }
-            had_previous=1
-        fi
-        dns_systemd_resolved_active && was_active=1
-        if ! { rm -f "$DNS_RESOLVED_DROPIN_FILE" &&
-            { [[ ! -e "$DNS_RESOLVED_RESOLV_BACKUP" && ! -L "$DNS_RESOLVED_RESOLV_BACKUP" ]] ||
-                dns_replace_resolv "$DNS_RESOLVED_RESOLV_BACKUP"; } &&
-            { (( was_active == 0 )) || { systemctl restart systemd-resolved 2>/dev/null && dns_systemd_resolved_active; }; }; }; then
-            if ! { { (( had_previous == 0 )) || cp -p "$work_dir/previous.conf" "$DNS_RESOLVED_DROPIN_FILE"; } &&
-                dns_replace_resolv "$work_dir/resolv.conf"; }; then
-                echo -e "${RED}DNS 配置恢复失败，备份保留在 ${work_dir}${PLAIN}"
-                return 1
-            fi
-            systemctl restart systemd-resolved >/dev/null 2>&1 || true
-            rm -rf "$work_dir"
-            echo -e "${RED}systemd-resolved 重载失败，已恢复 Zero.sh DNS 配置${PLAIN}"
-            return 1
-        fi
-        rm -f "$DNS_RESOLVED_RESOLV_BACKUP"
-        rm -rf "$work_dir"
-        changed=1
-    fi
-
-    if [[ -f "$DNS_RESOLV_BACKUP" ]]; then
-        if [[ -L "$DNS_RESOLV_CONF" ]]; then
-            echo -e "${YELLOW}${DNS_RESOLV_CONF} 已变为符号链接，为避免破坏当前网络管理方式，未恢复静态备份${PLAIN}"
-            return 1
-        else
-            conf_dir=$(dirname "$DNS_RESOLV_CONF")
-            temp_file=$(mktemp "$conf_dir/.resolv.conf.restore.XXXXXX") || return 1
-            cp -p "$DNS_RESOLV_BACKUP" "$temp_file" || {
-                rm -f "$temp_file"
-                return 1
-            }
-            mv -f "$temp_file" "$DNS_RESOLV_CONF" || {
-                rm -f "$temp_file"
-                return 1
-            }
-            rm -f "$DNS_RESOLV_BACKUP"
-            changed=1
-        fi
-    fi
-
-    if (( changed == 0 )); then
-        echo -e "${YELLOW}未找到 Zero.sh 创建的 DNS 配置或备份${PLAIN}"
-        return 2
-    fi
-    command -v resolvectl >/dev/null 2>&1 && resolvectl flush-caches >/dev/null 2>&1 || true
-    return 0
 }
 
 dns_apply_with_feedback() {
@@ -2847,10 +5197,8 @@ dns_apply_with_feedback() {
 }
 
 dns_restore_with_feedback() {
-    local result
-
-    dns_restore
-    result=$?
+    local result=0
+    dns_restore || result=$?
     case "$result" in
         0) echo -e "${GREEN}DNS 已恢复${PLAIN}" ;;
         2) ;;
@@ -2859,11 +5207,44 @@ dns_restore_with_feedback() {
     press_any_key_to_continue
 }
 
+dns_public_menu_hint() {
+    case "$1" in
+        ipv6) printf '%s' "${GREEN}2001:4860:4860::8888${PLAIN} / ${GREEN}2606:4700:4700::1111${PLAIN} (纯IPv6)" ;;
+        dual) printf '%s' "${GREEN}Google${PLAIN} / ${GREEN}Cloudflare${PLAIN} (双栈自动适配)" ;;
+        *)    printf '%s' "${GREEN}8.8.8.8${PLAIN} / ${GREEN}1.1.1.1${PLAIN}" ;;
+    esac
+}
+
+dns_apply_public() {
+    local stack_mode
+    stack_mode=$(dns_detect_stack)
+    case "$stack_mode" in
+        ipv6)
+            echo -e "${BLUE}检测到纯 IPv6 网络，选用 IPv6 公共 DNS: ${GREEN}2001:4860:4860::8888 / 2606:4700:4700::1111${PLAIN}"
+            dns_apply_with_feedback "2001:4860:4860::8888" "2606:4700:4700::1111"
+            ;;
+        dual)
+            if dns_systemd_resolved_active; then
+                echo -e "${BLUE}检测到双栈网络 (systemd-resolved)，选用双栈公共 DNS${PLAIN}"
+                dns_apply_with_feedback "8.8.8.8" "1.1.1.1" "2001:4860:4860::8888" "2606:4700:4700::1111"
+            else
+                echo -e "${BLUE}检测到双栈网络，选用双栈公共 DNS: ${GREEN}8.8.8.8 / 1.1.1.1 / 2001:4860:4860::8888${PLAIN}"
+                dns_apply_with_feedback "8.8.8.8" "1.1.1.1" "2001:4860:4860::8888"
+            fi
+            ;;
+        *)
+            dns_apply_with_feedback "8.8.8.8" "1.1.1.1"
+            ;;
+    esac
+}
+
 dns_show_menu() {
+    local stack_mode
+    stack_mode=$(dns_detect_stack)
     clear
     echo -e "${BLUE}======== DNS 配置工具 ========${PLAIN}\n"
-    dns_show_current
-    echo -e "${GREEN}1.${PLAIN}使用公共DNS ${GREEN}8.8.8.8${PLAIN} / ${GREEN}1.1.1.1${PLAIN}"
+    dns_show_current "$stack_mode"
+    echo -e "${GREEN}1.${PLAIN}使用公共DNS $(dns_public_menu_hint "$stack_mode")"
     echo -e "${GREEN}2.${PLAIN}自定义DNS"
     echo -e "${GREEN}3.${PLAIN}恢复原始DNS配置"
     echo -e "${GREEN}4.${PLAIN}启用NAT64 ${GREEN}nat64.net${PLAIN} (IPv6访问IPv4)"
@@ -2873,39 +5254,61 @@ dns_show_menu() {
 }
 
 dns_read_custom_servers() {
-    local dns=""
-
-    echo -e "\n${YELLOW}请输入DNS(每行一个,空行结束):${PLAIN}" >&2
+    local line="" tok="" eof_reached=0
+    echo -e "\n${YELLOW}请输入DNS(每行一个或空格/逗号分隔，空行结束；静态解析建议不超过3个):${PLAIN}" >&2
     while true; do
-        read -r -p "> " dns
-        dns=$(trim_input "$dns")
-        [[ -z "$dns" ]] && break
-        printf '%s\n' "$dns"
+        read -r -p "> " line || eof_reached=1
+        line=$(trim_input "$line")
+        [[ -z "$line" ]] && break
+        line="${line//,/ }"
+        for tok in $line; do
+            [[ -n "$tok" ]] && printf '%s\n' "$tok"
+        done
+        (( eof_reached == 1 )) && break
     done
 }
 
 dns_enable_nat64() {
-    echo -e "${YELLOW}使用 nat64.net 公共 DNS64/NAT64，服务免费，云端流量按原规则计费${PLAIN}"
-    echo -e "${YELLOW}服务条款: https://nat64.net/tos${PLAIN}"
+    local stack_mode
+    stack_mode=$(dns_detect_stack)
+    if [[ "$stack_mode" == "ipv4" || "$stack_mode" == "none" ]]; then
+        echo -e "${RED}未检测到可用的 IPv6 路由，已阻止写入纯 IPv6 NAT64 DNS（否则会导致 DNS 解析中断）${PLAIN}"
+        press_any_key_to_continue
+        return 1
+    fi
+    [[ "$stack_mode" == "dual" ]] && echo -e "${YELLOW}提示: 本机已具备双栈网络，通常无需启用 NAT64${PLAIN}"
+    echo -e "${YELLOW}使用 nat64.net 公共 DNS64/NAT64 (https://nat64.net/tos)${PLAIN}"
     dns_apply_with_feedback "2a00:1098:2c::1" "2a01:4f9:c010:3f02::1" "2a00:1098:2b::1"
 }
 
 dns_test_nat64() {
-    local http_code
+    local http_code="" stack_mode="" wget_headers=""
     echo -e "${YELLOW}正在测试 GitHub API 的 IPv6 连接...${PLAIN}"
-    if ! command -v curl >/dev/null 2>&1; then
-        echo -e "${RED}未安装 curl，无法测试${PLAIN}"
-    elif http_code=$(curl -6 --noproxy '*' --silent --show-error --output /dev/null \
-        --write-out '%{http_code}' --connect-timeout 15 --max-time 30 https://api.github.com); then
-        case "$http_code" in
-            2??) echo -e "${GREEN}IPv6 HTTPS 连通，GitHub API 访问成功（HTTP ${http_code}）${PLAIN}" ;;
-            *)
-                echo -e "${YELLOW}IPv6 HTTPS 连通，但 GitHub API 返回 HTTP ${http_code}${PLAIN}"
-                echo -e "${YELLOW}API 可能被限流或拒绝，依赖该 API 的安装仍可能失败；此结果不代表 NAT64 断网${PLAIN}"
-                ;;
-        esac
+    stack_mode=$(dns_detect_stack)
+    if [[ "$stack_mode" == "ipv4" || "$stack_mode" == "none" ]]; then
+        echo -e "${RED}未检测到可用的 IPv6 路由，无法建立 IPv6 / NAT64 连接${PLAIN}"
+        press_any_key_to_continue
+        return 1
+    fi
+
+    if command -v curl >/dev/null 2>&1; then
+        if http_code=$(curl -6 --noproxy '*' -sS -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 20 https://api.github.com); then
+            case "$http_code" in
+                2??) echo -e "${GREEN}IPv6 HTTPS 连通，GitHub API 访问成功（HTTP ${http_code}）${PLAIN}" ;;
+                *)   echo -e "${YELLOW}IPv6 HTTPS 连通，但 GitHub API 返回 HTTP ${http_code}${PLAIN}" ;;
+            esac
+        else
+            echo -e "${RED}IPv6 HTTPS 连接失败，请检查 DNS、网络或 NAT64 服务${PLAIN}"
+        fi
+    elif command -v wget >/dev/null 2>&1; then
+        if wget_headers=$(wget -6 --no-proxy --spider -S --timeout=10 --tries=1 https://api.github.com 2>&1); then
+            http_code=$(printf '%s\n' "$wget_headers" | awk '/^[[:space:]]*HTTP\/[0-9.]+[[:space:]]+[0-9]+/ {code=$2} END {print code}')
+            echo -e "${GREEN}IPv6 HTTPS 连通，GitHub API 访问成功（HTTP ${http_code:-200}）${PLAIN}"
+        else
+            echo -e "${RED}IPv6 HTTPS 连接失败，请检查 DNS、网络或 NAT64 服务${PLAIN}"
+        fi
     else
-        echo -e "${RED}IPv6 HTTPS 连接失败，请根据 curl 错误检查 DNS、网络或 NAT64 服务${PLAIN}"
+        echo -e "${RED}未安装 curl 或 wget，无法测试${PLAIN}"
     fi
     press_any_key_to_continue
 }
@@ -2913,44 +5316,29 @@ dns_test_nat64() {
 handle_dns_choice() {
     local choice="$1"
     local -a custom_dns=()
-
     case "$choice" in
-        1)
-            dns_apply_with_feedback "8.8.8.8" "1.1.1.1"
-            ;;
+        1) dns_apply_public ;;
         2)
             clear
             mapfile -t custom_dns < <(dns_read_custom_servers)
-            if [[ ${#custom_dns[@]} -eq 0 ]]; then
+            if (( ${#custom_dns[@]} == 0 )); then
                 echo -e "${YELLOW}未输入DNS${PLAIN}"
                 press_any_key_to_continue
             else
                 dns_apply_with_feedback "${custom_dns[@]}"
             fi
             ;;
-        3)
-            dns_restore_with_feedback
-            ;;
-        4)
-            dns_enable_nat64
-            ;;
-        5)
-            dns_test_nat64
-            ;;
-        0)
-            return 1
-            ;;
-        *)
-            show_invalid_option
-            ;;
+        3) dns_restore_with_feedback ;;
+        4) dns_enable_nat64 ;;
+        5) dns_test_nat64 ;;
+        0) return 1 ;;
+        *) show_invalid_option ;;
     esac
-
     return 0
 }
 
 dns_fix() {
     local choice
-
     while true; do
         dns_show_menu
         choice=$(read_menu_choice "请输入选项 [0-5]: ") || return 1
@@ -3014,12 +5402,11 @@ ssh_config_menu() {
 change_ssh_port() {
     while true; do
         clear
-        local current_port old_port
+        local current_port old_port new_port
         current_port=$(ssh_get_current_port)
         old_port="$current_port"
         echo -e "${YELLOW}当前SSH端口: ${GREEN}${current_port:-22}${PLAIN}\n"
-        read -r -p "$(echo -e "${BLUE}请输入新的SSH端口(输入0返回): ${PLAIN}")" new_port || return 1
-        new_port=$(trim_input "$new_port")
+        new_port=$(read_menu_choice "请输入新的SSH端口(输入0返回): ") || return 1
         if [[ "$new_port" == "0" ]]; then
             return
         fi
@@ -3069,11 +5456,11 @@ change_ssh_port() {
 }
 
 enable_or_change_root_password() {
+    local input
     clear
     echo -e "${YELLOW}设置 Root 密码并启用密码登录${PLAIN}"
     echo
-    read -r -p "$(echo -e "${BLUE}按回车继续,输入0返回:${PLAIN}")" input || return 1
-    input=$(trim_input "$input")
+    input=$(read_menu_choice "按回车继续,输入0返回: ") || return 1
     if [[ "$input" == "0" ]]; then
         return
     fi
@@ -3089,11 +5476,20 @@ enable_or_change_root_password() {
     press_any_key_to_continue
 }
 
+ssh_root_has_authorized_key() {
+    local f
+    for f in "$ROOT_HOME/.ssh/authorized_keys" "$ROOT_HOME/.ssh/authorized_keys2"; do
+        [[ -r "$f" ]] || continue
+        grep -Eq '^[[:space:]]*[^#[:space:]]' "$f" 2>/dev/null && return 0
+    done
+    return 1
+}
+
 enable_root_key_login() {
     clear
     local SSH_DIR="$ROOT_HOME/.ssh"
     local AUTH_KEYS="$SSH_DIR/authorized_keys"
-    local TMP_KEY TMP_PUB key_dir
+    local TMP_KEY TMP_PUB key_dir set_passwd
     local key_passphrase=""
 
     mkdir -p "$SSH_DIR" || return 1
@@ -3104,15 +5500,19 @@ enable_root_key_login() {
     echo -e "${BLUE}是否需要为私钥设置密码？${PLAIN}"
     echo -e "${GREEN}1.${PLAIN}是"
     echo -e "${GREEN}2.${PLAIN}否"
-    read -r -p "$(echo -e "${BLUE}choice [1/2]: ${PLAIN}")" set_passwd || return 1
+    echo -e "${YELLOW}0.${PLAIN}返回上级"
+    set_passwd=$(read_menu_choice "choice [0-2]: ") || return 1
 
+    if [[ "$set_passwd" == "0" ]]; then
+        return 0
+    fi
     if [[ "$set_passwd" != "1" && "$set_passwd" != "2" ]]; then
-        echo -e "${RED}输入无效,已返回主菜单${PLAIN}"
+        echo -e "${RED}输入无效,已返回上级${PLAIN}"
         sleep 0.3
         return
     fi
 
-    if [ "$set_passwd" = "1" ]; then
+    if [[ "$set_passwd" == "1" ]]; then
         clear
         echo -e "${BLUE}请输入私钥密码(不显示):${PLAIN}"
         read -r -s key_passphrase || return 1
@@ -3168,7 +5568,8 @@ disable_ssh_login_menu() {
     clear
     local has_password=0
     local has_pubkey=0
-    local pass_auth pubkey_auth permit_root_login
+    local has_auth_key=0
+    local pass_auth pubkey_auth permit_root_login disable_choice
     local password_login_text pubkey_login_text
     local -a ssh_status
 
@@ -3177,8 +5578,9 @@ disable_ssh_login_menu() {
     pass_auth="${ssh_status[2]}"
     pubkey_auth="${ssh_status[3]}"
 
+    ssh_root_has_authorized_key && has_auth_key=1
     [[ "$permit_root_login" == "yes" && "$pass_auth" == "yes" ]] && has_password=1
-    [[ "$permit_root_login" =~ ^(yes|prohibit-password|without-password)$ && "$pubkey_auth" == "yes" ]] && has_pubkey=1
+    [[ "$permit_root_login" =~ ^(yes|prohibit-password|without-password)$ && "$pubkey_auth" == "yes" && $has_auth_key -eq 1 ]] && has_pubkey=1
 
     password_login_text=$(ssh_status_label "$pass_auth")
     pubkey_login_text=$(ssh_status_label "$pubkey_auth")
@@ -3190,7 +5592,10 @@ disable_ssh_login_menu() {
     echo
 
     if [[ $enabled_count -le 1 ]]; then
-        echo -e "${RED}当前仅剩一种登录方式,禁止关闭全部登录方式${PLAIN}"
+        if [[ "$pubkey_auth" == "yes" && $has_auth_key -eq 0 ]]; then
+            echo -e "${YELLOW}提示: 未检测到已写入的公钥 (${ROOT_HOME}/.ssh/authorized_keys 为空)${PLAIN}"
+        fi
+        echo -e "${RED}当前仅剩一种可用登录方式,禁止关闭全部登录方式${PLAIN}"
         press_any_key_to_continue
         return
     fi
@@ -3203,7 +5608,7 @@ disable_ssh_login_menu() {
         1)
             if [[ "$pass_auth" == "yes" ]]; then
                 if [[ $has_pubkey -ne 1 ]]; then
-                    echo -e "${RED}关闭密码登录后将没有可确认的 root 登录方式,已取消${PLAIN}"
+                    echo -e "${RED}关闭密码登录后将没有可用的 root 密钥登录方式,已取消${PLAIN}"
                     press_any_key_to_continue
                     return
                 fi
@@ -3244,7 +5649,7 @@ disable_ssh_login_menu() {
 
 reboot_vps() {
     echo "即将重启系统..."
-    reboot
+    reboot 2>/dev/null || systemctl reboot 2>/dev/null || shutdown -r now
 }
 
 swap_is_valid_size_mb() {
@@ -3300,7 +5705,8 @@ update_swap_fstab() {
         !($1 in paths && $3 == "swap")
         END {print new_path " none swap sw 0 0"}
     ' /etc/fstab "$@" > "$temp" &&
-       chmod --reference=/etc/fstab "$temp" && chown --reference=/etc/fstab "$temp" &&
+       { chmod --reference=/etc/fstab "$temp" 2>/dev/null || chmod 644 "$temp"; } &&
+       { chown --reference=/etc/fstab "$temp" 2>/dev/null || true; } &&
        mv -f "$temp" /etc/fstab; then
         return 0
     fi
@@ -3467,7 +5873,7 @@ acme_ensure_cert_path() {
 }
 
 acme_has_ipv4() {
-    ip -4 addr show scope global 2>/dev/null | grep -q inet
+    dns_has_ipv4
 }
 
 acme_install_dependencies() {
@@ -3653,7 +6059,11 @@ acme_get_cert_list() {
 
 acme_display_cert_list() {
     local cert_list
-    cert_list=$(acme_get_cert_list)
+    if (( $# > 0 )); then
+        cert_list="$1"
+    else
+        cert_list=$(acme_get_cert_list)
+    fi
 
     if [[ -z "$cert_list" ]]; then
         echo -e "${YELLOW}暂无已申请的证书${PLAIN}"
@@ -3697,7 +6107,7 @@ acme_prompt_validated_domain() {
     local domain
     ACME_PROMPT_DOMAIN=""
 
-    read -r -p "$(echo -e "${BLUE}${prompt}${PLAIN}")" domain
+    read -r -p "${BLUE}${prompt}${PLAIN}" domain
     domain=$(trim_input "$domain")
     if [[ -z "$domain" ]]; then
         echo -e "${RED}未输入域名${PLAIN}"
@@ -3729,7 +6139,7 @@ acme_prompt_cf_token() {
     local token=""
 
     ACME_CF_TOKEN=""
-    if ! read -r -s -p "$(echo -e "${BLUE}请输入 Cloudflare API Token: ${PLAIN}")" token; then
+    if ! read -r -s -p "${BLUE}请输入 Cloudflare API Token: ${PLAIN}" token; then
         echo
         echo -e "${RED}读取 Cloudflare API Token 失败${PLAIN}"
         return 1
@@ -3822,13 +6232,13 @@ acme_cf_find_zone() {
             return 1
         fi
 
-        count=$(jq -r '.result_info.total_count // (.result | length) // 0' <<<"$ACME_CF_RESPONSE")
-        if [[ "$count" =~ ^[0-9]+$ ]] && (( count > 0 )); then
-            ACME_CF_ZONE_ID=$(jq -r '.result[0].id // empty' <<<"$ACME_CF_RESPONSE")
-            ACME_CF_ZONE_NAME=$(jq -r '.result[0].name // empty' <<<"$ACME_CF_RESPONSE")
-            ACME_CF_ACCOUNT_ID=$(jq -r '.result[0].account.id // empty' <<<"$ACME_CF_RESPONSE")
+        IFS=$'\t' read -r count ACME_CF_ZONE_ID ACME_CF_ZONE_NAME ACME_CF_ACCOUNT_ID < <(
+            jq -r '[(.result_info.total_count // (.result | length) // 0), (.result[0].id // ""), (.result[0].name // ""), (.result[0].account.id // "")] | @tsv' <<<"$ACME_CF_RESPONSE"
+        )
+        if [[ "$count" =~ ^[0-9]+$ ]] && (( count > 0 )) && [[ -n "$ACME_CF_ZONE_ID" ]]; then
             break
         fi
+        ACME_CF_ZONE_ID=""; ACME_CF_ZONE_NAME=""; ACME_CF_ACCOUNT_ID=""
         candidate="${candidate#*.}"
     done
 
@@ -4078,29 +6488,39 @@ acme_finalize_issue() {
 }
 
 acme_check_port_80() {
-    if ! command -v lsof >/dev/null 2>&1; then
-        echo -e "${YELLOW}未检测到 lsof，正在安装...${PLAIN}"
-        pkg_install lsof >/dev/null 2>&1 || {
-            echo -e "${RED}lsof 安装失败，无法检测 80 端口${PLAIN}"
-            return 1
-        }
-    fi
+    local ss_out="" listen_pids="" yn=""
 
     echo -e "${YELLOW}正在检测 80 端口状态...${PLAIN}"
-
     echo -e "${YELLOW}申请期间会通过 ACME 钩子临时放行 Zero FireWall 的 TCP 80，结束后移除；其他防火墙需自行放行。${PLAIN}"
 
-    local listen_pids
-    listen_pids=$(lsof -t -iTCP:80 -sTCP:LISTEN 2>/dev/null | sort -u)
-    if [[ -z "$listen_pids" ]]; then
-        echo -e "${GREEN}检测到当前 80 端口未被占用${PLAIN}"
-        return 0
+    if command -v ss >/dev/null 2>&1; then
+        ss_out=$(ss -H -lntp 'sport = :80' 2>/dev/null || true)
+        if [[ -z "$ss_out" ]]; then
+            echo -e "${GREEN}检测到当前 80 端口未被占用${PLAIN}"
+            return 0
+        fi
+        echo -e "${RED}检测到 80 端口被其他程序占用${PLAIN}"
+        printf '%s\n' "$ss_out"
+        listen_pids=$(printf '%s\n' "$ss_out" | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
+    else
+        if ! command -v lsof >/dev/null 2>&1; then
+            echo -e "${YELLOW}未检测到 ss/lsof，正在安装 lsof...${PLAIN}"
+            pkg_install lsof >/dev/null 2>&1 || {
+                echo -e "${RED}lsof 安装失败，无法检测 80 端口${PLAIN}"
+                return 1
+            }
+        fi
+        listen_pids=$(lsof -t -iTCP:80 -sTCP:LISTEN 2>/dev/null | sort -u)
+        if [[ -z "$listen_pids" ]]; then
+            echo -e "${GREEN}检测到当前 80 端口未被占用${PLAIN}"
+            return 0
+        fi
+        echo -e "${RED}检测到 80 端口被其他程序占用${PLAIN}"
+        lsof -iTCP:80 -sTCP:LISTEN 2>/dev/null
     fi
 
-    echo -e "${RED}检测到 80 端口被其他程序占用${PLAIN}"
-    lsof -iTCP:80 -sTCP:LISTEN 2>/dev/null
-    read -rp "$(echo -e "${BLUE}如需结束占用进程请输入 Y，其他键返回菜单 [Y/N]: ${PLAIN}")" yn
-    if [[ "$yn" =~ ^[Yy]$ ]]; then
+    read -rp "${BLUE}如需结束占用进程请输入 Y，其他键返回菜单 [Y/N]: ${PLAIN}" yn
+    if [[ "$yn" =~ ^[Yy]$ && -n "$listen_pids" ]]; then
         printf '%s\n' "$listen_pids" | xargs -r kill -9
         sleep 1
         return 0
@@ -4211,12 +6631,12 @@ acme_revoke_cert() {
 
     clear
     echo -e "${BLUE}================ 证书列表 ================${PLAIN}"
-    if ! acme_display_cert_list; then
+    cert_list=$(acme_get_cert_list)
+    if ! acme_display_cert_list "$cert_list"; then
         press_any_key_to_continue
         return
     fi
 
-    cert_list=$(acme_get_cert_list)
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         domains+=("${line%%|*}")
@@ -4235,7 +6655,7 @@ acme_revoke_cert() {
 
     selected_domain="${domains[$((choice-1))]}"
     echo -e "${YELLOW}即将撤销证书: ${selected_domain}${PLAIN}"
-    read -r -p "$(echo -e "${BLUE}确认撤销? [y/N]: ${PLAIN}")" confirm
+    read -r -p "${BLUE}确认撤销? [y/N]: ${PLAIN}" confirm
     confirm=$(trim_input "$confirm")
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         echo -e "${YELLOW}已取消操作${PLAIN}"
@@ -4300,7 +6720,8 @@ acme_switch_provider() {
             return
             ;;
         *)
-            echo -e "${RED}无效选项${PLAIN}"
+            show_invalid_option
+            return
             ;;
     esac
     press_any_key_to_continue
@@ -4313,7 +6734,7 @@ acme_generate_self_signed_cert() {
 
     clear
     acme_ensure_cert_path || return 1
-    read -r -p "$(echo -e "${BLUE}请输入证书域名(默认: ${default_domain}): ${PLAIN}")" domain || return 1
+    read -r -p "${BLUE}请输入证书域名(默认: ${default_domain}): ${PLAIN}" domain || return 1
     domain=$(trim_input "$domain")
     domain="${domain:-$default_domain}"
     if ! acme_validate_domain "$domain"; then
@@ -4404,16 +6825,10 @@ mihomo_pause_and_return() {
 }
 
 mihomo_get_arch() {
-    local arch
-    arch=$(uname -m)
-    case "$arch" in
-        x86_64|amd64) echo "amd64" ;;
-        aarch64|arm64) echo "arm64" ;;
-        *)
-            echo -e "${RED}不支持${PLAIN}" >&2
-            return 1
-            ;;
-    esac
+    zero_get_arch || {
+        echo -e "${RED}不支持${PLAIN}" >&2
+        return 1
+    }
 }
 
 mihomo_yaml_string() {
@@ -4423,7 +6838,7 @@ mihomo_yaml_string() {
 }
 
 mihomo_random_pass() {
-    tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 12
+    LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 12
 }
 
 mihomo_validate_port() {
@@ -4434,7 +6849,6 @@ mihomo_validate_port() {
 mihomo_validate_uuid() {
     [[ "$1" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]
 }
-
 
 mihomo_channel_label() {
     case "$1" in
@@ -4447,50 +6861,74 @@ mihomo_channel_label() {
 mihomo_get_current_version_label() {
     local version_line current_version
     version_line=$("$MIHOMO_EXEC_PATH" -v 2>/dev/null | head -1)
-    current_version=$(echo "$version_line" | grep -oE 'alpha-[0-9a-f]+' | head -1)
-    if [[ -n "$current_version" ]]; then
-        echo "$current_version"
+    if [[ "$version_line" =~ (alpha-[0-9a-f]+) ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
         return
     fi
-
-    current_version=$(echo "$version_line" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-    echo "${current_version:-未知}"
+    if [[ "$version_line" =~ (v[0-9]+\.[0-9]+\.[0-9]+) ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return
+    fi
+    echo "未知"
 }
 
 mihomo_select_asset_name() {
     local release_json="$1"
     local arch="$2"
     local channel="$3"
-    local asset_names asset_pattern asset_name
+    local cpu_level="${4:-}"
+    local asset_names ver_re pattern asset_name
+    local -a patterns=()
 
-    asset_names=$(echo "$release_json" | grep -oE '"name":[[:space:]]*"mihomo-linux-[^"]+\.gz"' | sed -E 's/^"name":[[:space:]]*"//; s/"$//')
-    if [[ -z "$asset_names" ]]; then
-        return 1
-    fi
+    asset_names=$(printf '%s\n' "$release_json" | grep -oE '"name":[[:space:]]*"mihomo-linux-[^"]+\.gz"' | sed -E 's/^"name":[[:space:]]*"//; s/"$//')
+    [[ -n "$asset_names" ]] || return 1
 
     case "$channel" in
-        alpha)
-            case "$arch" in
-                amd64) asset_pattern='^mihomo-linux-amd64-v3-alpha-[0-9a-f]+\.gz$' ;;
-                arm64) asset_pattern='^mihomo-linux-arm64-alpha-[0-9a-f]+\.gz$' ;;
-                *) return 1 ;;
-            esac
+        alpha)   ver_re='alpha-[0-9a-f]+' ;;
+        release) ver_re='v[0-9]+\.[0-9]+\.[0-9]+' ;;
+        *)       return 1 ;;
+    esac
+
+    case "$arch" in
+        amd64)
+            [[ -n "$cpu_level" ]] || cpu_level=$(bbr_detect_x86_64_level_local 2>/dev/null || true)
+            if [[ "$cpu_level" =~ ^[34]$ ]]; then
+                patterns=(
+                    "^mihomo-linux-amd64-v3-${ver_re}\\.gz$"
+                    "^mihomo-linux-amd64-${ver_re}\\.gz$"
+                    "^mihomo-linux-amd64-v2-${ver_re}\\.gz$"
+                    "^mihomo-linux-amd64-v1-${ver_re}\\.gz$"
+                    "^mihomo-linux-amd64-compatible-${ver_re}\\.gz$"
+                )
+            elif [[ "$cpu_level" == "2" ]]; then
+                patterns=(
+                    "^mihomo-linux-amd64-v2-${ver_re}\\.gz$"
+                    "^mihomo-linux-amd64-v1-${ver_re}\\.gz$"
+                    "^mihomo-linux-amd64-compatible-${ver_re}\\.gz$"
+                )
+            else
+                patterns=(
+                    "^mihomo-linux-amd64-v1-${ver_re}\\.gz$"
+                    "^mihomo-linux-amd64-compatible-${ver_re}\\.gz$"
+                )
+            fi
             ;;
-        release)
-            case "$arch" in
-                amd64) asset_pattern='^mihomo-linux-amd64-v3-v[0-9]+\.[0-9]+\.[0-9]+\.gz$' ;;
-                arm64) asset_pattern='^mihomo-linux-arm64-v[0-9]+\.[0-9]+\.[0-9]+\.gz$' ;;
-                *) return 1 ;;
-            esac
+        arm64)
+            patterns=("^mihomo-linux-arm64(-v8)?-${ver_re}\\.gz$")
             ;;
         *)
             return 1
             ;;
     esac
 
-    asset_name=$(echo "$asset_names" | grep -E "$asset_pattern" | head -1)
-    [[ -n "$asset_name" ]] || return 1
-    echo "$asset_name"
+    for pattern in "${patterns[@]}"; do
+        asset_name=$(printf '%s\n' "$asset_names" | grep -E "$pattern" | head -n1)
+        if [[ -n "$asset_name" ]]; then
+            printf '%s\n' "$asset_name"
+            return 0
+        fi
+    done
+    return 1
 }
 
 mihomo_get_download_info() {
@@ -4508,8 +6946,8 @@ mihomo_get_download_info() {
 
     api_url="https://api.github.com/repos/MetaCubeX/mihomo/${release_path}"
 
-    release_json=$(curl -fsSL "$api_url") || return 1
-    latest_version=$(echo "$release_json" | grep '"tag_name":' | sed -E 's/.*"tag_name":[[:space:]]*"([^"]+)".*/\1/' | head -1)
+    release_json=$(curl -fsSL --connect-timeout 10 --max-time 30 "$api_url") || return 1
+    latest_version=$(printf '%s\n' "$release_json" | grep '"tag_name":' | sed -E 's/.*"tag_name":[[:space:]]*"([^"]+)".*/\1/' | head -1)
     [[ -n "$latest_version" ]] || return 1
 
     asset_name=$(mihomo_select_asset_name "$release_json" "$arch" "$channel") || return 1
@@ -4517,7 +6955,7 @@ mihomo_get_download_info() {
 
     display_version="$latest_version"
     if [[ "$channel" == "alpha" ]]; then
-        asset_version=$(echo "$asset_name" | grep -oE 'alpha-[0-9a-f]+' | tail -1)
+        asset_version=$(printf '%s\n' "$asset_name" | grep -oE 'alpha-[0-9a-f]+' | tail -1)
         display_version="${MIHOMO_ALPHA_TAG} (${asset_version})"
     fi
 
@@ -4526,31 +6964,30 @@ mihomo_get_download_info() {
 
 mihomo_download_binary() {
     local download_url="$1" target="${2:-$MIHOMO_EXEC_PATH}"
+    local tmpdir tmp_target
 
-    rm -f "/tmp/mihomo.gz" "/tmp/mihomo"
-
-    if ! curl -fL --connect-timeout 10 --max-time 120 -o "/tmp/mihomo.gz" "$download_url"; then
+    tmpdir=$(mktemp -d /tmp/zero-mihomo.XXXXXX) || return 1
+    if ! curl -fL --connect-timeout 10 --max-time 120 -o "$tmpdir/mihomo.gz" "$download_url"; then
         echo -e "${RED}下载失败${PLAIN}"
-        rm -f "/tmp/mihomo.gz" "/tmp/mihomo"
+        rm -rf "$tmpdir"
         return 1
     fi
 
-    if ! gunzip -f "/tmp/mihomo.gz"; then
+    if ! gzip -dc "$tmpdir/mihomo.gz" > "$tmpdir/mihomo"; then
         echo -e "${RED}解压失败${PLAIN}"
-        rm -f "/tmp/mihomo.gz" "/tmp/mihomo"
+        rm -rf "$tmpdir"
         return 1
     fi
 
-    if ! mv "/tmp/mihomo" "$target"; then
+    mkdir -p "${target%/*}" || { rm -rf "$tmpdir"; return 1; }
+    tmp_target=$(mktemp "${target}.tmp.XXXXXX") || { rm -rf "$tmpdir"; return 1; }
+    if ! install -m 755 "$tmpdir/mihomo" "$tmp_target" || ! mv -f "$tmp_target" "$target"; then
         echo -e "${RED}安装内核失败${PLAIN}"
-        rm -f "/tmp/mihomo"
+        rm -f "$tmp_target"
+        rm -rf "$tmpdir"
         return 1
     fi
-
-    if ! chmod +x "$target"; then
-        echo -e "${RED}设置执行权限失败${PLAIN}"
-        return 1
-    fi
+    rm -rf "$tmpdir"
 }
 
 mihomo_install_dependencies() {
@@ -4604,8 +7041,8 @@ mihomo_select_cert() {
         opt=$(read_menu_choice "输入选项: ") || return 1
         
         if [[ "$opt" == "0" ]]; then
-            read -r -p "$(echo -e "${BLUE}证书路径: ${PLAIN}")" mihomo_cert_path || return 1
-            read -r -p "$(echo -e "${BLUE}私钥路径: ${PLAIN}")" mihomo_key_path || return 1
+            read -r -p "${BLUE}证书路径: ${PLAIN}" mihomo_cert_path || return 1
+            read -r -p "${BLUE}私钥路径: ${PLAIN}" mihomo_key_path || return 1
             if [[ -f "$mihomo_cert_path" && -f "$mihomo_key_path" ]]; then
                 return 0
             else
@@ -4686,11 +7123,23 @@ mihomo_restart_checked() {
 mihomo_make_config_backup() {
     local backup
     backup="$(mktemp)" || return 1
+    chmod 600 "$backup" 2>/dev/null || true
     cp "$MIHOMO_CONFIG_PATH" "$backup" || {
         rm -f "$backup"
         return 1
     }
     printf '%s\n' "$backup"
+}
+
+mihomo_commit_tmp_config() {
+    local tmp_file="$1" backup="${2:-}"
+    if chmod 600 "$tmp_file" && mv -f "$tmp_file" "$MIHOMO_CONFIG_PATH"; then
+        return 0
+    fi
+    echo -e "${RED}配置写入失败${PLAIN}"
+    rm -f "$tmp_file" "$backup"
+    sleep 1
+    return 1
 }
 
 mihomo_check_config() {
@@ -4708,6 +7157,7 @@ mihomo_restart_with_rollback() {
             echo -e "${RED}配置无效且恢复失败，备份保留在 ${backup}${PLAIN}"
             return 1
         fi
+        chmod 600 "$MIHOMO_CONFIG_PATH" 2>/dev/null || true
         rm -f "$backup"
         echo -e "${YELLOW}配置检查失败，已恢复原配置，未重启服务${PLAIN}"
         return 1
@@ -4727,6 +7177,7 @@ mihomo_restart_with_rollback() {
         echo -e "${RED}恢复配置失败，备份保留在 ${backup}${PLAIN}"
         return 1
     fi
+    chmod 600 "$MIHOMO_CONFIG_PATH" 2>/dev/null || true
     rm -f "$backup"
     if systemctl restart "$MIHOMO_SERVICE_NAME" >/dev/null 2>&1; then
         echo -e "${YELLOW}${failure_msg},已回滚到上一份可用配置${PLAIN}"
@@ -4736,6 +7187,107 @@ mihomo_restart_with_rollback() {
     echo -e "${RED}${failure_msg},回滚后服务仍未启动${PLAIN}"
     mihomo_show_service_failure
     return 1
+}
+
+mihomo_render_listener() {
+    local name="$1" port="$2" pass="$3" cert="${4:-}" key="${5:-}" extra1="${6:-}" extra2="${7:-}"
+    case "$name" in
+        anytls-in)
+            cat <<EOF
+- name: anytls-in
+  type: anytls
+  port: ${port}
+  listen: ::0
+  users:
+    username1: $(mihomo_yaml_string "$pass")
+  certificate: $(mihomo_yaml_string "$cert")
+  private-key: $(mihomo_yaml_string "$key")
+  padding-scheme: |
+   stop=8
+   0=30-30
+   1=100-400
+   2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000
+   3=9-9,500-1000
+   4=500-1000
+   5=500-1000
+   6=500-1000
+   7=500-1000
+
+EOF
+            ;;
+        trojan-in)
+            cat <<EOF
+- name: trojan-in
+  type: trojan
+  port: ${port}
+  listen: ::0
+  users:
+    - username: 1
+      password: $(mihomo_yaml_string "$pass")
+  ws-path: "/"
+  certificate: $(mihomo_yaml_string "$cert")
+  private-key: $(mihomo_yaml_string "$key")
+
+EOF
+            ;;
+        snellv5-in)
+            cat <<EOF
+- name: snellv5-in
+  type: snell
+  port: ${port}
+  listen: ::0
+  psk: $(mihomo_yaml_string "$pass")
+  version: 5
+  udp: true
+EOF
+            if [[ "$extra1" == "y" ]]; then
+                cat <<EOF
+  obfs-opts:
+    mode: http
+    host: $(mihomo_yaml_string "$extra2")
+EOF
+            fi
+            printf '\n'
+            ;;
+        tuicv5-in)
+            cat <<EOF
+- name: tuicv5-in
+  type: tuic
+  port: ${port}
+  listen: ::0
+  users:
+    ${extra1}: $(mihomo_yaml_string "$pass")
+  certificate: $(mihomo_yaml_string "$cert")
+  private-key: $(mihomo_yaml_string "$key")
+  congestion-controller: bbr
+  max-idle-time: 15000
+  authentication-timeout: 3000
+  alpn:
+    - h3
+  max-udp-relay-packet-size: 1408
+
+EOF
+            ;;
+        hysteria2-in)
+            cat <<EOF
+- name: hysteria2-in
+  type: hysteria2
+  port: ${port}
+  listen: ::0
+  users:
+    user1: $(mihomo_yaml_string "$pass")
+  masquerade: ""
+  alpn:
+  - h3
+  certificate: $(mihomo_yaml_string "$cert")
+  private-key: $(mihomo_yaml_string "$key")
+
+EOF
+            ;;
+        *)
+            return 1
+            ;;
+    esac
 }
 
 mihomo_generate_config() {
@@ -4761,108 +7313,32 @@ EOF
     chmod 600 "$MIHOMO_CONFIG_PATH" || return 1
 
     if [[ "$enable_anytls" == "y" ]]; then
-        cat >> "$MIHOMO_CONFIG_PATH" <<EOF || return 1
-- name: anytls-in
-  type: anytls
-  port: ${anytls_port}
-  listen: ::0
-  users:
-    username1: $(mihomo_yaml_string "$anytls_pass")
-  certificate: $(mihomo_yaml_string "$anytls_cert")
-  private-key: $(mihomo_yaml_string "$anytls_key")
-  padding-scheme: |
-   stop=8
-   0=30-30
-   1=100-400
-   2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000
-   3=9-9,500-1000
-   4=500-1000
-   5=500-1000
-   6=500-1000
-   7=500-1000
-
-EOF
+        mihomo_render_listener "anytls-in" "$anytls_port" "$anytls_pass" "$anytls_cert" "$anytls_key" >> "$MIHOMO_CONFIG_PATH" || return 1
     fi
-
     if [[ "$enable_trojan" == "y" ]]; then
-        cat >> "$MIHOMO_CONFIG_PATH" <<EOF || return 1
-- name: trojan-in
-  type: trojan
-  port: ${trojan_port}
-  listen: ::0
-  users:
-    - username: 1
-      password: $(mihomo_yaml_string "$trojan_pass")
-  ws-path: "/"
-  certificate: $(mihomo_yaml_string "$trojan_cert")
-  private-key: $(mihomo_yaml_string "$trojan_key")
-
-EOF
+        mihomo_render_listener "trojan-in" "$trojan_port" "$trojan_pass" "$trojan_cert" "$trojan_key" >> "$MIHOMO_CONFIG_PATH" || return 1
     fi
-    
     if [[ "$enable_snell" == "y" ]]; then
-        cat >> "$MIHOMO_CONFIG_PATH" <<EOF || return 1
-- name: snellv5-in
-  type: snell
-  port: ${snell_port}
-  listen: ::0
-  psk: $(mihomo_yaml_string "$snell_pass")
-  version: 5
-  udp: true
-EOF
-        if [[ "$snell_obfs" == "y" ]]; then
-            cat >> "$MIHOMO_CONFIG_PATH" <<EOF || return 1
-  obfs-opts:
-    mode: http
-    host: $(mihomo_yaml_string "$snell_obfs_host")
-EOF
-        fi
-        cat >> "$MIHOMO_CONFIG_PATH" <<EOF || return 1
-
-EOF
+        mihomo_render_listener "snellv5-in" "$snell_port" "$snell_pass" "" "" "$snell_obfs" "$snell_obfs_host" >> "$MIHOMO_CONFIG_PATH" || return 1
     fi
-
     if [[ "$enable_tuic" == "y" ]]; then
-        cat >> "$MIHOMO_CONFIG_PATH" <<EOF || return 1
-- name: tuicv5-in
-  type: tuic
-  port: ${tuic_port}
-  listen: ::0
-  users:
-    ${tuic_uuid}: $(mihomo_yaml_string "$tuic_pass")
-  certificate: $(mihomo_yaml_string "$tuic_cert")
-  private-key: $(mihomo_yaml_string "$tuic_key")
-  congestion-controller: bbr
-  max-idle-time: 80000
-  authentication-timeout: 8000
-  alpn:
-    - h3
-  max-udp-relay-packet-size: 1408
-
-EOF
+        mihomo_render_listener "tuicv5-in" "$tuic_port" "$tuic_pass" "$tuic_cert" "$tuic_key" "$tuic_uuid" >> "$MIHOMO_CONFIG_PATH" || return 1
     fi
-
     if [[ "$enable_hy2" == "y" ]]; then
-        cat >> "$MIHOMO_CONFIG_PATH" <<EOF || return 1
-- name: hysteria2-in
-  type: hysteria2
-  port: ${hy2_port}
-  listen: ::0
-  users:
-    user1: $(mihomo_yaml_string "$hy2_pass")
-  masquerade: ""
-  alpn:
-  - h3
-  certificate: $(mihomo_yaml_string "$hy2_cert")
-  private-key: $(mihomo_yaml_string "$hy2_key")
-
-EOF
+        mihomo_render_listener "hysteria2-in" "$hy2_port" "$hy2_pass" "$hy2_cert" "$hy2_key" >> "$MIHOMO_CONFIG_PATH" || return 1
     fi
 
     cat >> "$MIHOMO_CONFIG_PATH" <<EOF || return 1
 rules:
   - MATCH,DIRECT
 EOF
+}
+
+mihomo_cleanup_failed_install() {
+    systemctl disable --now "$MIHOMO_SERVICE_NAME" >/dev/null 2>&1 || true
+    rm -f "$MIHOMO_SERVICE_FILE" "$MIHOMO_EXEC_PATH" "$MIHOMO_CONFIG_PATH"
+    rmdir "$MIHOMO_CONFIG_DIR" 2>/dev/null || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
 }
 
 mihomo_install() {
@@ -4873,21 +7349,25 @@ mihomo_install() {
         return
     fi
 
+    local ARCH
+    if ! ARCH=$(mihomo_get_arch); then
+        mihomo_pause_and_return
+        return
+    fi
+
     mihomo_install_dependencies || {
         mihomo_pause_and_return
         return 1
     }
 
-    mkdir -p "$MIHOMO_CONFIG_DIR"
-
     clear
     echo -e "${BLUE}选择要启用的监听器:${PLAIN}"
     local enable_anytls enable_trojan enable_snell enable_tuic enable_hy2
-    read -r -p "$(echo -e "${BLUE}启用 Anytls?   [y/N]: ${PLAIN}")" enable_anytls || return 1
-    read -r -p "$(echo -e "${BLUE}启用 Trojan?   [y/N]: ${PLAIN}")" enable_trojan || return 1
-    read -r -p "$(echo -e "${BLUE}启用 Snellv5?  [y/N]: ${PLAIN}")" enable_snell || return 1
-    read -r -p "$(echo -e "${BLUE}启用 Tuicv5?   [y/N]: ${PLAIN}")" enable_tuic || return 1
-    read -r -p "$(echo -e "${BLUE}启用 Hysteria? [y/N]: ${PLAIN}")" enable_hy2 || return 1
+    read -r -p "${BLUE}启用 Anytls?   [y/N]: ${PLAIN}" enable_anytls || return 1
+    read -r -p "${BLUE}启用 Trojan?   [y/N]: ${PLAIN}" enable_trojan || return 1
+    read -r -p "${BLUE}启用 Snellv5?  [y/N]: ${PLAIN}" enable_snell || return 1
+    read -r -p "${BLUE}启用 Tuicv5?   [y/N]: ${PLAIN}" enable_tuic || return 1
+    read -r -p "${BLUE}启用 Hysteria? [y/N]: ${PLAIN}" enable_hy2 || return 1
     [[ "$enable_anytls" =~ ^[Yy]$ ]] && enable_anytls="y" || enable_anytls="n"
     [[ "$enable_trojan" =~ ^[Yy]$ ]] && enable_trojan="y" || enable_trojan="n"
     [[ "$enable_snell" =~ ^[Yy]$ ]] && enable_snell="y" || enable_snell="n"
@@ -4900,43 +7380,24 @@ mihomo_install() {
         return
     fi
 
-    local install_label ARCH result download_url target_version target_asset
-    install_label=$(mihomo_channel_label "release")
-    echo -e "${BLUE}[*] 下载 Mihomo ${install_label}...${PLAIN}"
-    
-    if ! ARCH=$(mihomo_get_arch); then
-        mihomo_pause_and_return
-        return
-    fi
-    if ! result=$(mihomo_get_download_info "$ARCH" "release"); then
-        echo -e "${RED}获取 Mihomo ${install_label}失败${PLAIN}"
-        mihomo_pause_and_return
-        return
-    fi
-    IFS='|' read -r download_url target_version target_asset <<< "$result"
-    
-    if ! mihomo_download_binary "$download_url"; then
-        mihomo_pause_and_return
-        return
-    fi
-
-    echo -e "${GREEN}内核安装完成: ${target_version}${PLAIN}"
     local random_summary=""
-    
+    local anytls_port="" anytls_pass="" anytls_cert="" anytls_key=""
+    local trojan_port="" trojan_pass="" trojan_cert="" trojan_key=""
+    local snell_port="" snell_pass="" snell_obfs="n" snell_obfs_host="icloud.com.cn"
+    local tuic_port="" tuic_uuid="" tuic_pass="" tuic_cert="" tuic_key=""
+    local hy2_port="" hy2_pass="" hy2_cert="" hy2_key=""
 
     if [[ "$enable_anytls" == "y" ]]; then
         clear
         echo -e "${BLUE}===== AnyTLS 配置 =====${PLAIN}"
-        local anytls_port anytls_pass anytls_cert anytls_key
-        read -r -p "$(echo -e "${BLUE}端口(默认:8443): ${PLAIN}")" anytls_port || return 1
+        read -r -p "${BLUE}端口(默认:8443): ${PLAIN}" anytls_port || return 1
         anytls_port=${anytls_port:-8443}
         if ! mihomo_validate_port "$anytls_port"; then
             echo -e "${RED}AnyTLS 端口无效${PLAIN}"
-            rm -f "$MIHOMO_EXEC_PATH"
             mihomo_pause_and_return
             return
         fi
-        read -r -p "$(echo -e "${BLUE}密码(回车随机): ${PLAIN}")" anytls_pass || return 1
+        read -r -p "${BLUE}密码(回车随机): ${PLAIN}" anytls_pass || return 1
         if [[ -z "$anytls_pass" ]]; then
             anytls_pass=$(mihomo_random_pass)
             [[ -n "$random_summary" ]] && random_summary+=$'\n'
@@ -4946,20 +7407,18 @@ mihomo_install() {
         anytls_cert="$mihomo_cert_path"
         anytls_key="$mihomo_key_path"
     fi
-    
+
     if [[ "$enable_trojan" == "y" ]]; then
         clear
         echo -e "${BLUE}===== Trojan 配置 =====${PLAIN}"
-        local trojan_port trojan_pass trojan_cert trojan_key
-        read -r -p "$(echo -e "${BLUE}端口(默认:10819): ${PLAIN}")" trojan_port || return 1
+        read -r -p "${BLUE}端口(默认:10819): ${PLAIN}" trojan_port || return 1
         trojan_port=${trojan_port:-10819}
         if ! mihomo_validate_port "$trojan_port"; then
             echo -e "${RED}Trojan 端口无效${PLAIN}"
-            rm -f "$MIHOMO_EXEC_PATH"
             mihomo_pause_and_return
             return
         fi
-        read -r -p "$(echo -e "${BLUE}密码(回车随机): ${PLAIN}")" trojan_pass || return 1
+        read -r -p "${BLUE}密码(回车随机): ${PLAIN}" trojan_pass || return 1
         if [[ -z "$trojan_pass" ]]; then
             trojan_pass=$(mihomo_random_pass)
             [[ -n "$random_summary" ]] && random_summary+=$'\n'
@@ -4973,25 +7432,23 @@ mihomo_install() {
     if [[ "$enable_snell" == "y" ]]; then
         clear
         echo -e "${BLUE}===== Snell v5 配置 =====${PLAIN}"
-        local snell_port snell_pass snell_obfs snell_obfs_host
-        read -r -p "$(echo -e "${BLUE}端口(默认:10815): ${PLAIN}")" snell_port || return 1
+        read -r -p "${BLUE}端口(默认:10815): ${PLAIN}" snell_port || return 1
         snell_port=${snell_port:-10815}
         if ! mihomo_validate_port "$snell_port"; then
             echo -e "${RED}Snell v5 端口无效${PLAIN}"
-            rm -f "$MIHOMO_EXEC_PATH"
             mihomo_pause_and_return
             return
         fi
-        read -r -p "$(echo -e "${BLUE}PSK(回车随机): ${PLAIN}")" snell_pass || return 1
+        read -r -p "${BLUE}PSK(回车随机): ${PLAIN}" snell_pass || return 1
         if [[ -z "$snell_pass" ]]; then
             snell_pass=$(mihomo_random_pass)
             [[ -n "$random_summary" ]] && random_summary+=$'\n'
             random_summary+="Snellv5 PSK: $snell_pass"
         fi
-        read -r -p "$(echo -e "${BLUE}启用 OBFS(http)? [y/N]: ${PLAIN}")" snell_obfs || return 1
-        if [[ "$snell_obfs" == "y" || "$snell_obfs" == "Y" ]]; then
+        read -r -p "${BLUE}启用 OBFS(http)? [y/N]: ${PLAIN}" snell_obfs || return 1
+        if [[ "$snell_obfs" =~ ^[Yy]$ ]]; then
             snell_obfs="y"
-            read -r -p "$(echo -e "${BLUE}OBFS Host(默认:icloud.com.cn): ${PLAIN}")" snell_obfs_host || return 1
+            read -r -p "${BLUE}OBFS Host(默认:icloud.com.cn): ${PLAIN}" snell_obfs_host || return 1
             snell_obfs_host=${snell_obfs_host:-icloud.com.cn}
         else
             snell_obfs="n"
@@ -5002,26 +7459,25 @@ mihomo_install() {
     if [[ "$enable_tuic" == "y" ]]; then
         clear
         echo -e "${BLUE}===== TUIC 配置 =====${PLAIN}"
-        local tuic_port tuic_uuid tuic_pass tuic_cert tuic_key
-        read -r -p "$(echo -e "${BLUE}端口(默认:28443): ${PLAIN}")" tuic_port || return 1
+        read -r -p "${BLUE}端口(默认:28443): ${PLAIN}" tuic_port || return 1
         tuic_port=${tuic_port:-28443}
         if ! mihomo_validate_port "$tuic_port"; then
             echo -e "${RED}TUIC 端口无效${PLAIN}"
-            rm -f "$MIHOMO_EXEC_PATH"
             mihomo_pause_and_return
             return
         fi
-        read -r -p "$(echo -e "${BLUE}UUID(回车随机): ${PLAIN}")" tuic_uuid || return 1
+        read -r -p "${BLUE}UUID(回车随机): ${PLAIN}" tuic_uuid || return 1
         if [[ -z "$tuic_uuid" ]]; then
             tuic_uuid=$(cat /proc/sys/kernel/random/uuid)
             [[ -n "$random_summary" ]] && random_summary+=$'\n'
             random_summary+="TUIC UUID: $tuic_uuid"
         fi
-        mihomo_validate_uuid "$tuic_uuid" || {
+        if ! mihomo_validate_uuid "$tuic_uuid"; then
             echo -e "${RED}TUIC UUID 格式无效${PLAIN}"
+            mihomo_pause_and_return
             return 1
-        }
-        read -r -p "$(echo -e "${BLUE}密码(回车随机): ${PLAIN}")" tuic_pass || return 1
+        fi
+        read -r -p "${BLUE}密码(回车随机): ${PLAIN}" tuic_pass || return 1
         if [[ -z "$tuic_pass" ]]; then
             tuic_pass=$(mihomo_random_pass)
             [[ -n "$random_summary" ]] && random_summary+=$'\n'
@@ -5035,16 +7491,14 @@ mihomo_install() {
     if [[ "$enable_hy2" == "y" ]]; then
         clear
         echo -e "${BLUE}===== Hysteria2 配置 =====${PLAIN}"
-        local hy2_port hy2_pass hy2_cert hy2_key
-        read -r -p "$(echo -e "${BLUE}端口(默认:18443): ${PLAIN}")" hy2_port || return 1
+        read -r -p "${BLUE}端口(默认:18443): ${PLAIN}" hy2_port || return 1
         hy2_port=${hy2_port:-18443}
         if ! mihomo_validate_port "$hy2_port"; then
             echo -e "${RED}Hysteria2 端口无效${PLAIN}"
-            rm -f "$MIHOMO_EXEC_PATH"
             mihomo_pause_and_return
             return
         fi
-        read -r -p "$(echo -e "${BLUE}密码(回车随机): ${PLAIN}")" hy2_pass || return 1
+        read -r -p "${BLUE}密码(回车随机): ${PLAIN}" hy2_pass || return 1
         if [[ -z "$hy2_pass" ]]; then
             hy2_pass=$(mihomo_random_pass)
             [[ -n "$random_summary" ]] && random_summary+=$'\n'
@@ -5055,29 +7509,50 @@ mihomo_install() {
         hy2_key="$mihomo_key_path"
     fi
 
+    local install_label result download_url target_version target_asset
+    install_label=$(mihomo_channel_label "release")
+    echo -e "${BLUE}[*] 下载 Mihomo ${install_label}...${PLAIN}"
+    if ! result=$(mihomo_get_download_info "$ARCH" "release"); then
+        echo -e "${RED}获取 Mihomo ${install_label}失败${PLAIN}"
+        mihomo_pause_and_return
+        return
+    fi
+    IFS='|' read -r download_url target_version target_asset <<< "$result"
+
+    if ! mihomo_download_binary "$download_url"; then
+        mihomo_pause_and_return
+        return
+    fi
+    echo -e "${GREEN}内核安装完成: ${target_version} (${target_asset})${PLAIN}"
+
     if [[ -n "$random_summary" ]]; then
         echo -e "${GREEN}随机凭据:${PLAIN}"
         echo -e "${GREEN}${random_summary}${PLAIN}"
     fi
 
+    mkdir -p "$MIHOMO_CONFIG_DIR"
     if ! mihomo_generate_config || ! mihomo_check_config || ! mihomo_create_systemd_service; then
         echo -e "${RED}配置检查或文件写入失败${PLAIN}"
+        mihomo_cleanup_failed_install
         mihomo_pause_and_return
         return 1
     fi
 
     if ! mihomo_reload_systemd; then
+        mihomo_cleanup_failed_install
         mihomo_pause_and_return
-        return
+        return 1
     fi
     if ! systemctl enable "$MIHOMO_SERVICE_NAME" >/dev/null 2>&1; then
         echo -e "${RED}Mihomo 设置开机自启失败${PLAIN}"
+        mihomo_cleanup_failed_install
         mihomo_pause_and_return
-        return
+        return 1
     fi
     if ! mihomo_start_checked "" "Mihomo 服务启动失败"; then
+        mihomo_cleanup_failed_install
         mihomo_pause_and_return
-        return
+        return 1
     fi
 
     echo -e "${GREEN}安装完成,服务已启动${PLAIN}"
@@ -5085,6 +7560,7 @@ mihomo_install() {
 }
 
 mihomo_manage_service() {
+    local opt
     while true; do
         clear
         echo -e "${BLUE}✦ Mihomo_Menu ✦${PLAIN}"
@@ -5093,7 +7569,7 @@ mihomo_manage_service() {
         echo -e "${GREEN}  3.${PLAIN}停止服务"
         echo -e "${GREEN}  4.${PLAIN}重启服务"
         echo -e "${GREEN}  0.${PLAIN}返回上级"
-        read -r -p "$(echo -e "${BLUE}✦ Steins Gate ✦ : ${PLAIN}")" opt || return 1
+        opt=$(read_menu_choice "✦ Steins Gate ✦ : ") || return 1
 
         case "$opt" in
             1)
@@ -5133,29 +7609,39 @@ mihomo_manage_service() {
     done
 }
 
+mihomo_read_listener_statuses() {
+    awk '
+        /^- name: anytls-in([[:space:]]|$)/    { a=1 }
+        /^- name: trojan-in([[:space:]]|$)/    { tr=1 }
+        /^- name: snellv5-in([[:space:]]|$)/   { s=1 }
+        /^- name: tuicv5-in([[:space:]]|$)/    { tu=1 }
+        /^- name: hysteria2-in([[:space:]]|$)/ { h=1 }
+        END {
+            print (a  ? "已启用" : "未启用")
+            print (tr ? "已启用" : "未启用")
+            print (s  ? "已启用" : "未启用")
+            print (tu ? "已启用" : "未启用")
+            print (h  ? "已启用" : "未启用")
+        }
+    ' "$MIHOMO_CONFIG_PATH" 2>/dev/null
+}
+
 mihomo_modify_config() {
+    local opt
+    local -a statuses
     while true; do
-        local anytls_status="未启用"
-        local trojan_status="未启用"
-        local hy2_status="未启用"
-        local tuic_status="未启用"
-        local snell_status="未启用"
-        grep -q "name: anytls-in" "$MIHOMO_CONFIG_PATH" && anytls_status="已启用"
-        grep -q "name: trojan-in" "$MIHOMO_CONFIG_PATH" && trojan_status="已启用"
-        grep -q "name: snellv5-in" "$MIHOMO_CONFIG_PATH" && snell_status="已启用"
-        grep -q "name: tuicv5-in" "$MIHOMO_CONFIG_PATH" && tuic_status="已启用"
-        grep -q "name: hysteria2-in" "$MIHOMO_CONFIG_PATH" && hy2_status="已启用"
-        
+        mapfile -t statuses < <(mihomo_read_listener_statuses)
+
         clear
         echo -e "${BLUE}✦ Modify_Conf ✦${PLAIN}"
-        echo -e "${GREEN}  1.${PLAIN}Anytls  [${YELLOW}${anytls_status}${PLAIN}]"
-        echo -e "${GREEN}  2.${PLAIN}Trojan  [${YELLOW}${trojan_status}${PLAIN}]"
-        echo -e "${GREEN}  3.${PLAIN}Snellv5 [${YELLOW}${snell_status}${PLAIN}]"
-        echo -e "${GREEN}  4.${PLAIN}Tuicv5  [${YELLOW}${tuic_status}${PLAIN}]"
-        echo -e "${GREEN}  5.${PLAIN}Hysteria[${YELLOW}${hy2_status}${PLAIN}]"
+        echo -e "${GREEN}  1.${PLAIN}Anytls  [${YELLOW}${statuses[0]:-未启用}${PLAIN}]"
+        echo -e "${GREEN}  2.${PLAIN}Trojan  [${YELLOW}${statuses[1]:-未启用}${PLAIN}]"
+        echo -e "${GREEN}  3.${PLAIN}Snellv5 [${YELLOW}${statuses[2]:-未启用}${PLAIN}]"
+        echo -e "${GREEN}  4.${PLAIN}Tuicv5  [${YELLOW}${statuses[3]:-未启用}${PLAIN}]"
+        echo -e "${GREEN}  5.${PLAIN}Hysteria[${YELLOW}${statuses[4]:-未启用}${PLAIN}]"
         echo -e "${GREEN}  0.${PLAIN}Return"
-        read -r -p "$(echo -e "${BLUE}✦ Steins Gate ✦ : ${PLAIN}")" opt || return 1
-        
+        opt=$(read_menu_choice "✦ Steins Gate ✦ : ") || return 1
+
         case "$opt" in
             1) mihomo_toggle_or_modify_listener "anytls-in" "AnyTLS" "8443" ;;
             2) mihomo_toggle_or_modify_listener "trojan-in" "Trojan" "10819" ;;
@@ -5172,11 +7658,12 @@ mihomo_toggle_or_modify_listener() {
     local name="$1"
     local display_name="$2"
     local default_port="$3"
-    
+    local opt enable
+
     while true; do
         local is_enabled="n"
         grep -q "name: $name" "$MIHOMO_CONFIG_PATH" && is_enabled="y"
-        
+
         clear
         echo -e "${BLUE}✦ ${display_name}_Conf ✦${PLAIN}"
         if [[ "$is_enabled" == "y" ]]; then
@@ -5186,7 +7673,7 @@ mihomo_toggle_or_modify_listener() {
                 echo -e "${GREEN}  3.${PLAIN}切换OBFS"
                 echo -e "${GREEN}  4.${PLAIN}禁用服务"
                 echo -e "${GREEN}  0.${PLAIN}返回上级"
-                read -r -p "$(echo -e "${BLUE}✦ Steins Gate ✦ : ${PLAIN}")" opt || return 1
+                opt=$(read_menu_choice "✦ Steins Gate ✦ : ") || return 1
 
                 case "$opt" in
                     1) mihomo_modify_listener_port "$name" ;;
@@ -5202,8 +7689,8 @@ mihomo_toggle_or_modify_listener() {
                 echo -e "${GREEN}  3.${PLAIN}修改证书"
                 echo -e "${GREEN}  4.${PLAIN}禁用服务"
                 echo -e "${GREEN}  0.${PLAIN}返回上级"
-                read -r -p "$(echo -e "${BLUE}✦ Steins Gate ✦ : ${PLAIN}")" opt || return 1
-                
+                opt=$(read_menu_choice "✦ Steins Gate ✦ : ") || return 1
+
                 case "$opt" in
                     1) mihomo_modify_listener_port "$name" ;;
                     2) mihomo_modify_listener_pass "$name" ;;
@@ -5215,8 +7702,8 @@ mihomo_toggle_or_modify_listener() {
             fi
         else
             echo -e "${YELLOW}  当前未启用${PLAIN}"
-            read -r -p "$(echo -e "${BLUE}是否启用? [y/N]: ${PLAIN}")" enable || return 1
-            if [[ "$enable" == "y" || "$enable" == "Y" ]]; then
+            read -r -p "${BLUE}是否启用? [y/N]: ${PLAIN}" enable || return 1
+            if [[ "$enable" =~ ^[Yy]$ ]]; then
                 mihomo_add_listener "$name" "$display_name" "$default_port"
             else
                 break
@@ -5229,34 +7716,36 @@ mihomo_add_listener() {
     local name="$1"
     local display_name="$2"
     local default_port="$3"
-    
+    local port pass
+
     clear
     echo -e "${BLUE}===== 添加 ${display_name} =====${PLAIN}"
-    read -r -p "$(echo -e "${BLUE}端口(默认:${default_port}): ${PLAIN}")" port || return 1
+    read -r -p "${BLUE}端口(默认:${default_port}): ${PLAIN}" port || return 1
     port=${port:-$default_port}
     if ! mihomo_validate_port "$port"; then
         echo -e "${RED}端口无效${PLAIN}"
         sleep 1
         return 1
     fi
-    
+
     local uuid="" uuid_random="n" pass_random="n" snell_obfs="n" snell_obfs_host="icloud.com.cn"
     if [[ "$name" == "tuicv5-in" ]]; then
-        read -r -p "$(echo -e "${BLUE}UUID(回车随机): ${PLAIN}")" uuid || return 1
+        read -r -p "${BLUE}UUID(回车随机): ${PLAIN}" uuid || return 1
         if [[ -z "$uuid" ]]; then
             uuid=$(cat /proc/sys/kernel/random/uuid)
             uuid_random="y"
         fi
         mihomo_validate_uuid "$uuid" || {
             echo -e "${RED}TUIC UUID 格式无效${PLAIN}"
+            sleep 1
             return 1
         }
     fi
-    
+
     if [[ "$name" == "snellv5-in" ]]; then
-        read -r -p "$(echo -e "${BLUE}PSK(回车随机): ${PLAIN}")" pass || return 1
+        read -r -p "${BLUE}PSK(回车随机): ${PLAIN}" pass || return 1
     else
-        read -r -p "$(echo -e "${BLUE}密码(回车随机): ${PLAIN}")" pass || return 1
+        read -r -p "${BLUE}密码(回车随机): ${PLAIN}" pass || return 1
     fi
     if [[ -z "$pass" ]]; then
         pass=$(mihomo_random_pass)
@@ -5264,17 +7753,17 @@ mihomo_add_listener() {
     fi
 
     if [[ "$name" == "snellv5-in" ]]; then
-        read -r -p "$(echo -e "${BLUE}启用 OBFS(http)? [y/N]: ${PLAIN}")" snell_obfs || return 1
-        if [[ "$snell_obfs" == "y" || "$snell_obfs" == "Y" ]]; then
+        read -r -p "${BLUE}启用 OBFS(http)? [y/N]: ${PLAIN}" snell_obfs || return 1
+        if [[ "$snell_obfs" =~ ^[Yy]$ ]]; then
             snell_obfs="y"
-            read -r -p "$(echo -e "${BLUE}OBFS Host(默认:icloud.com.cn): ${PLAIN}")" snell_obfs_host || return 1
+            read -r -p "${BLUE}OBFS Host(默认:icloud.com.cn): ${PLAIN}" snell_obfs_host || return 1
             snell_obfs_host=${snell_obfs_host:-icloud.com.cn}
         else
             snell_obfs="n"
             snell_obfs_host="icloud.com.cn"
         fi
     fi
-    
+
     if [[ "$name" != "snellv5-in" ]]; then
         mihomo_select_cert || return 1
         [[ "$uuid_random" == "y" ]] && echo -e "${GREEN}UUID: $uuid${PLAIN}"
@@ -5282,8 +7771,8 @@ mihomo_add_listener() {
     else
         [[ "$pass_random" == "y" ]] && echo -e "${GREEN}PSK: $pass${PLAIN}"
     fi
-    
-    local tmp_config backup
+
+    local tmp_config backup render_ok=0
     tmp_config=$(mktemp) || {
         echo -e "${RED}创建临时配置失败${PLAIN}"
         sleep 1
@@ -5296,103 +7785,22 @@ mihomo_add_listener() {
         return 1
     }
     case "$name" in
-        anytls-in)
-            cat > "$tmp_config" <<LISTENER || { rm -f "$tmp_config" "$backup"; return 1; }
-- name: anytls-in
-  type: anytls
-  port: ${port}
-  listen: ::0
-  users:
-    username1: $(mihomo_yaml_string "$pass")
-  certificate: $(mihomo_yaml_string "$mihomo_cert_path")
-  private-key: $(mihomo_yaml_string "$mihomo_key_path")
-  padding-scheme: |
-   stop=8
-   0=30-30
-   1=100-400
-   2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000
-   3=9-9,500-1000
-   4=500-1000
-   5=500-1000
-   6=500-1000
-   7=500-1000
-
-LISTENER
-            ;;
-        trojan-in)
-            cat > "$tmp_config" <<LISTENER || { rm -f "$tmp_config" "$backup"; return 1; }
-- name: trojan-in
-  type: trojan
-  port: ${port}
-  listen: ::0
-  users:
-    - username: 1
-      password: $(mihomo_yaml_string "$pass")
-  ws-path: "/"
-  certificate: $(mihomo_yaml_string "$mihomo_cert_path")
-  private-key: $(mihomo_yaml_string "$mihomo_key_path")
-
-LISTENER
-            ;;
         snellv5-in)
-            cat > "$tmp_config" <<LISTENER || { rm -f "$tmp_config" "$backup"; return 1; }
-- name: snellv5-in
-  type: snell
-  port: ${port}
-  listen: ::0
-  psk: $(mihomo_yaml_string "$pass")
-  version: 5
-  udp: true
-LISTENER
-            if [[ "$snell_obfs" == "y" ]]; then
-                cat >> "$tmp_config" <<LISTENER || { rm -f "$tmp_config" "$backup"; return 1; }
-  obfs-opts:
-    mode: http
-    host: $(mihomo_yaml_string "$snell_obfs_host")
-LISTENER
-            fi
-            cat >> "$tmp_config" <<LISTENER || { rm -f "$tmp_config" "$backup"; return 1; }
-
-LISTENER
+            mihomo_render_listener "$name" "$port" "$pass" "" "" "$snell_obfs" "$snell_obfs_host" > "$tmp_config" && render_ok=1
             ;;
         tuicv5-in)
-            cat > "$tmp_config" <<LISTENER || { rm -f "$tmp_config" "$backup"; return 1; }
-- name: tuicv5-in
-  type: tuic
-  port: ${port}
-  listen: ::0
-  users:
-    ${uuid}: $(mihomo_yaml_string "$pass")
-  certificate: $(mihomo_yaml_string "$mihomo_cert_path")
-  private-key: $(mihomo_yaml_string "$mihomo_key_path")
-  congestion-controller: bbr
-  max-idle-time: 15000
-  authentication-timeout: 3000
-  alpn:
-    - h3
-  max-udp-relay-packet-size: 1408
-
-LISTENER
+            mihomo_render_listener "$name" "$port" "$pass" "$mihomo_cert_path" "$mihomo_key_path" "$uuid" > "$tmp_config" && render_ok=1
             ;;
-        hysteria2-in)
-            cat > "$tmp_config" <<LISTENER || { rm -f "$tmp_config" "$backup"; return 1; }
-- name: hysteria2-in
-  type: hysteria2
-  port: ${port}
-  listen: ::0
-  users:
-    user1: $(mihomo_yaml_string "$pass")
-  masquerade: ""
-  alpn:
-  - h3
-  certificate: $(mihomo_yaml_string "$mihomo_cert_path")
-  private-key: $(mihomo_yaml_string "$mihomo_key_path")
-
-LISTENER
+        *)
+            mihomo_render_listener "$name" "$port" "$pass" "$mihomo_cert_path" "$mihomo_key_path" > "$tmp_config" && render_ok=1
             ;;
     esac
+    if (( render_ok == 0 )); then
+        rm -f "$tmp_config" "$backup"
+        return 1
+    fi
     
-    awk -v tmpfile="$tmp_config" '
+    if ! awk -v tmpfile="$tmp_config" '
         BEGIN {inserted=0}
         /^rules:/ && !inserted {
             while ((getline line < tmpfile) > 0) print line
@@ -5406,12 +7814,10 @@ LISTENER
                 close(tmpfile)
             }
         }
-    ' "$MIHOMO_CONFIG_PATH" > "${MIHOMO_CONFIG_PATH}.tmp" && mv "${MIHOMO_CONFIG_PATH}.tmp" "$MIHOMO_CONFIG_PATH" || {
-        echo -e "${RED}配置写入失败${PLAIN}"
-        rm -f "$tmp_config" "${MIHOMO_CONFIG_PATH}.tmp" "$backup"
-        sleep 1
+    ' "$MIHOMO_CONFIG_PATH" > "${MIHOMO_CONFIG_PATH}.tmp" || ! mihomo_commit_tmp_config "${MIHOMO_CONFIG_PATH}.tmp" "$backup"; then
+        rm -f "$tmp_config"
         return 1
-    }
+    fi
 
     rm -f "$tmp_config"
 
@@ -5421,7 +7827,7 @@ LISTENER
 
 mihomo_snell_obfs_enabled() {
     awk '
-        /^- name: /{block=($0 ~ "snellv5-in")}
+        /^- name: /{block=($0 == "- name: snellv5-in")}
         block && /^  obfs-opts:/{found=1}
         END {exit found ? 0 : 1}
     ' "$MIHOMO_CONFIG_PATH"
@@ -5432,7 +7838,7 @@ mihomo_toggle_snell_obfs() {
 
     if mihomo_snell_obfs_enabled; then
         echo -e "${BLUE}当前OBFS: 开启${PLAIN}"
-        read -r -p "$(echo -e "${RED}确定关闭 Snell OBFS? [y/N]: ${PLAIN}")" confirm
+        read -r -p "${RED}确定关闭 Snell OBFS? [y/N]: ${PLAIN}" confirm
         if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
             return
         fi
@@ -5443,16 +7849,12 @@ mihomo_toggle_snell_obfs() {
             return 1
         }
         awk '
-            /^- name: /{block=($0 ~ "snellv5-in"); skip=0}
+            /^- name: /{block=($0 == "- name: snellv5-in"); skip=0}
             block && /^  obfs-opts:/{skip=1; next}
             block && skip && /^    /{next}
             {skip=0; print}
-        ' "$MIHOMO_CONFIG_PATH" > "${MIHOMO_CONFIG_PATH}.tmp" && mv "${MIHOMO_CONFIG_PATH}.tmp" "$MIHOMO_CONFIG_PATH" || {
-            echo -e "${RED}配置写入失败${PLAIN}"
-            rm -f "${MIHOMO_CONFIG_PATH}.tmp" "$backup"
-            sleep 1
-            return 1
-        }
+        ' "$MIHOMO_CONFIG_PATH" > "${MIHOMO_CONFIG_PATH}.tmp" &&
+            mihomo_commit_tmp_config "${MIHOMO_CONFIG_PATH}.tmp" "$backup" || return 1
 
         mihomo_restart_with_rollback "$backup" "OBFS 已关闭" "OBFS 已移除,但服务重启失败"
         sleep 1
@@ -5460,7 +7862,7 @@ mihomo_toggle_snell_obfs() {
     fi
 
     echo -e "${BLUE}当前OBFS: 关闭${PLAIN}"
-    read -r -p "$(echo -e "${BLUE}OBFS Host(默认:icloud.com.cn): ${PLAIN}")" host
+    read -r -p "${BLUE}OBFS Host(默认:icloud.com.cn): ${PLAIN}" host
     host=${host:-icloud.com.cn}
 
     backup=$(mihomo_make_config_backup) || {
@@ -5470,7 +7872,7 @@ mihomo_toggle_snell_obfs() {
     }
     ZERO_MIHOMO_HOST="$(mihomo_yaml_string "$host")" awk '
         BEGIN {host=ENVIRON["ZERO_MIHOMO_HOST"]}
-        /^- name: /{block=($0 ~ "snellv5-in")}
+        /^- name: /{block=($0 == "- name: snellv5-in")}
         {print}
         block && /^  udp:/ && !inserted {
             print "  obfs-opts:"
@@ -5478,12 +7880,8 @@ mihomo_toggle_snell_obfs() {
             print "    host: " host
             inserted=1
         }
-    ' "$MIHOMO_CONFIG_PATH" > "${MIHOMO_CONFIG_PATH}.tmp" && mv "${MIHOMO_CONFIG_PATH}.tmp" "$MIHOMO_CONFIG_PATH" || {
-        echo -e "${RED}配置写入失败${PLAIN}"
-        rm -f "${MIHOMO_CONFIG_PATH}.tmp" "$backup"
-        sleep 1
-        return 1
-    }
+    ' "$MIHOMO_CONFIG_PATH" > "${MIHOMO_CONFIG_PATH}.tmp" &&
+        mihomo_commit_tmp_config "${MIHOMO_CONFIG_PATH}.tmp" "$backup" || return 1
 
     mihomo_restart_with_rollback "$backup" "OBFS 已开启" "OBFS 已写入,但服务重启失败"
     sleep 1
@@ -5492,8 +7890,9 @@ mihomo_toggle_snell_obfs() {
 mihomo_disable_listener() {
     local name="$1"
     local display_name="$2"
-    
-    read -r -p "$(echo -e "${RED}确定禁用 ${display_name}? [y/N]: ${PLAIN}")" confirm
+    local confirm
+
+    read -r -p "${RED}确定禁用 ${display_name}? [y/N]: ${PLAIN}" confirm
     if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
         local backup
         backup=$(mihomo_make_config_backup) || {
@@ -5501,31 +7900,26 @@ mihomo_disable_listener() {
             sleep 1
             return 1
         }
-        awk -v name="$name" '
+        awk -v target="- name: $name" '
             BEGIN {skip=0}
             /^- name: /{
-                if ($0 ~ name) {skip=1; next}
+                if ($0 == target) {skip=1; next}
                 else {skip=0}
             }
-            skip && /^- name: /{skip=0}
             skip && /^rules:/{skip=0; print; next}
             skip && /^[^ -]/{skip=0}
             !skip {print}
-        ' "$MIHOMO_CONFIG_PATH" > "${MIHOMO_CONFIG_PATH}.tmp" && mv "${MIHOMO_CONFIG_PATH}.tmp" "$MIHOMO_CONFIG_PATH" || {
-            echo -e "${RED}配置写入失败${PLAIN}"
-            rm -f "${MIHOMO_CONFIG_PATH}.tmp" "$backup"
-            sleep 1
-            return 1
-        }
+        ' "$MIHOMO_CONFIG_PATH" > "${MIHOMO_CONFIG_PATH}.tmp" &&
+            mihomo_commit_tmp_config "${MIHOMO_CONFIG_PATH}.tmp" "$backup" || return 1
 
         mihomo_restart_with_rollback "$backup" "${display_name} 已禁用" "${display_name} 已移除,但服务重启失败"
+        sleep 1
     fi
-    sleep 1
 }
 
 mihomo_modify_listener_port() {
-    local name="$1"
-    read -r -p "$(echo -e "${BLUE}新端口: ${PLAIN}")" new_port
+    local name="$1" new_port
+    read -r -p "${BLUE}新端口: ${PLAIN}" new_port
     if mihomo_validate_port "$new_port"; then
         local backup
         backup=$(mihomo_make_config_backup) || {
@@ -5533,16 +7927,12 @@ mihomo_modify_listener_port() {
             sleep 1
             return 1
         }
-        awk -v name="$name" -v port="$new_port" '
-            /^- name: /{found=($0 ~ name)}
+        awk -v target="- name: $name" -v port="$new_port" '
+            /^- name: /{found=($0 == target)}
             found && /^  port:/{$0="  port: "port; found=0}
             {print}
-        ' "$MIHOMO_CONFIG_PATH" > "${MIHOMO_CONFIG_PATH}.tmp" && mv "${MIHOMO_CONFIG_PATH}.tmp" "$MIHOMO_CONFIG_PATH" || {
-            echo -e "${RED}配置写入失败${PLAIN}"
-            rm -f "${MIHOMO_CONFIG_PATH}.tmp" "$backup"
-            sleep 1
-            return 1
-        }
+        ' "$MIHOMO_CONFIG_PATH" > "${MIHOMO_CONFIG_PATH}.tmp" &&
+            mihomo_commit_tmp_config "${MIHOMO_CONFIG_PATH}.tmp" "$backup" || return 1
         mihomo_restart_with_rollback "$backup" "已更新" "端口已写入,但服务重启失败"
     else
         echo -e "${RED}端口无效${PLAIN}"
@@ -5551,7 +7941,7 @@ mihomo_modify_listener_port() {
 }
 
 mihomo_modify_listener_pass() {
-    local name="$1"
+    local name="$1" new_pass
     local prompt_label="新密码"
     local failure_msg="密码已写入,但服务重启失败"
     if [[ "$name" == "snellv5-in" ]]; then
@@ -5559,7 +7949,7 @@ mihomo_modify_listener_pass() {
         failure_msg="PSK已写入,但服务重启失败"
     fi
 
-    read -r -p "$(echo -e "${BLUE}${prompt_label}: ${PLAIN}")" new_pass
+    read -r -p "${BLUE}${prompt_label}: ${PLAIN}" new_pass
     if [[ -n "$new_pass" ]]; then
         local backup
         backup=$(mihomo_make_config_backup) || {
@@ -5567,82 +7957,26 @@ mihomo_modify_listener_pass() {
             sleep 1
             return 1
         }
-        case "$name" in
-            anytls-in)
-                ZERO_MIHOMO_PASSWORD="$(mihomo_yaml_string "$new_pass")" awk '
-                    BEGIN {pass=ENVIRON["ZERO_MIHOMO_PASSWORD"]}
-                    /^- name: anytls-in/{found=1}
-                    found && /username1:/{$0="    username1: "pass; found=0}
-                    {print}
-                ' "$MIHOMO_CONFIG_PATH" > "${MIHOMO_CONFIG_PATH}.tmp" && mv "${MIHOMO_CONFIG_PATH}.tmp" "$MIHOMO_CONFIG_PATH" || {
-                    echo -e "${RED}配置写入失败${PLAIN}"
-                    rm -f "${MIHOMO_CONFIG_PATH}.tmp" "$backup"
-                    sleep 1
-                    return 1
-                }
-                ;;
-            trojan-in)
-                ZERO_MIHOMO_PASSWORD="$(mihomo_yaml_string "$new_pass")" awk '
-                    BEGIN {pass=ENVIRON["ZERO_MIHOMO_PASSWORD"]}
-                    /^- name: trojan-in/{found=1}
-                    found && /password:/{$0="      password: "pass; found=0}
-                    {print}
-                ' "$MIHOMO_CONFIG_PATH" > "${MIHOMO_CONFIG_PATH}.tmp" && mv "${MIHOMO_CONFIG_PATH}.tmp" "$MIHOMO_CONFIG_PATH" || {
-                    echo -e "${RED}配置写入失败${PLAIN}"
-                    rm -f "${MIHOMO_CONFIG_PATH}.tmp" "$backup"
-                    sleep 1
-                    return 1
-                }
-                ;;
-            hysteria2-in)
-                ZERO_MIHOMO_PASSWORD="$(mihomo_yaml_string "$new_pass")" awk '
-                    BEGIN {pass=ENVIRON["ZERO_MIHOMO_PASSWORD"]}
-                    /^- name: hysteria2-in/{found=1}
-                    found && /user1:/{$0="    user1: "pass; found=0}
-                    {print}
-                ' "$MIHOMO_CONFIG_PATH" > "${MIHOMO_CONFIG_PATH}.tmp" && mv "${MIHOMO_CONFIG_PATH}.tmp" "$MIHOMO_CONFIG_PATH" || {
-                    echo -e "${RED}配置写入失败${PLAIN}"
-                    rm -f "${MIHOMO_CONFIG_PATH}.tmp" "$backup"
-                    sleep 1
-                    return 1
-                }
-                ;;
-            tuicv5-in)
-                ZERO_MIHOMO_PASSWORD="$(mihomo_yaml_string "$new_pass")" awk '
-                    BEGIN {pass=ENVIRON["ZERO_MIHOMO_PASSWORD"]}
-                    /^- name: tuicv5-in/{found=1}
-                    found && /^    [A-Fa-f0-9-]+:/{
-                        split($0, arr, ":")
-                        uuid = arr[1]
-                        gsub(/^[[:space:]]+/, "", uuid)
-                        $0 = "    " uuid ": " pass
-                        found=0
-                    }
-                    {print}
-                ' "$MIHOMO_CONFIG_PATH" > "${MIHOMO_CONFIG_PATH}.tmp" && mv "${MIHOMO_CONFIG_PATH}.tmp" "$MIHOMO_CONFIG_PATH" || {
-                    echo -e "${RED}配置写入失败${PLAIN}"
-                    rm -f "${MIHOMO_CONFIG_PATH}.tmp" "$backup"
-                    sleep 1
-                    return 1
-                }            
-                ;;
-            snellv5-in)
-                ZERO_MIHOMO_PASSWORD="$(mihomo_yaml_string "$new_pass")" awk '
-                    BEGIN {pass=ENVIRON["ZERO_MIHOMO_PASSWORD"]}
-                    /^- name: snellv5-in/{found=1}
-                    found && /^  psk:/{$0="  psk: "pass; found=0}
-                    {print}
-                ' "$MIHOMO_CONFIG_PATH" > "${MIHOMO_CONFIG_PATH}.tmp" && mv "${MIHOMO_CONFIG_PATH}.tmp" "$MIHOMO_CONFIG_PATH" || {
-                    echo -e "${RED}配置写入失败${PLAIN}"
-                    rm -f "${MIHOMO_CONFIG_PATH}.tmp" "$backup"
-                    sleep 1
-                    return 1
-                }
-                ;;
-        esac
+        ZERO_MIHOMO_PASSWORD="$(mihomo_yaml_string "$new_pass")" awk -v name="$name" -v target="- name: $name" '
+            BEGIN {pass=ENVIRON["ZERO_MIHOMO_PASSWORD"]}
+            /^- name: /{found=($0 == target)}
+            found && name == "anytls-in"    && /^    username1:/{$0="    username1: "pass; found=0}
+            found && name == "trojan-in"    && /^      password:/{$0="      password: "pass; found=0}
+            found && name == "hysteria2-in" && /^    user1:/{$0="    user1: "pass; found=0}
+            found && name == "snellv5-in"   && /^  psk:/{$0="  psk: "pass; found=0}
+            found && name == "tuicv5-in"    && /^    [A-Fa-f0-9-]+:/{
+                split($0, arr, ":")
+                uuid = arr[1]
+                gsub(/^[[:space:]]+/, "", uuid)
+                $0 = "    " uuid ": " pass
+                found=0
+            }
+            {print}
+        ' "$MIHOMO_CONFIG_PATH" > "${MIHOMO_CONFIG_PATH}.tmp" &&
+            mihomo_commit_tmp_config "${MIHOMO_CONFIG_PATH}.tmp" "$backup" || return 1
         mihomo_restart_with_rollback "$backup" "已更新" "$failure_msg"
+        sleep 1
     fi
-    sleep 1
 }
 
 mihomo_modify_listener_cert() {
@@ -5655,18 +7989,14 @@ mihomo_modify_listener_cert() {
         return 1
     }
     ZERO_MIHOMO_CERT="$(mihomo_yaml_string "$mihomo_cert_path")" \
-    ZERO_MIHOMO_KEY="$(mihomo_yaml_string "$mihomo_key_path")" awk -v name="$name" '
+    ZERO_MIHOMO_KEY="$(mihomo_yaml_string "$mihomo_key_path")" awk -v target="- name: $name" '
         BEGIN {cert=ENVIRON["ZERO_MIHOMO_CERT"]; key=ENVIRON["ZERO_MIHOMO_KEY"]}
-        /^- name: /{block=($0 ~ name)}
-        block && /certificate:/{$0="  certificate: "cert}
-        block && /private-key:/{$0="  private-key: "key; block=0}
+        /^- name: /{block=($0 == target)}
+        block && /^  certificate:/{$0="  certificate: "cert}
+        block && /^  private-key:/{$0="  private-key: "key; block=0}
         {print}
-    ' "$MIHOMO_CONFIG_PATH" > "${MIHOMO_CONFIG_PATH}.tmp" && mv "${MIHOMO_CONFIG_PATH}.tmp" "$MIHOMO_CONFIG_PATH" || {
-        echo -e "${RED}配置写入失败${PLAIN}"
-        rm -f "${MIHOMO_CONFIG_PATH}.tmp" "$backup"
-        sleep 1
-        return 1
-    }
+    ' "$MIHOMO_CONFIG_PATH" > "${MIHOMO_CONFIG_PATH}.tmp" &&
+        mihomo_commit_tmp_config "${MIHOMO_CONFIG_PATH}.tmp" "$backup" || return 1
     mihomo_restart_with_rollback "$backup" "已更新" "证书已写入,但服务重启失败"
     sleep 1
 }
@@ -5711,7 +8041,7 @@ mihomo_update_channel() {
         return
     fi
 
-    read -r -p "$(echo -e "${BLUE}是否更新到 Mihomo ${channel_label}? [y/N]: ${PLAIN}")" confirm
+    read -r -p "${BLUE}是否更新到 Mihomo ${channel_label}? [y/N]: ${PLAIN}" confirm
     if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
         return
     fi
@@ -5770,7 +8100,7 @@ mihomo_update() {
         echo -e "${GREEN}  1.${PLAIN}更新测试版"
         echo -e "${GREEN}  2.${PLAIN}更新正式版"
         echo -e "${GREEN}  0.${PLAIN}返回上级"
-        read -r -p "$(echo -e "${BLUE}✦ Steins Gate ✦ : ${PLAIN}")" option || return 1
+        option=$(read_menu_choice "✦ Steins Gate ✦ : ") || return 1
 
         case "$option" in
             1) mihomo_update_channel "alpha" ;;
@@ -5782,8 +8112,9 @@ mihomo_update() {
 }
 
 mihomo_delete() {
+    local confirm
     clear
-    read -r -p "$(echo -e "${RED}确定删除? [y/N]: ${PLAIN}")" confirm
+    read -r -p "${RED}确定删除? [y/N]: ${PLAIN}" confirm
     if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
         systemctl stop "$MIHOMO_SERVICE_NAME" 2>/dev/null || true
         systemctl disable "$MIHOMO_SERVICE_NAME" 2>/dev/null || true
@@ -5806,7 +8137,7 @@ mihomo_menu() {
         echo -e "${GREEN}  3.${PLAIN}更新内核"
         echo -e "${GREEN}  4.${PLAIN}删除服务"
         echo -e "${GREEN}  0.${PLAIN}返回主页"
-        read -r -p "$(echo -e "${BLUE}✦ Steins Gate ✦ : ${PLAIN}")" option || return 1
+        option=$(read_menu_choice "✦ Steins Gate ✦ : ") || return 1
 
         case "$option" in
             1) mihomo_install ;;
@@ -5877,14 +8208,10 @@ singbox_atomic_install() {
 }
 
 singbox_get_arch() {
-    case "$(uname -m)" in
-        x86_64|amd64) echo "amd64" ;;
-        aarch64|arm64) echo "arm64" ;;
-        *)
-            echo -e "${RED}Sing-box 暂不支持当前架构: $(uname -m)${PLAIN}" >&2
-            return 1
-            ;;
-    esac
+    zero_get_arch || {
+        echo -e "${RED}Sing-box 暂不支持当前架构: $(uname -m)${PLAIN}" >&2
+        return 1
+    }
 }
 
 singbox_install_dependencies() {
@@ -6046,8 +8373,9 @@ singbox_prepare_release() {
     }
 
     asset_name="sing-box-${version}-linux-${arch}.tar.gz"
-    url=$(printf '%s' "$release_json" | jq -r --arg name "$asset_name" '.assets[] | select(.name == $name) | .browser_download_url' | head -n1)
-    digest=$(printf '%s' "$release_json" | jq -r --arg name "$asset_name" '.assets[] | select(.name == $name) | (.digest // empty)' | head -n1)
+    IFS=$'\t' read -r url digest < <(
+        jq -r --arg name "$asset_name" '([.assets[]? | select(.name == $name)][0] // {}) | [(.browser_download_url // ""), (.digest // "")] | @tsv' <<<"$release_json"
+    )
     digest="${digest#sha256:}"
     digest=$(printf '%s' "$digest" | tr '[:upper:]' '[:lower:]')
 
@@ -6145,8 +8473,8 @@ singbox_select_cert() {
         opt=$(read_menu_choice "输入选项: ") || return 1
 
         if [[ "$opt" == "0" ]]; then
-            read -r -p "$(echo -e "${BLUE}证书路径: ${PLAIN}")" cert_path || return 1
-            read -r -p "$(echo -e "${BLUE}私钥路径: ${PLAIN}")" key_path || return 1
+            read -r -p "${BLUE}证书路径: ${PLAIN}" cert_path || return 1
+            read -r -p "${BLUE}私钥路径: ${PLAIN}" key_path || return 1
         elif valid_list_index "$opt" "${#cert_files[@]}"; then
             cert_path="${cert_files[$((opt-1))]}"
             key_path="${cert_path%.crt}.key"
@@ -6230,13 +8558,7 @@ singbox_config_uses_port() {
 
 singbox_port_is_listening() {
     local port="$1"
-    ss -H -lntu 2>/dev/null | awk -v port="$port" '
-        {
-            address=$5
-            if (address ~ (":" port "$")) found=1
-        }
-        END {exit found ? 0 : 1}
-    '
+    ss -H -lntu "sport = :$port" 2>/dev/null | grep -q .
 }
 
 singbox_port_available() {
@@ -6267,7 +8589,7 @@ singbox_prompt_port() {
     local port
 
     while true; do
-        read -r -p "$(echo -e "${BLUE}${label}端口(默认:${default_port}): ${PLAIN}")" port || return 1
+        read -r -p "${BLUE}${label}端口(默认:${default_port}): ${PLAIN}" port || return 1
         port=$(trim_input "$port")
         port="${port:-$default_port}"
         if ! singbox_validate_port "$port"; then
@@ -6289,7 +8611,7 @@ singbox_prompt_ws_path() {
     local default_path="${1:-/}" path
 
     while true; do
-        read -r -p "$(echo -e "${BLUE}WebSocket 路径(默认:${default_path}): ${PLAIN}")" path || return 1
+        read -r -p "${BLUE}WebSocket 路径(默认:${default_path}): ${PLAIN}" path || return 1
         path=$(trim_input "$path")
         path="${path:-$default_path}"
         if singbox_validate_ws_path "$path"; then
@@ -6319,16 +8641,16 @@ singbox_prompt_shadowsocks() {
         echo -e "${RED}该加密方式要求 Base64 解码后为 ${bytes} 字节${PLAIN}"
     done
 
-    read -r -p "$(echo -e "${BLUE}开启 ShadowTLS v3? [y/N]: ${PLAIN}")" enable_shadowtls || return 1
+    read -r -p "${BLUE}开启 ShadowTLS v3? [y/N]: ${PLAIN}" enable_shadowtls || return 1
     if [[ "$enable_shadowtls" =~ ^[Yy]$ ]]; then
         while true; do
-            read -r -p "$(echo -e "${BLUE}伪装握手域名: ${PLAIN}")" handshake_server || return 1
+            read -r -p "${BLUE}伪装握手域名: ${PLAIN}" handshake_server || return 1
             handshake_server=$(trim_input "$handshake_server")
             [[ -n "$handshake_server" ]] && break
             echo -e "${RED}伪装握手域名不能为空${PLAIN}"
         done
         while true; do
-            read -r -p "$(echo -e "${BLUE}伪装握手端口(默认:443): ${PLAIN}")" handshake_port || return 1
+            read -r -p "${BLUE}伪装握手端口(默认:443): ${PLAIN}" handshake_port || return 1
             handshake_port=$(trim_input "$handshake_port")
             handshake_port="${handshake_port:-443}"
             singbox_validate_port "$handshake_port" && break
@@ -6383,7 +8705,7 @@ singbox_prompt_snell() {
     echo -e "${GREEN}1.${PLAIN}default (推荐)"
     echo -e "${GREEN}2.${PLAIN}unshaped"
     echo -e "${RED}3.${PLAIN}unsafe-raw"
-    read -r -p "$(echo -e "${BLUE}流量整形模式 [1-3,默认1]: ${PLAIN}")" option || return 1
+    option=$(read_menu_choice "流量整形模式 [1-3,默认1]: ") || return 1
     case "${option:-1}" in
         1) mode="default" ;;
         2) mode="unshaped" ;;
@@ -6418,7 +8740,7 @@ singbox_prompt_tls_inbound() {
     uuid=""
     if [[ "$type" == "tuic" ]]; then
         while true; do
-            read -r -p "$(echo -e "${BLUE}UUID(回车随机生成): ${PLAIN}")" uuid || return 1
+            read -r -p "${BLUE}UUID(回车随机生成): ${PLAIN}" uuid || return 1
             uuid=$(trim_input "$uuid")
             [[ -n "$uuid" ]] || uuid=$(singbox_random_uuid)
             singbox_validate_uuid "$uuid" && break
@@ -6606,7 +8928,7 @@ singbox_install() {
     echo -e "${BLUE}选择 Sing-box 内核:${PLAIN}"
     echo -e "${GREEN}1.${PLAIN}正式版"
     echo -e "${GREEN}2.${PLAIN}测试版"
-    read -r -p "$(echo -e "${BLUE}请选择 [1-2,默认1]: ${PLAIN}")" channel_choice || return 1
+    channel_choice=$(read_menu_choice "请选择 [1-2,默认1]: ") || return 1
     case "${channel_choice:-1}" in
         1) install_channel="release" ;;
         2) install_channel="beta" ;;
@@ -6642,6 +8964,13 @@ singbox_install() {
         singbox_cleanup_stage
         singbox_pause_and_return
         return
+    fi
+
+    if [[ "$enable_snell" == "y" ]] && ! singbox_version_supports_snell "$SINGBOX_STAGE_VERSION"; then
+        echo -e "${RED}当前选择的 Sing-box ${SINGBOX_STAGE_VERSION} 不支持 Snell v6 (需 1.14.0+)，请改选测试版或取消 Snell${PLAIN}"
+        singbox_cleanup_stage
+        singbox_pause_and_return
+        return 1
     fi
 
     candidate=$(mktemp) || {
@@ -6740,21 +9069,6 @@ singbox_install() {
     singbox_pause_and_return
 }
 
-singbox_protocol_status() {
-    local type="$1" tag port suffix=""
-    tag=$(singbox_tag_for_type "$type") || return 1
-    if singbox_config_has_tag "$SINGBOX_CONFIG_PATH" "$tag"; then
-        if [[ "$type" == "shadowsocks" ]] && singbox_shadowsocks_uses_shadowtls "$SINGBOX_CONFIG_PATH"; then
-            tag="$SINGBOX_SHADOWTLS_TAG"
-            suffix=" (ShadowTLS v3)"
-        fi
-        port=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag == $tag) | .listen_port' "$SINGBOX_CONFIG_PATH")
-        echo "已启用:${port}${suffix}"
-    else
-        echo "未启用"
-    fi
-}
-
 singbox_add_inbound() {
     local type="$1" label candidate result=0
     label=$(singbox_label_for_type "$type")
@@ -6793,7 +9107,7 @@ singbox_modify_port() {
         tag="$SINGBOX_SHADOWTLS_TAG"
     fi
     current_port=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag == $tag) | .listen_port' "$SINGBOX_CONFIG_PATH")
-    read -r -p "$(echo -e "${BLUE}新端口(当前:${current_port}): ${PLAIN}")" new_port
+    read -r -p "${BLUE}新端口(当前:${current_port}): ${PLAIN}" new_port
     new_port=$(trim_input "$new_port")
     [[ -n "$new_port" ]] || return 0
     if ! singbox_validate_port "$new_port"; then
@@ -6860,7 +9174,7 @@ singbox_modify_auth() {
             return 1
         }
     elif [[ "$type" == "tuic" ]]; then
-        read -r -p "$(echo -e "${BLUE}新 UUID(回车保持,R随机): ${PLAIN}")" uuid || { rm -f "$candidate"; return 1; }
+        read -r -p "${BLUE}新 UUID(回车保持,R随机): ${PLAIN}" uuid || { rm -f "$candidate"; return 1; }
         uuid=$(trim_input "$uuid")
         if [[ "$uuid" =~ ^[Rr]$ ]]; then
             uuid=$(singbox_random_uuid)
@@ -6947,7 +9261,7 @@ singbox_modify_snell_mode() {
     echo -e "${GREEN}2.${PLAIN}v6 / unshaped"
     echo -e "${RED}3.${PLAIN}v6 / unsafe-raw"
     echo -e "${YELLOW}0.${PLAIN}取消"
-    read -r -p "$(echo -e "${BLUE}请选择 [0-3]: ${PLAIN}")" option
+    option=$(read_menu_choice "请选择 [0-3]: ") || return 1
     case "$option" in
         1) mode="default"; description="v6 / default" ;;
         2) mode="unshaped"; description="v6 / unshaped" ;;
@@ -6986,10 +9300,10 @@ singbox_modify_shadowtls() {
     read -r -s -p "新 ShadowTLS 密码(回车保持): " password
     echo
     password="${password:-$current_password}"
-    read -r -p "$(echo -e "${BLUE}伪装握手域名(回车保持): ${PLAIN}")" handshake_server
+    read -r -p "${BLUE}伪装握手域名(回车保持): ${PLAIN}" handshake_server
     handshake_server=$(trim_input "$handshake_server")
     handshake_server="${handshake_server:-$current_server}"
-    read -r -p "$(echo -e "${BLUE}伪装握手端口(当前:${current_port}): ${PLAIN}")" handshake_port
+    read -r -p "${BLUE}伪装握手端口(当前:${current_port}): ${PLAIN}" handshake_port
     handshake_port=$(trim_input "$handshake_port")
     handshake_port="${handshake_port:-$current_port}"
     if ! singbox_validate_port "$handshake_port"; then
@@ -7029,7 +9343,7 @@ singbox_remove_inbound() {
         echo -e "${RED}至少需要保留一个入站,不能删除 ${label}${PLAIN}"
         return 1
     fi
-    read -r -p "$(echo -e "${RED}确定禁用 ${label}? [y/N]: ${PLAIN}")" confirm
+    read -r -p "${RED}确定禁用 ${label}? [y/N]: ${PLAIN}" confirm
     [[ "$confirm" =~ ^[Yy]$ ]] || return 0
 
     candidate=$(mktemp) || return 1
@@ -7062,7 +9376,7 @@ singbox_manage_protocol() {
             sleep 2
             return 1
         fi
-        read -r -p "$(echo -e "${BLUE}${label} 当前未启用,是否添加? [y/N]: ${PLAIN}")" confirm || return 1
+        read -r -p "${BLUE}${label} 当前未启用,是否添加? [y/N]: ${PLAIN}" confirm || return 1
         [[ "$confirm" =~ ^[Yy]$ ]] && singbox_add_inbound "$type"
         return
     fi
@@ -7086,7 +9400,7 @@ singbox_manage_protocol() {
             echo -e "${RED}4.${PLAIN}禁用入站"
         fi
         echo -e "${YELLOW}0.${PLAIN}返回上级"
-        read -r -p "$(echo -e "${BLUE}请输入选项: ${PLAIN}")" option || return 1
+        option=$(read_menu_choice "请输入选项: ") || return 1
         case "$option" in
             1) singbox_modify_port "$type"; sleep 1 ;;
             2) singbox_modify_auth "$type"; sleep 1 ;;
@@ -7131,14 +9445,6 @@ singbox_warp_enabled() {
     jq -e --arg tag "$SINGBOX_WARP_TAG" \
         'any(.endpoints[]?; .type == "wireguard" and .tag == $tag)' \
         "$SINGBOX_CONFIG_PATH" >/dev/null 2>&1
-}
-
-singbox_warp_status() {
-    if singbox_warp_enabled; then
-        echo "已启用"
-    else
-        echo "未启用"
-    fi
 }
 
 singbox_enable_warp() {
@@ -7231,32 +9537,62 @@ singbox_disable_warp() {
 singbox_manage_warp() {
     local confirm
     if singbox_warp_enabled; then
-        read -r -p "$(echo -e "${RED}WARP 分流当前已启用,是否关闭? [y/N]: ${PLAIN}")" confirm || return 1
+        read -r -p "${RED}WARP 分流当前已启用,是否关闭? [y/N]: ${PLAIN}" confirm || return 1
         [[ "$confirm" =~ ^[Yy]$ ]] && singbox_disable_warp
     else
-        read -r -p "$(echo -e "${BLUE}WARP 分流当前未启用,是否开启? [y/N]: ${PLAIN}")" confirm || return 1
+        read -r -p "${BLUE}WARP 分流当前未启用,是否开启? [y/N]: ${PLAIN}" confirm || return 1
         [[ "$confirm" =~ ^[Yy]$ ]] && singbox_enable_warp
     fi
 }
 
+singbox_read_config_summary() {
+    local config_file="${1:-$SINGBOX_CONFIG_PATH}"
+    jq -r --arg stls "$SINGBOX_SHADOWTLS_TAG" --arg warp "$SINGBOX_WARP_TAG" '
+        def status($tag):
+            ([.inbounds[]? | select(.tag == $tag)][0]) as $inb |
+            if $inb == null then "未启用"
+            else "已启用:\($inb.listen_port)"
+            end;
+        def ss_status:
+            ([.inbounds[]? | select(.tag == "ss-in")][0]) as $ss |
+            if $ss == null then "未启用"
+            else
+                ([.inbounds[]? | select(.type == "shadowtls" and .tag == $stls and .version == 3 and .detour == "ss-in")][0]) as $st |
+                if $st != null then "已启用:\($st.listen_port) (ShadowTLS v3)"
+                else "已启用:\($ss.listen_port)"
+                end
+            end;
+        status("anytls-in"),
+        status("trojan-in"),
+        ss_status,
+        status("tuic-in"),
+        status("hy2-in"),
+        status("snell-in"),
+        (if any(.endpoints[]?; .type == "wireguard" and .tag == $warp) then "已启用" else "未启用" end)
+    ' "$config_file" 2>/dev/null
+}
+
 singbox_modify_config() {
-    local option snell_status
+    local option snell_status snell_ok=0
+    local -a summary
+    singbox_supports_snell && snell_ok=1
     while true; do
-        snell_status=$(singbox_protocol_status snell)
-        if [[ "$snell_status" == "未启用" ]] && ! singbox_supports_snell; then
+        mapfile -t summary < <(singbox_read_config_summary "$SINGBOX_CONFIG_PATH")
+        snell_status="${summary[5]:-未启用}"
+        if [[ "$snell_status" == "未启用" ]] && (( snell_ok == 0 )); then
             snell_status="需 Sing-box 1.14+"
         fi
         clear
         echo -e "${BLUE}===== Sing-box 配置管理 =====${PLAIN}"
-        echo -e "${GREEN}1.${PLAIN}AnyTLS          [${YELLOW}$(singbox_protocol_status anytls)${PLAIN}]"
-        echo -e "${GREEN}2.${PLAIN}Trojan + WS + TLS [${YELLOW}$(singbox_protocol_status trojan)${PLAIN}]"
-        echo -e "${GREEN}3.${PLAIN}Shadowsocks 2022[${YELLOW}$(singbox_protocol_status shadowsocks)${PLAIN}]"
-        echo -e "${GREEN}4.${PLAIN}TUIC v5         [${YELLOW}$(singbox_protocol_status tuic)${PLAIN}]"
-        echo -e "${GREEN}5.${PLAIN}Hysteria2       [${YELLOW}$(singbox_protocol_status hysteria2)${PLAIN}]"
+        echo -e "${GREEN}1.${PLAIN}AnyTLS          [${YELLOW}${summary[0]:-未启用}${PLAIN}]"
+        echo -e "${GREEN}2.${PLAIN}Trojan + WS + TLS [${YELLOW}${summary[1]:-未启用}${PLAIN}]"
+        echo -e "${GREEN}3.${PLAIN}Shadowsocks 2022[${YELLOW}${summary[2]:-未启用}${PLAIN}]"
+        echo -e "${GREEN}4.${PLAIN}TUIC v5         [${YELLOW}${summary[3]:-未启用}${PLAIN}]"
+        echo -e "${GREEN}5.${PLAIN}Hysteria2       [${YELLOW}${summary[4]:-未启用}${PLAIN}]"
         echo -e "${GREEN}6.${PLAIN}Snell v6        [${YELLOW}${snell_status}${PLAIN}]"
-        echo -e "${GREEN}7.${PLAIN}WARP 分流       [${YELLOW}$(singbox_warp_status)${PLAIN}]"
+        echo -e "${GREEN}7.${PLAIN}WARP 分流       [${YELLOW}${summary[6]:-未启用}${PLAIN}]"
         echo -e "${YELLOW}0.${PLAIN}返回上级"
-        read -r -p "$(echo -e "${BLUE}请输入选项 [0-7]: ${PLAIN}")" option || return 1
+        option=$(read_menu_choice "请输入选项 [0-7]: ") || return 1
         case "$option" in
             1) singbox_manage_protocol anytls ;;
             2) singbox_manage_protocol trojan ;;
@@ -7281,7 +9617,7 @@ singbox_manage_service() {
         echo -e "${GREEN}  3.${PLAIN}停止服务"
         echo -e "${GREEN}  4.${PLAIN}重启服务"
         echo -e "${GREEN}  0.${PLAIN}返回主页"
-        read -r -p "$(echo -e "${BLUE}✦ Steins Gate ✦ : ${PLAIN}")" option || return 1
+        option=$(read_menu_choice "✦ Steins Gate ✦ : ") || return 1
         case "$option" in
             1)
                 clear
@@ -7350,7 +9686,7 @@ singbox_update_channel() {
         return
     fi
 
-    read -r -p "$(echo -e "${BLUE}发现新版本,是否更新到 Sing-box ${SINGBOX_STAGE_VERSION}? [y/N]: ${PLAIN}")" confirm
+    read -r -p "${BLUE}发现新版本,是否更新到 Sing-box ${SINGBOX_STAGE_VERSION}? [y/N]: ${PLAIN}" confirm
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         singbox_cleanup_stage
         return
@@ -7428,7 +9764,7 @@ singbox_update() {
         echo -e "${GREEN}  1.${PLAIN}更新正式版"
         echo -e "${GREEN}  2.${PLAIN}更新测试版"
         echo -e "${GREEN}  0.${PLAIN}返回上级"
-        read -r -p "$(echo -e "${BLUE}✦ Steins Gate ✦ : ${PLAIN}")" option || return 1
+        option=$(read_menu_choice "✦ Steins Gate ✦ : ") || return 1
         case "$option" in
             1) singbox_update_channel release ;;
             2) singbox_update_channel beta ;;
@@ -7446,7 +9782,7 @@ singbox_delete() {
         singbox_pause_and_return
         return
     fi
-    read -r -p "$(echo -e "${RED}确定删除 Sing-box、配置和服务? [y/N]: ${PLAIN}")" confirm
+    read -r -p "${RED}确定删除 Sing-box、配置和服务? [y/N]: ${PLAIN}" confirm
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
         if systemctl is-active --quiet "$SINGBOX_SERVICE_NAME" &&
            ! systemctl stop "$SINGBOX_SERVICE_NAME" >/dev/null 2>&1; then
@@ -7483,7 +9819,7 @@ singbox_menu() {
         echo -e "${GREEN}  3.${PLAIN}更新内核"
         echo -e "${GREEN}  4.${PLAIN}删除服务"
         echo -e "${GREEN}  0.${PLAIN}返回主页"
-        read -r -p "$(echo -e "${BLUE}✦ Steins Gate ✦ : ${PLAIN}")" option || return 1
+        option=$(read_menu_choice "✦ Steins Gate ✦ : ") || return 1
         case "$option" in
             1) singbox_install ;;
             2)
@@ -7502,9 +9838,9 @@ singbox_menu() {
     done
 }
 
-CYAN="\033[0;36m"
-BOLD="\033[1m"
-NC="\033[0m"
+CYAN=$'\033[0;36m'
+BOLD=$'\033[1m'
+NC=$'\033[0m'
 
 wireproxy_info()  { log_prefixed "$CYAN" "[INFO]" "$*"; }
 wireproxy_ok()    { log_prefixed "$GREEN" "[ OK ]" "$*"; }
@@ -7534,6 +9870,72 @@ WIREPROXY_SOCKS_BIND="$WIREPROXY_DEFAULT_SOCKS_BIND"
 WIREPROXY_SOCKS_USER=""
 WIREPROXY_SOCKS_PASS=""
 
+warp_escape_sed_replacement() {
+    local s="${1//\\/\\\\}"
+    s="${s//&/\\&}"
+    s="${s//|/\\|}"
+    printf '%s' "$s"
+}
+
+warp_endpoint_host() {
+    local value="$1"
+    if [[ "$value" =~ ^\[([0-9a-fA-F:]+)\]:[0-9]{1,5}$ ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+    elif [[ "$value" =~ ^([^:]+):[0-9]{1,5}$ ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+    else
+        printf '%s\n' "$value"
+    fi
+}
+
+warp_endpoint_port() {
+    local value="$1"
+    if [[ "$value" =~ ^\[[0-9a-fA-F:]+\]:([0-9]{1,5})$ ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+    elif [[ "$value" =~ ^[^:]+:([0-9]{1,5})$ ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+    fi
+}
+
+warp_is_ipv4_literal() {
+    [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+}
+
+warp_is_ipv6_literal() {
+    [[ "$1" == *:* ]]
+}
+
+warp_trace_value() {
+    local trace="$1" wanted="$2" k v
+    while IFS='=' read -r k v; do
+        if [[ "$k" == "$wanted" ]]; then
+            printf '%s\n' "${v%$'\r'}"
+            return 0
+        fi
+    done <<< "$trace"
+}
+
+warp_trace_warp_label() {
+    local warp
+    warp="$(warp_trace_value "$1" "warp")"
+    [[ "$warp" == "on" ]] && warp="free"
+    [[ -n "$warp" ]] && printf '%s\n' "$warp" || printf 'unknown\n'
+}
+
+warp_merge_warp_status() {
+    local status="unknown" trace warp
+    for trace in "$@"; do
+        [[ -z "$trace" ]] && continue
+        warp="$(warp_trace_warp_label "$trace")"
+        case "$warp" in
+            plus) printf 'plus\n'; return 0 ;;
+            free) status="free" ;;
+            off)  [[ "$status" == "unknown" ]] && status="off" ;;
+        esac
+    done
+    printf '%s\n' "$status"
+}
+
 warp_parse_team_response() {
     local -a fields=()
     mapfile -d '' -t fields < <(jq -sj '
@@ -7545,7 +9947,9 @@ warp_parse_team_response() {
         .[] | ., "\u0000"
     ')
     [[ "${#fields[@]}" == 8 ]] || return 1
-    warp_v4="${fields[0]}"; warp_v6="${fields[1]}"; peer_pub="${fields[2]}"
+    warp_v4="${fields[0]%%/*}"
+    warp_v6="${fields[1]%%/*}"
+    peer_pub="${fields[2]}"
     org="${fields[3]}"; ep_port="${fields[4]}"; ep_host="${fields[5]}"
     ep_v4="${fields[6]%%:*}"
     ep_v6="${fields[7]}"
@@ -7553,6 +9957,8 @@ warp_parse_team_response() {
         ep_v6="${ep_v6#\[}"
         ep_v6="${ep_v6%%\]*}"
     fi
+    [[ "$ep_v6" == *"cf1"* ]] && ep_v6=""
+    return 0
 }
 
 warp_release_latest_tag() {
@@ -7645,37 +10051,28 @@ wireproxy_ensure_wireguard_tools() {
 }
 
 wireproxy_detect_arch() {
-    case "$(uname -m)" in
-        x86_64|amd64)
-            WIREPROXY_ARCH="amd64"
-            WIREPROXY_WGCF_ARCH="amd64"
-            ;;
-        aarch64|arm64)
-            WIREPROXY_ARCH="arm64"
-            WIREPROXY_WGCF_ARCH="arm64"
-            ;;
-        *)
-            wireproxy_err "不支持的架构: $(uname -m)"
-            ;;
-    esac
+    WIREPROXY_ARCH=$(zero_get_arch) || wireproxy_err "不支持的架构: $(uname -m)"
+    WIREPROXY_WGCF_ARCH="$WIREPROXY_ARCH"
 }
 
 wireproxy_detect_network() {
-    local has_v4=false has_v6=false
+    local has_v4=false has_v6=false check_v4=true check_v6=true pid4="" pid6=""
 
     if command -v ip >/dev/null 2>&1; then
-        ip -4 addr show scope global 2>/dev/null | grep -q inet &&
-            curl -4 --connect-timeout 3 --max-time 5 -s http://1.1.1.1/cdn-cgi/trace &>/dev/null &&
-            has_v4=true
-        ip -6 addr show scope global 2>/dev/null | grep -q inet6 &&
-            curl -6 -g --connect-timeout 3 --max-time 5 -s "http://[2606:4700:4700::1111]/cdn-cgi/trace" &>/dev/null &&
-            has_v6=true
-    else
-        curl -4 --connect-timeout 3 --max-time 5 -s http://1.1.1.1/cdn-cgi/trace &>/dev/null &&
-            has_v4=true
-        curl -6 -g --connect-timeout 3 --max-time 5 -s "http://[2606:4700:4700::1111]/cdn-cgi/trace" &>/dev/null &&
-            has_v6=true
+        dns_has_ipv4 || check_v4=false
+        dns_has_ipv6 || check_v6=false
     fi
+
+    if $check_v4; then
+        curl -4 --connect-timeout 3 --max-time 5 -s http://1.1.1.1/cdn-cgi/trace >/dev/null 2>&1 &
+        pid4=$!
+    fi
+    if $check_v6; then
+        curl -6 -g --connect-timeout 3 --max-time 5 -s "http://[2606:4700:4700::1111]/cdn-cgi/trace" >/dev/null 2>&1 &
+        pid6=$!
+    fi
+    [[ -n "$pid4" ]] && wait "$pid4" && has_v4=true
+    [[ -n "$pid6" ]] && wait "$pid6" && has_v6=true
 
     if $has_v4 && $has_v6; then
         WIREPROXY_NET_MODE="dual"
@@ -7778,7 +10175,7 @@ wireproxy_ensure_wgcf() {
 
 wireproxy_cleanup_wgcf() {
     if [[ -n "$WIREPROXY_WGCF_TMP" ]]; then
-        rm -rf "$(dirname "$WIREPROXY_WGCF_TMP")"
+        rm -rf "${WIREPROXY_WGCF_TMP%/*}"
         WIREPROXY_WGCF_TMP=""
         WIREPROXY_WGCF_PATH=""
     fi
@@ -7805,10 +10202,6 @@ wireproxy_is_local_bind() {
        "$1" =~ ^\[::1\]:[0-9]{1,5}$ ]]
 }
 
-wireproxy_escape_sed_replacement() {
-    printf '%s' "$1" | sed 's/[&|\\]/\\&/g'
-}
-
 wireproxy_extract_ini_value() {
     local file="$1" section="$2" key="$3"
     awk -F' = ' -v section="$section" -v key="$key" '
@@ -7816,36 +10209,6 @@ wireproxy_extract_ini_value() {
         /^\[/ { in_section=0 }
         in_section && $1 == key { print $2; exit }
     ' "$file"
-}
-
-wireproxy_endpoint_host() {
-    local value="$1"
-    if [[ "$value" =~ ^\[([0-9a-fA-F:]+)\]:[0-9]{1,5}$ ]]; then
-        printf '%s\n' "${BASH_REMATCH[1]}"
-    elif [[ "$value" =~ ^([^:]+):[0-9]{1,5}$ ]]; then
-        printf '%s\n' "${BASH_REMATCH[1]}"
-    else
-        printf '%s\n' "$value"
-    fi
-}
-
-wireproxy_endpoint_port() {
-    local value="$1"
-    if [[ "$value" =~ ^\[[0-9a-fA-F:]+\]:([0-9]{1,5})$ ]]; then
-        printf '%s\n' "${BASH_REMATCH[1]}"
-    elif [[ "$value" =~ ^[^:]+:([0-9]{1,5})$ ]]; then
-        printf '%s\n' "${BASH_REMATCH[1]}"
-    fi
-}
-
-wireproxy_is_ipv4_literal() {
-    local host="$1"
-    [[ "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
-}
-
-wireproxy_is_ipv6_literal() {
-    local host="$1"
-    [[ "$host" == *:* ]]
 }
 
 wireproxy_resolve_host_by_family() {
@@ -7863,7 +10226,7 @@ wireproxy_select_endpoint_for_network() {
     local host port resolved
 
     [[ -n "$WIREPROXY_NET_MODE" ]] || wireproxy_detect_network
-    port="${preferred_port:-$(wireproxy_endpoint_port "$current")}"
+    port="${preferred_port:-$(warp_endpoint_port "$current")}"
     [[ -z "$port" ]] && port="2408"
 
     case "$WIREPROXY_NET_MODE" in
@@ -7872,9 +10235,9 @@ wireproxy_select_endpoint_for_network() {
                 printf '[%s]:%s\n' "$preferred_v6" "$port"
                 return 0
             fi
-            host="$(wireproxy_endpoint_host "$current")"
+            host="$(warp_endpoint_host "$current")"
             [[ -n "$host" ]] || wireproxy_err "无法确定 IPv6 Endpoint"
-            if wireproxy_is_ipv6_literal "$host" && ! wireproxy_is_ipv4_literal "$host"; then
+            if warp_is_ipv6_literal "$host" && ! warp_is_ipv4_literal "$host"; then
                 printf '[%s]:%s\n' "$host" "$port"
                 return 0
             fi
@@ -7887,9 +10250,9 @@ wireproxy_select_endpoint_for_network() {
                 printf '%s:%s\n' "$preferred_v4" "$port"
                 return 0
             fi
-            host="$(wireproxy_endpoint_host "$current")"
+            host="$(warp_endpoint_host "$current")"
             [[ -n "$host" ]] || wireproxy_err "无法确定 IPv4 Endpoint"
-            if wireproxy_is_ipv4_literal "$host"; then
+            if warp_is_ipv4_literal "$host"; then
                 printf '%s:%s\n' "$host" "$port"
                 return 0
             fi
@@ -8157,18 +10520,21 @@ wireproxy_show_proxy_status() {
 }
 
 wireproxy_show_proxy_trace() {
-    local v4_trace="" v6_trace="" ip4="" ip6="" warp_status=""
+    local v4_trace="" v6_trace="" ip4="" ip6="" warp_status="" tmpdir
     wireproxy_load_socks_settings
 
     [[ -f "$WIREPROXY_CONF" ]] || { wireproxy_warn "未找到配置文件"; return; }
 
-    v4_trace="$(wireproxy_fetch_trace_via_proxy_v4 || true)"
+    tmpdir="$(mktemp -d /tmp/zero-wp-trace.XXXXXX)" || return 1
+    ( wireproxy_fetch_trace_via_proxy_v4 > "$tmpdir/v4" 2>/dev/null || true ) &
+    ( wireproxy_fetch_trace_via_proxy_v6 > "$tmpdir/v6" 2>/dev/null || true ) &
+    wait
+    [[ -s "$tmpdir/v4" ]] && v4_trace="$(<"$tmpdir/v4")"
+    [[ -s "$tmpdir/v6" ]] && v6_trace="$(<"$tmpdir/v6")"
+    rm -rf "$tmpdir"
 
-    [[ -n "$v4_trace" ]] && ip4="$(wireproxy_trace_value "$v4_trace" "ip")"
-
-    v6_trace="$(wireproxy_fetch_trace_via_proxy_v6 || true)"
-
-    [[ -n "$v6_trace" ]] && ip6="$(wireproxy_trace_value "$v6_trace" "ip")"
+    [[ -n "$v4_trace" ]] && ip4="$(warp_trace_value "$v4_trace" "ip")"
+    [[ -n "$v6_trace" ]] && ip6="$(warp_trace_value "$v6_trace" "ip")"
 
     [[ -z "$ip4" ]] && ip4="无"
     [[ -z "$ip6" ]] && ip6="无"
@@ -8176,7 +10542,7 @@ wireproxy_show_proxy_trace() {
     echo -e "  IPv4: ${GREEN}${ip4}${NC}"
     echo -e "  IPv6: ${CYAN}${ip6}${NC}"
     if [[ -n "$v4_trace" || -n "$v6_trace" ]]; then
-        warp_status="$(wireproxy_merge_warp_status "$v4_trace" "$v6_trace")"
+        warp_status="$(warp_merge_warp_status "$v4_trace" "$v6_trace")"
         echo -e "  Warp: ${YELLOW}${warp_status}${NC}"
     else
         wireproxy_warn "无法通过 SOCKS 代理获取 WARP 出口信息，可稍等几秒后再试一次"
@@ -8212,33 +10578,6 @@ wireproxy_fetch_trace_via_proxy_v6() {
     trace="$(curl "${curl_args[@]}" "http://[2606:4700:4700::1111]/cdn-cgi/trace" 2>/dev/null || true)"
     [[ -n "$trace" && "$trace" == *"warp="* ]] || return 1
     printf '%s\n' "$trace"
-}
-
-wireproxy_trace_value() {
-    local trace="$1" key="$2"
-    printf '%s\n' "$trace" | awk -F= -v key="$key" '$1 == key { print $2; exit }'
-}
-
-wireproxy_trace_warp_label() {
-    local trace="$1" warp
-    warp="$(wireproxy_trace_value "$trace" "warp")"
-    [[ "$warp" == "on" ]] && warp="free"
-    [[ -n "$warp" ]] && printf '%s\n' "$warp" || printf 'unknown\n'
-}
-
-wireproxy_merge_warp_status() {
-    local status="unknown" trace warp
-    for trace in "$@"; do
-        [[ -z "$trace" ]] && continue
-        warp="$(wireproxy_trace_warp_label "$trace")"
-        case "$warp" in
-            plus) printf 'plus\n'; return 0 ;;
-            free) status="free" ;;
-            off) [[ "$status" == "unknown" ]] && status="off" ;;
-        esac
-    done
-
-    printf '%s\n' "$status"
 }
 
 wireproxy_cleanup_free_install() {
@@ -8408,7 +10747,7 @@ wireproxy_modify_config() {
     echo -e "  ${YELLOW}3)${NC} 改SOCKS监听    ${GREEN}4)${NC} 改SOCKS认证"
     echo -e "  ${CYAN}5)${NC} 编辑WARP配置 ${RED}  0)${NC} 返回上级"
     echo
-    read -rp "  请选择 [0-5]: " input
+    input=$(read_menu_choice "  请选择 [0-5]: ") || return 1
 
     case "$input" in
         1)
@@ -8417,7 +10756,7 @@ wireproxy_modify_config() {
             if [[ -n "$new_ep" ]]; then
                 wireproxy_is_valid_host_port "$new_ep" || { wireproxy_warn "Endpoint 格式无效"; return; }
                 backup_file="$(wireproxy_make_backup "$WIREPROXY_WG_WARP_CONF")" || return 1
-                escaped_value="$(wireproxy_escape_sed_replacement "$new_ep")"
+                escaped_value="$(warp_escape_sed_replacement "$new_ep")"
                 sed -i "s|^Endpoint = .*|Endpoint = ${escaped_value}|" "$WIREPROXY_WG_WARP_CONF" || { wireproxy_warn "配置修改失败；备份保留在 $backup_file"; return 1; }
                 wireproxy_ok "Endpoint 已更新"
                 wireproxy_restart_service_with_backup "$backup_file" "$WIREPROXY_WG_WARP_CONF"
@@ -8446,7 +10785,7 @@ wireproxy_modify_config() {
                     [[ "$confirm" =~ ^[Yy]$ ]] || { wireproxy_warn "已取消"; return; }
                 fi
                 backup_file="$(wireproxy_make_backup "$WIREPROXY_CONF")" || return 1
-                escaped_value="$(wireproxy_escape_sed_replacement "$new_bind")"
+                escaped_value="$(warp_escape_sed_replacement "$new_bind")"
                 sed -i "s|^BindAddress = .*|BindAddress = ${escaped_value}|" "$WIREPROXY_CONF" || { wireproxy_warn "配置修改失败；备份保留在 $backup_file"; return 1; }
                 wireproxy_ok "SOCKS 监听地址已更新"
                 wireproxy_restart_service_with_backup "$backup_file" "$WIREPROXY_CONF"
@@ -8540,7 +10879,7 @@ wireproxy_menu() {
     while true; do
         wireproxy_show_menu
         wireproxy_menu_divider
-        read -rp "  请输入选项 [0-5]: " choice || return 1
+        choice=$(read_menu_choice "  请输入选项 [0-5]: ") || return 1
         case "$choice" in
             1) wireproxy_install_free; wireproxy_pause ;;
             2) wireproxy_install_team; wireproxy_pause ;;
@@ -8595,36 +10934,6 @@ warpstack_is_valid_endpoint() {
     return 0
 }
 
-warpstack_endpoint_host() {
-    local value="$1"
-    if [[ "$value" =~ ^\[([0-9a-fA-F:]+)\]:[0-9]{1,5}$ ]]; then
-        printf '%s\n' "${BASH_REMATCH[1]}"
-    elif [[ "$value" =~ ^([^:]+):[0-9]{1,5}$ ]]; then
-        printf '%s\n' "${BASH_REMATCH[1]}"
-    else
-        printf '%s\n' "$value"
-    fi
-}
-
-warpstack_endpoint_port() {
-    local value="$1"
-    if [[ "$value" =~ ^\[[0-9a-fA-F:]+\]:([0-9]{1,5})$ ]]; then
-        printf '%s\n' "${BASH_REMATCH[1]}"
-    elif [[ "$value" =~ ^[^:]+:([0-9]{1,5})$ ]]; then
-        printf '%s\n' "${BASH_REMATCH[1]}"
-    fi
-}
-
-warpstack_is_ipv4_literal() {
-    local host="$1"
-    [[ "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
-}
-
-warpstack_is_ipv6_literal() {
-    local host="$1"
-    [[ "$host" == *:* ]]
-}
-
 warpstack_resolve_endpoint_host_by_family() {
     local host="$1" family="$2"
     command -v getent >/dev/null 2>&1 || warpstack_err "缺少 getent，无法解析 Endpoint"
@@ -8640,7 +10949,7 @@ warpstack_select_endpoint_for_network() {
     local host port resolved
 
     [[ -n "$WARPSTACK_NET_MODE" ]] || warpstack_detect_network
-    port="${preferred_port:-$(warpstack_endpoint_port "$current")}"
+    port="${preferred_port:-$(warp_endpoint_port "$current")}"
     [[ -z "$port" ]] && port="2408"
 
     case "$WARPSTACK_NET_MODE" in
@@ -8649,9 +10958,9 @@ warpstack_select_endpoint_for_network() {
                 printf '[%s]:%s\n' "$preferred_v6" "$port"
                 return 0
             fi
-            host="$(warpstack_endpoint_host "$current")"
+            host="$(warp_endpoint_host "$current")"
             [[ -n "$host" ]] || warpstack_err "无法确定 IPv6 Endpoint"
-            if warpstack_is_ipv6_literal "$host" && ! warpstack_is_ipv4_literal "$host"; then
+            if warp_is_ipv6_literal "$host" && ! warp_is_ipv4_literal "$host"; then
                 printf '[%s]:%s\n' "$host" "$port"
                 return 0
             fi
@@ -8660,9 +10969,9 @@ warpstack_select_endpoint_for_network() {
             printf '[%s]:%s\n' "$resolved" "$port"
             ;;
         dual|v4_only)
-            host="$(warpstack_endpoint_host "$current")"
+            host="$(warp_endpoint_host "$current")"
             [[ -n "$host" ]] || warpstack_err "无法确定 IPv4 Endpoint"
-            if warpstack_is_ipv6_literal "$host" && ! warpstack_is_ipv4_literal "$host"; then
+            if warp_is_ipv6_literal "$host" && ! warp_is_ipv4_literal "$host"; then
                 if [[ -n "$preferred_v4" ]]; then
                     printf '%s:%s\n' "$preferred_v4" "$port"
                     return 0
@@ -8673,7 +10982,7 @@ warpstack_select_endpoint_for_network() {
                 printf '%s:%s\n' "$preferred_v4" "$port"
                 return 0
             fi
-            if warpstack_is_ipv4_literal "$host" || [[ "$host" =~ ^[A-Za-z0-9.-]+$ ]]; then
+            if warp_is_ipv4_literal "$host" || [[ "$host" =~ ^[A-Za-z0-9.-]+$ ]]; then
                 printf '%s:%s\n' "$host" "$port"
                 return 0
             fi
@@ -8688,18 +10997,8 @@ warpstack_select_endpoint_for_network() {
     esac
 }
 
-warpstack_escape_sed_replacement() {
-    printf '%s' "$1" | sed 's/[&|\\]/\\&/g'
-}
-
 warpstack_detect_arch() {
-    local arch
-    arch=$(uname -m)
-    case "$arch" in
-        x86_64|amd64) WARPSTACK_WGCF_ARCH="amd64" ;;
-        aarch64|arm64) WARPSTACK_WGCF_ARCH="arm64" ;;
-        *) warpstack_err "不支持的架构: $arch" ;;
-    esac
+    WARPSTACK_WGCF_ARCH=$(zero_get_arch) || warpstack_err "不支持的架构: $(uname -m)"
 }
 
 warpstack_probe_network_family() {
@@ -8707,16 +11006,25 @@ warpstack_probe_network_family() {
 }
 
 warpstack_detect_network() {
+    local pid4="" pid6=""
     WARPSTACK_V4_ADDR=false
     WARPSTACK_V6_ADDR=false
     WARPSTACK_V4_READY=false
     WARPSTACK_V6_READY=false
 
-    ip -4 addr show scope global 2>/dev/null | grep -q inet && WARPSTACK_V4_ADDR=true
-    ip -6 addr show scope global 2>/dev/null | grep -q inet6 && WARPSTACK_V6_ADDR=true
+    dns_has_ipv4 && WARPSTACK_V4_ADDR=true
+    dns_has_ipv6 && WARPSTACK_V6_ADDR=true
 
-    $WARPSTACK_V4_ADDR && warpstack_probe_network_family -4 && WARPSTACK_V4_READY=true
-    $WARPSTACK_V6_ADDR && warpstack_probe_network_family -6 && WARPSTACK_V6_READY=true
+    if $WARPSTACK_V4_ADDR; then
+        warpstack_probe_network_family -4 &
+        pid4=$!
+    fi
+    if $WARPSTACK_V6_ADDR; then
+        warpstack_probe_network_family -6 &
+        pid6=$!
+    fi
+    [[ -n "$pid4" ]] && wait "$pid4" && WARPSTACK_V4_READY=true
+    [[ -n "$pid6" ]] && wait "$pid6" && WARPSTACK_V6_READY=true
 
     if $WARPSTACK_V4_READY && $WARPSTACK_V6_READY; then
         WARPSTACK_NET_MODE="dual"
@@ -8732,13 +11040,24 @@ warpstack_detect_network() {
 }
 
 warpstack_show_network_status() {
-    local warp_running=false config_mode=""
-    warpstack_detect_network
+    local warp_running=false config_mode="" has_v4=false has_v6=false net_mode="none"
     if ip link show wg0 &>/dev/null 2>&1; then
         warp_running=true
         config_mode="$(warpstack_config_mode 2>/dev/null || true)"
     fi
-    case "$WARPSTACK_NET_MODE" in
+    dns_has_ipv4 && has_v4=true
+    dns_has_ipv6 && has_v6=true
+    if $has_v4 && $has_v6; then
+        net_mode="dual"
+    elif $has_v6; then
+        net_mode="v6_only"
+    elif $has_v4; then
+        net_mode="v4_only"
+    elif ip -4 addr show scope global 2>/dev/null | grep -q inet ||
+         ip -6 addr show scope global 2>/dev/null | grep -q inet6; then
+        net_mode="uncertain"
+    fi
+    case "$net_mode" in
         dual)
             if $warp_running && [[ "$config_mode" == "add_v4" ]]; then
                 echo -e "  网络: ${GREEN}IPv4✓(WARP)${NC} ${GREEN}IPv6✓(原生)${NC}"
@@ -8748,10 +11067,10 @@ warpstack_show_network_status() {
                 echo -e "  网络: ${GREEN}IPv4✓${NC} ${GREEN}IPv6✓${NC}"
             fi
             ;;
-        v6_only) echo -e "  网络: ${RED}IPv4✗${NC} ${GREEN}IPv6✓${NC}" ;;
-        v4_only) echo -e "  网络: ${GREEN}IPv4✓${NC} ${RED}IPv6✗${NC}" ;;
-        uncertain) echo -e "  网络: ${YELLOW}地址存在，但联网检测异常${NC}" ;;
-        none)    echo -e "  网络: ${RED}IPv4✗${NC} ${RED}IPv6✗${NC}" ;;
+        v6_only)   echo -e "  网络: ${RED}IPv4✗${NC} ${GREEN}IPv6✓${NC}" ;;
+        v4_only)   echo -e "  网络: ${GREEN}IPv4✓${NC} ${RED}IPv6✗${NC}" ;;
+        uncertain) echo -e "  网络: ${YELLOW}地址存在，但路由异常${NC}" ;;
+        none)      echo -e "  网络: ${RED}IPv4✗${NC} ${RED}IPv6✗${NC}" ;;
     esac
     if $warp_running; then
         echo -e "  WARP: ${GREEN}运行中${NC}"
@@ -8840,7 +11159,7 @@ warpstack_write_wg_conf() {
             ;;
     esac
 
-    conf_dir="$(dirname "$WARPSTACK_WG_CONF")"
+    conf_dir="${WARPSTACK_WG_CONF%/*}"
     mkdir -p "$conf_dir" || warpstack_err "无法创建 WireGuard 配置目录: ${conf_dir}"
     if ! cat > "$WARPSTACK_WG_CONF" << EOF
 # Managed by Zero.sh WarpStack
@@ -8923,12 +11242,16 @@ warpstack_start_and_enable() {
 }
 
 warpstack_show_result() {
-    local mode="$1"
+    local mode="$1" tmpdir v4a="获取失败" v6a="获取失败"
     warpstack_ok "配置完成"
 
-    local v4a v6a
-    v4a=$(warpstack_public_ip "-4" "获取失败")
-    v6a=$(warpstack_public_ip "-6" "获取失败")
+    tmpdir="$(mktemp -d /tmp/zero-ws-res.XXXXXX)" || return 1
+    ( warpstack_public_ip "-4" "获取失败" > "$tmpdir/v4" ) &
+    ( warpstack_public_ip "-6" "获取失败" > "$tmpdir/v6" ) &
+    wait
+    [[ -s "$tmpdir/v4" ]] && v4a="$(<"$tmpdir/v4")"
+    [[ -s "$tmpdir/v6" ]] && v6a="$(<"$tmpdir/v6")"
+    rm -rf "$tmpdir"
 
     if [[ "$mode" == "add_v4" ]]; then
         echo -e "  模式: 纯 IPv6 -> 添加 IPv4"
@@ -8966,41 +11289,13 @@ warpstack_fetch_trace() {
     local family="$1" connect_timeout="${2:-5}" max_time="${3:-10}" trace=""
     trace="$(curl -fsS "$family" --noproxy '*' --connect-timeout "$connect_timeout" --max-time "$max_time" \
         https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
-    printf '%s\n' "$trace" | grep -q '^ip=' || return 1
-    printf '%s\n' "$trace" | grep -q '^warp=' || return 1
+    [[ "$trace" == *"ip="* && "$trace" == *"warp="* ]] || return 1
     printf '%s\n' "$trace"
 }
 
-warpstack_trace_value() {
-    local trace="$1" key="$2"
-    printf '%s\n' "$trace" | awk -F= -v key="$key" '$1 == key { print $2; exit }'
-}
-
-warpstack_trace_warp_label() {
-    local trace="$1" warp
-    warp="$(warpstack_trace_value "$trace" "warp")"
-    [[ "$warp" == "on" ]] && warp="free"
-    [[ -n "$warp" ]] && printf '%s\n' "$warp" || printf 'unknown\n'
-}
-
-warpstack_merge_warp_status() {
-    local status="unknown" trace warp
-    for trace in "$@"; do
-        [[ -z "$trace" ]] && continue
-        warp="$(warpstack_trace_warp_label "$trace")"
-        case "$warp" in
-            plus) printf 'plus\n'; return 0 ;;
-            free) status="free" ;;
-            off) [[ "$status" == "unknown" ]] && status="off" ;;
-        esac
-    done
-
-    printf '%s\n' "$status"
-}
-
 warpstack_trace_is_warp() {
-    local trace="$1" warp
-    warp="$(warpstack_trace_value "$trace" "warp")"
+    local warp
+    warp="$(warp_trace_value "$1" "warp")"
     [[ -n "$warp" && "$warp" != "off" ]]
 }
 
@@ -9200,7 +11495,7 @@ warpstack_modify_config() {
     echo -e "  ${GREEN}1)${NC} 改Endpoint   ${CYAN}2)${NC} 改MTU"
     echo -e "  ${YELLOW}3)${NC} 编辑配置     ${RED}0)${NC} 返回上级"
     echo
-    read -rp "  请选择 [0-3]: " sub
+    sub=$(read_menu_choice "  请选择 [0-3]: ") || return 1
 
     case "$sub" in
         1)
@@ -9211,7 +11506,7 @@ warpstack_modify_config() {
                     warpstack_warn "Endpoint 格式无效，请使用 域名/IP:端口 或 [IPv6]:端口"
                 else
                     backup_file="$(warpstack_make_backup)" || return 1
-                    escaped_ep=$(warpstack_escape_sed_replacement "$new_ep")
+                    escaped_ep=$(warp_escape_sed_replacement "$new_ep")
                     sed -i "s|^Endpoint = .*|Endpoint = ${escaped_ep}|" "$WARPSTACK_WG_CONF" || { warpstack_warn "配置修改失败；备份保留在 $backup_file"; return 1; }
                     warpstack_restart_wg_with_backup "$backup_file" || true
                 fi
@@ -9270,6 +11565,7 @@ warpstack_restart_wg() {
 }
 
 warpstack_manage_service() {
+    local sub
     while true; do
         clear
         warpstack_menu_divider
@@ -9282,7 +11578,7 @@ warpstack_manage_service() {
         echo -e "  ${GREEN}1)${NC} 修改配置  ${CYAN}2)${NC} 暂停服务"
         echo -e "  ${YELLOW}3)${NC} 重启服务  ${RED}0)${NC} 返回上级"
         echo
-        read -rp "  请选择 [0-3]: " sub || return 1
+        sub=$(read_menu_choice "  请选择 [0-3]: ") || return 1
 
         case "$sub" in
             1) warpstack_modify_config && warpstack_pause ;;
@@ -9297,29 +11593,52 @@ warpstack_manage_service() {
 warpstack_show_ip() {
     clear
     warpstack_info "当前出口 IP"
-    local v4 v6 allowed v4_trace="" v6_trace="" v4_suffix="" v6_suffix="" warp_status="" has_target=false has_warp=false
-    v4=$(warpstack_public_ip "-4" "无")
-    v6=$(warpstack_public_ip "-6" "无")
+    local v4="无" v6="无" allowed="" v4_trace="" v6_trace="" v4_suffix="" v6_suffix="" warp_status="" has_target=false has_warp=false tmpdir
+    tmpdir="$(mktemp -d /tmp/zero-ws-ip.XXXXXX)" || return 1
 
     if [[ -f "$WARPSTACK_WG_CONF" ]]; then
         allowed="$(warpstack_conf_value "AllowedIPs")"
-        if [[ "$allowed" == *"0.0.0.0/0"* ]]; then
-            has_target=true
-            v4_trace="$(warpstack_fetch_trace "-4" || true)"
-            if warpstack_trace_is_warp "$v4_trace"; then
-                has_warp=true
-                v4_suffix=" ${GREEN}(WARP)${NC}"
-            fi
-        fi
-        if [[ "$allowed" == *"::/0"* ]]; then
-            has_target=true
-            v6_trace="$(warpstack_fetch_trace "-6" || true)"
-            if warpstack_trace_is_warp "$v6_trace"; then
-                has_warp=true
-                v6_suffix=" ${GREEN}(WARP)${NC}"
-            fi
-        fi
     fi
+
+    if [[ "$allowed" == *"0.0.0.0/0"* ]]; then
+        has_target=true
+        ( warpstack_fetch_trace "-4" > "$tmpdir/t4" 2>/dev/null || warpstack_public_ip "-4" "无" > "$tmpdir/ip4" ) &
+    else
+        ( warpstack_public_ip "-4" "无" > "$tmpdir/ip4" ) &
+    fi
+
+    if [[ "$allowed" == *"::/0"* ]]; then
+        has_target=true
+        ( warpstack_fetch_trace "-6" > "$tmpdir/t6" 2>/dev/null || warpstack_public_ip "-6" "无" > "$tmpdir/ip6" ) &
+    else
+        ( warpstack_public_ip "-6" "无" > "$tmpdir/ip6" ) &
+    fi
+    wait
+
+    if [[ -s "$tmpdir/t4" ]]; then
+        v4_trace="$(<"$tmpdir/t4")"
+        v4="$(warp_trace_value "$v4_trace" "ip")"
+        [[ -z "$v4" ]] && v4="无"
+        if warpstack_trace_is_warp "$v4_trace"; then
+            has_warp=true
+            v4_suffix=" ${GREEN}(WARP)${NC}"
+        fi
+    elif [[ -s "$tmpdir/ip4" ]]; then
+        v4="$(<"$tmpdir/ip4")"
+    fi
+
+    if [[ -s "$tmpdir/t6" ]]; then
+        v6_trace="$(<"$tmpdir/t6")"
+        v6="$(warp_trace_value "$v6_trace" "ip")"
+        [[ -z "$v6" ]] && v6="无"
+        if warpstack_trace_is_warp "$v6_trace"; then
+            has_warp=true
+            v6_suffix=" ${GREEN}(WARP)${NC}"
+        fi
+    elif [[ -s "$tmpdir/ip6" ]]; then
+        v6="$(<"$tmpdir/ip6")"
+    fi
+    rm -rf "$tmpdir"
 
     echo -e "  IPv4: ${CYAN}${v4}${NC}${v4_suffix}"
     echo -e "  IPv6: ${CYAN}${v6}${NC}${v6_suffix}"
@@ -9336,7 +11655,7 @@ warpstack_show_ip() {
     fi
     $has_target || warpstack_warn "配置中未找到可检查的 WARP AllowedIPs"
     if $has_warp; then
-        warp_status="$(warpstack_merge_warp_status "$v4_trace" "$v6_trace")"
+        warp_status="$(warp_merge_warp_status "$v4_trace" "$v6_trace")"
         echo -e "  Warp: ${YELLOW}${warp_status}${NC}"
     else
         warpstack_warn "未检测到 WARP 出口状态"
@@ -9398,7 +11717,7 @@ warpstack_menu() {
     while true; do
         warpstack_show_menu
         warpstack_menu_divider
-        read -rp "  请输入选项 [0-5]: " choice || return 1
+        choice=$(read_menu_choice "  请输入选项 [0-5]: ") || return 1
         case "$choice" in
             1) warpstack_install_free; warpstack_pause ;;
             2) warpstack_install_team; warpstack_pause ;;
@@ -9465,6 +11784,12 @@ prompt_text() { printf '%b%s%b' "$BLUE" "$1" "$PLAIN"; }
 pause_menu() { read -r -p "$(prompt_text '按回车返回...')" _ || return 0; }
 screen() { [[ -t 1 && -n "${TERM:-}" ]] && clear; return 0; }
 ask_yes() { local answer; read -r -p "$(prompt_text "$1 [y/N]: ")" answer || return 1; [[ "$answer" =~ ^[Yy]$ ]]; }
+norm_choice() {
+    local v="${1#"${1%%[![:space:]]*}"}"
+    v="${v%"${v##*[![:space:]]}"}"
+    [[ "$v" =~ ^[0-9]+$ ]] && v=$((10#$v))
+    printf '%s' "$v"
+}
 
 usage() {
     printf '%s\n' \
@@ -9747,12 +12072,26 @@ validate_settings() {
 }
 
 detect_endpoint() {
-    local address
-    address=$(curl_get --noproxy '*' -4 --max-time 8 https://api64.ipify.org 2>/dev/null) &&
-        valid_ipv4 "$address" && { printf '%s' "$address"; return 0; }
-    address=$(curl_get --noproxy '*' -6 --max-time 8 https://api64.ipify.org 2>/dev/null) &&
-        valid_ipv6 "$address" && { printf '%s' "$address"; return 0; }
-    error '无法自动获取公网 IP，请检查服务器到 api64.ipify.org 的连接。'
+    local address url try_v4=1 try_v6=1
+    if command -v ip >/dev/null 2>&1; then
+        ip -4 route get 1.1.1.1 2>/dev/null | grep -Evq 'unreachable|prohibit|blackhole|throw|dev lo' || try_v4=0
+        ip -6 route get 2001:4860:4860::8888 2>/dev/null | grep -Evq 'unreachable|prohibit|blackhole|throw|dev lo' || try_v6=0
+    fi
+    if (( try_v4 )); then
+        for url in https://api64.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
+            address=$(curl_get --noproxy '*' -4 --connect-timeout 3 --max-time 4 "$url" 2>/dev/null) || continue
+            address="${address//$'\r'/}"; address="${address//$'\n'/}"
+            valid_ipv4 "$address" && { printf '%s' "$address"; return 0; }
+        done
+    fi
+    if (( try_v6 )); then
+        for url in https://api64.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
+            address=$(curl_get --noproxy '*' -6 --connect-timeout 3 --max-time 4 "$url" 2>/dev/null) || continue
+            address="${address//$'\r'/}"; address="${address//$'\n'/}"
+            valid_ipv6 "$address" && { printf '%s' "$address"; return 0; }
+        done
+    fi
+    error '无法自动获取公网 IP。'
 }
 
 default_listener() {
@@ -9941,14 +12280,14 @@ service_healthy() {
     local revision="$1" port pid sockets i family=inet
     port=$(jq -er '.port' "$revision/settings.json") || return 1
     [[ "$(jq -r '.listen_address' "$revision/settings.json")" == '[::]' ]] && family=inet6
-    for ((i=0; i<12; i++)); do
+    for ((i=0; i<25; i++)); do
         if systemctl is-active --quiet "$VOLTO_SERVICE" &&
             pid=$(systemctl show -p MainPID --value "$VOLTO_SERVICE") &&
             [[ "$pid" =~ ^[1-9][0-9]*$ ]] &&
             sockets=$(ss -H -lunp -f "$family" "sport = :$port") && [[ "$sockets" == *"pid=$pid,"* ]]; then
             return 0
         fi
-        (( i < 11 )) && sleep 1
+        (( i < 24 )) && sleep 0.2
     done
     return 1
 }
@@ -10109,7 +12448,7 @@ install_service() {
     fi
     prepare_release && download_release || return 1
     port=$(prompt_port) || return 1
-    endpoint=$(detect_endpoint) || return 1
+    endpoint=$(detect_endpoint) || endpoint=$(prompt_value '服务器公网 IP 或域名' '' valid_endpoint) || return 1
     listen=$(default_listener "$endpoint") || return 1
     congestion=$(choose_congestion '' "$VOLTO_WORK/release/volto") || return 1
     username=$(prompt_value '用户名' 'surge' valid_user) && password=$(prompt_password) || return 1
@@ -10203,9 +12542,10 @@ modify_port() {
 }
 
 modify_endpoint() {
-    local old endpoint listen
+    local old endpoint listen current_ep
     old=$(current_revision) || return 1
-    endpoint=$(detect_endpoint) || return 1
+    current_ep=$(jq -r '.endpoint // empty' "$old/settings.json" 2>/dev/null || true)
+    endpoint=$(detect_endpoint) || endpoint=$(prompt_value '服务器公网 IP 或域名' "$current_ep" valid_endpoint) || return 1
     listen=$(default_listener "$endpoint") || return 1
     new_revision && json_edit "$VOLTO_NEW/settings.json" --arg value "$endpoint" --arg listen "$listen" \
         '.endpoint=$value | .listen_address=$listen' &&
@@ -10441,6 +12781,7 @@ config_menu() {
             '3. 拥塞控制 / IP 优先级 / QUIC 连接数' '4. 自动刷新服务器地址' \
             '5. 更改认证 (用户名 / 密码)' '0. 返回上级'
         read -r -p "$(prompt_text '✦ Steins Gate ✦ : ')" option || return 0
+        option=$(norm_choice "$option")
         case "$option" in
             1) run_action modify_port;; 2) run_action modify_certificate;;
             3) run_action modify_transport;; 4) run_action modify_endpoint;;
@@ -10460,6 +12801,7 @@ service_menu() {
         menu_items '1. 查看状态 / 配置 (密码隐藏)' '2. 修改配置' \
             '3. 停止服务' '4. 重启服务' '5. 启动服务' '0. 返回主页'
         read -r -p "$(prompt_text '✦ Steins Gate ✦ : ')" option || return 0
+        option=$(norm_choice "$option")
         case "$option" in
             1) run_action show_status;; 2) config_menu; continue;; 3) run_action service_action stop;;
             4) run_action service_action restart;; 5) run_action service_action start;;
@@ -10476,6 +12818,7 @@ main_menu() {
         menu_title "✦ Volto_Ver.${VOLTO_MANAGER_VERSION} ✦"
         menu_items '1. 安装服务' '2. 管理服务' '3. 更新内核' '4. 删除服务' "${VOLTO_EXIT_TEXT:-0. 退出脚本}"
         read -r -p "$(prompt_text '✦ Steins Gate ✦ : ')" option || return 0
+        option=$(norm_choice "$option")
         case "$option" in
             1) run_action install_service;;
             2) if require_install; then service_menu; continue; fi; false;;
@@ -10550,6 +12893,13 @@ run_action() (
     "$@"
 )
 
+cert_timer_ready() {
+    [[ -f "$VOLTO_CERT_UNIT" && -f "$VOLTO_CERT_TIMER_UNIT" && -x "$VOLTO_MANAGER" ]] &&
+        grep -Fqx "ExecStart=$VOLTO_MANAGER --renew-cert" "$VOLTO_CERT_UNIT" 2>/dev/null &&
+        systemctl is-enabled --quiet "$VOLTO_CERT_TIMER" 2>/dev/null &&
+        systemctl is-active --quiet "$VOLTO_CERT_TIMER" 2>/dev/null
+}
+
 main() {
     local action="${1:---menu}"
     case "$action" in
@@ -10569,7 +12919,7 @@ main() {
     dependencies || return 1
     case "$action" in
         --menu)
-            if require_install >/dev/null 2>&1; then
+            if require_install >/dev/null 2>&1 && ! cert_timer_ready; then
                 run_action sync_certificate_timer || warn '证书自动同步未能启用，请检查上方错误。'
             fi
             main_menu;;
@@ -10602,7 +12952,14 @@ configure_volto() {
 # END ZERO_VOLTO_MODULE
 
 reinstall_system_menu() { reinstall_menu; }
-reboot_system()         { echo "系统将在 3 秒后重新启动..."; sleep 3; reboot_vps; }
+reboot_system() {
+    local confirm
+    read -r -p "${YELLOW}确认立即重启 VPS 吗? [y/N]: ${PLAIN}" confirm || return 0
+    [[ "$confirm" =~ ^[Yy]$ ]] || return 0
+    echo -e "${YELLOW}系统将在 3 秒后重新启动...${PLAIN}"
+    sleep 3
+    reboot_vps
+}
 configure_mihomo()      { ( umask 077; mihomo_menu ); }
 configure_singbox()     { singbox_menu; }
 configure_wireproxy() {
@@ -10649,8 +13006,13 @@ firewall_exec() {
 firewall_supports_table() {
     local cmd="$1"
     local table="$2"
+    local probe_chain="INPUT"
     command -v "$cmd" >/dev/null 2>&1 || return 1
-    firewall_exec_quiet "$cmd" -t "$table" -S
+    case "$table" in
+        nat)    probe_chain="PREROUTING" ;;
+        mangle) probe_chain="FORWARD" ;;
+    esac
+    firewall_exec_quiet "$cmd" -t "$table" -S "$probe_chain"
 }
 
 firewall_chain_exists() {
@@ -10730,8 +13092,7 @@ firewall_has_rules() {
 }
 
 firewall_install_tools() {
-    command -v apt >/dev/null 2>&1 || return 1
-    apt update && apt install -y iptables iproute2
+    pkg_install iptables iproute2
 }
 
 firewall_prepare_tools() {
@@ -10751,9 +13112,8 @@ firewall_prepare_tools() {
     fi
 }
 
-firewall_write_restore_service() {
-    mkdir -p "$FIREWALL_RULE_DIR" || return 1
-    cat > "$ZERO_FIREWALL_SERVICE" <<EOF
+firewall_render_restore_service() {
+    cat <<EOF
 [Unit]
 Description=Restore Zero firewall rules
 After=network.target
@@ -10772,7 +13132,14 @@ firewall_setup_persistence() {
     mkdir -p "$FIREWALL_RULE_DIR" || return 1
 
     if command -v systemctl >/dev/null 2>&1; then
-        firewall_write_restore_service || return 1
+        local expected_unit current_unit=""
+        expected_unit=$(firewall_render_restore_service)
+        [[ -f "$ZERO_FIREWALL_SERVICE" ]] && current_unit=$(<"$ZERO_FIREWALL_SERVICE")
+        if [[ "$current_unit" == "$expected_unit" ]] &&
+           systemctl is-enabled --quiet "$ZERO_FIREWALL_SERVICE_NAME" 2>/dev/null; then
+            return 0
+        fi
+        printf '%s\n' "$expected_unit" > "$ZERO_FIREWALL_SERVICE" || return 1
         systemctl daemon-reload >/dev/null 2>&1 || return 1
         systemctl enable "$ZERO_FIREWALL_SERVICE_NAME" >/dev/null 2>&1 || return 1
         return 0
@@ -10953,7 +13320,7 @@ firewall_dispose_backup() {
 }
 
 firewall_current_ssh_port() {
-    local port sockets unit socket_listen socket_address _client _client_port _server
+    local port sockets unit socket_listen tok prev_tok _client _client_port _server
     read -r _client _client_port _server port <<< "${SSH_CONNECTION:-}"
     if [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && (( port <= 65535 )); then
         sockets=$(ss -H -lntp "sport = :$port" 2>/dev/null) || sockets=''
@@ -10964,29 +13331,18 @@ firewall_current_ssh_port() {
             for unit in ssh.socket sshd.socket; do
                 systemctl is-active --quiet "$unit" 2>/dev/null || continue
                 socket_listen=$(systemctl show -p Listen --value "$unit" 2>/dev/null) || continue
-                while IFS= read -r socket_address; do
-                    if [[ "$socket_address" =~ ^([0-9.]+|\[[^]]+\]):${port}(%[^[:space:]]+)?[[:space:]]+\(Stream\)$ ]]; then
+                prev_tok=""
+                for tok in $socket_listen; do
+                    if [[ "$tok" == "(Stream)" && ( "$prev_tok" == "$port" || "$prev_tok" =~ ^([0-9.]+|\[[^]]+\]|\*):${port}(%[^[:space:]]+)?$ ) ]]; then
                         printf '%s\n' "$port"
                         return 0
                     fi
-                done <<< "$socket_listen"
+                    prev_tok="$tok"
+                done
             done
         fi
     fi
     ssh_get_current_port
-}
-
-firewall_read_runtime_status() {
-    local has_iptables=false
-    local has_ip6tables=false
-
-    firewall_supports_table "iptables" filter && has_iptables=true
-    firewall_supports_table "ip6tables" filter && has_ip6tables=true
-
-    printf '%s\n' \
-        "$(firewall_current_ssh_port)" \
-        "$has_iptables" \
-        "$has_ip6tables"
 }
 
 firewall_read_view_status() {
@@ -11069,7 +13425,10 @@ firewall_can_change_ssh_port() {
 }
 
 firewall_prepare_input_chain_for_cmd() {
-    local cmd="$1"
+    local cmd="$1" first_rule
+    command -v "$cmd" >/dev/null 2>&1 || return 1
+    first_rule=$("$cmd" -w 3 -t filter -S INPUT 1 2>/dev/null || true)
+    [[ "$first_rule" == "-A INPUT -j $ZERO_FW_CHAIN" ]] && return 0
     firewall_supports_table "$cmd" filter || return 1
     firewall_ensure_chain "$cmd" filter "$ZERO_FW_CHAIN" || return 1
     firewall_ensure_rule_absent "$cmd" filter INPUT -j "$ZERO_FW_CHAIN" || return 1
@@ -11077,7 +13436,10 @@ firewall_prepare_input_chain_for_cmd() {
 }
 
 firewall_prepare_nat_chain_for_cmd() {
-    local cmd="$1"
+    local cmd="$1" first_rule
+    command -v "$cmd" >/dev/null 2>&1 || return 1
+    first_rule=$("$cmd" -w 3 -t nat -S PREROUTING 1 2>/dev/null || true)
+    [[ "$first_rule" == "-A PREROUTING -j $ZERO_PORT_JUMP_CHAIN" ]] && return 0
     firewall_supports_table "$cmd" nat || return 1
     firewall_ensure_chain "$cmd" nat "$ZERO_PORT_JUMP_CHAIN" || return 1
     firewall_ensure_rule_absent "$cmd" nat PREROUTING -j "$ZERO_PORT_JUMP_CHAIN" || return 1
@@ -11194,107 +13556,6 @@ firewall_humanize_rule() {
     echo "$rule"
 }
 
-firewall_compact_rendered_lines() {
-    local chain="$1"
-    local scope rule proto port target action
-    local -a order_types order_values raw_lines group_scopes group_actions group_ports group_tcp group_udp
-    local order_count=0
-    local raw_count=0
-    local group_count=0
-    local found_index
-    local i
-
-    if [[ "$chain" != "$ZERO_FW_CHAIN" ]]; then
-        cat
-        return 0
-    fi
-
-    while IFS=$'\t' read -r scope rule; do
-        [[ -z "$scope" ]] && continue
-
-        proto=""
-        port=""
-        target=""
-        action=""
-
-        if [[ "$rule" =~ -p[[:space:]]+(tcp|udp) ]]; then
-            proto="${BASH_REMATCH[1]}"
-        fi
-        if [[ "$rule" =~ --dport[[:space:]]+([^[:space:]]+) ]]; then
-            port="${BASH_REMATCH[1]}"
-        fi
-        if [[ "$rule" =~ -j[[:space:]]+(ACCEPT|DROP) ]]; then
-            target="${BASH_REMATCH[1]}"
-        fi
-
-        if [[ -n "$proto" && -n "$port" && -n "$target" ]]; then
-            proto=$(firewall_protocol_label "$proto")
-            if [[ "$target" == "ACCEPT" ]]; then
-                action="放行"
-            else
-                action="阻断"
-            fi
-
-            found_index=-1
-            for (( i=0; i<group_count; i++ )); do
-                if [[ "${group_scopes[i]}" == "$scope" && "${group_actions[i]}" == "$action" && "${group_ports[i]}" == "$port" ]]; then
-                    found_index=$i
-                    break
-                fi
-            done
-
-            if (( found_index < 0 )); then
-                found_index=$group_count
-                group_scopes[group_count]="$scope"
-                group_actions[group_count]="$action"
-                group_ports[group_count]="$port"
-                group_tcp[group_count]=0
-                group_udp[group_count]=0
-                order_types[order_count]="group"
-                order_values[order_count]="$group_count"
-                ((order_count++))
-                ((group_count++))
-            fi
-
-            if [[ "$proto" == "TCP" ]]; then
-                group_tcp[found_index]=1
-            elif [[ "$proto" == "UDP" ]]; then
-                group_udp[found_index]=1
-            fi
-
-            continue
-        fi
-
-        raw_lines[raw_count]="${scope}"$'\t'"${rule}"
-        order_types[order_count]="line"
-        order_values[order_count]="$raw_count"
-        ((order_count++))
-        ((raw_count++))
-    done
-
-    for (( i=0; i<order_count; i++ )); do
-        if [[ "${order_types[i]}" == "line" ]]; then
-            printf '%s\n' "${raw_lines[${order_values[i]}]}"
-            continue
-        fi
-
-        local group_index="${order_values[i]}"
-        local proto_label="UDP"
-
-        if (( ${group_tcp[group_index]:-0} == 1 && ${group_udp[group_index]:-0} == 1 )); then
-            proto_label="TCP+UDP"
-        elif (( ${group_tcp[group_index]:-0} == 1 )); then
-            proto_label="TCP"
-        fi
-
-        printf '%s\tDISPLAY:%s %s %s\n' \
-            "${group_scopes[group_index]}" \
-            "${group_actions[group_index]}" \
-            "$proto_label" \
-            "${group_ports[group_index]}"
-    done
-}
-
 firewall_render_merged_chain() {
     local table="$1"
     local chain="$2"
@@ -11310,31 +13571,57 @@ firewall_render_merged_chain() {
             if firewall_has_rules "ip6tables" "$table" "$chain"; then
                 ip6tables -t "$table" -S "$chain" 2>/dev/null | sed -n "s/^-A ${chain} /v6 /p"
             fi
-        } | awk '
+        } | awk -v compact="$([[ "$chain" == "$ZERO_FW_CHAIN" ]] && echo 1 || echo 0)" '
             function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+            function tok_after(s, flag,    i, n, a) {
+                n = split(s, a, /[ \t]+/)
+                for (i = 1; i < n; i++) if (a[i] == flag) return a[i + 1]
+                return ""
+            }
             {
-                ver=$1
-                $1=""
+                ver=$1; $1=""
                 rule=trim($0)
-                if (!(rule in idx)) {
-                    idx[rule]=++count
-                    order[count]=rule
-                }
+                if (!(rule in idx)) { idx[rule]=++count; order[count]=rule }
                 if (ver=="v4") seen4[rule]=1
                 if (ver=="v6") seen6[rule]=1
             }
             END {
                 for (i=1; i<=count; i++) {
                     rule=order[i]
-                    if (seen4[rule] && seen6[rule]) scope="both"
-                    else if (seen4[rule]) scope="v4"
-                    else scope="v6"
-                    printf "%s\t%s\n", scope, rule
+                    scope = (seen4[rule] && seen6[rule]) ? "both" : (seen4[rule] ? "v4" : "v6")
+                    if (compact) {
+                        proto = tok_after(rule, "-p")
+                        port  = tok_after(rule, "--dport")
+                        tgt   = tok_after(rule, "-j")
+                        if ((proto == "tcp" || proto == "udp") && port != "" && (tgt == "ACCEPT" || tgt == "DROP")) {
+                            act = (tgt == "ACCEPT") ? "放行" : "阻断"
+                            key = scope SUBSEP act SUBSEP port
+                            if (!(key in gidx)) {
+                                gidx[key] = ++out_n
+                                otype[out_n] = "g"
+                                gscope[out_n] = scope; gact[out_n] = act; gport[out_n] = port
+                            }
+                            gi = gidx[key]
+                            if (proto == "tcp") gtcp[gi] = 1
+                            else gudp[gi] = 1
+                            continue
+                        }
+                    }
+                    ++out_n
+                    otype[out_n] = "r"
+                    oraw[out_n] = scope "\t" rule
+                }
+                for (i=1; i<=out_n; i++) {
+                    if (otype[i] == "r") {
+                        print oraw[i]
+                    } else {
+                        plab = (gtcp[i] && gudp[i]) ? "TCP+UDP" : (gtcp[i] ? "TCP" : "UDP")
+                        printf "%s\tDISPLAY:%s %s %s\n", gscope[i], gact[i], plab, gport[i]
+                    }
                 }
             }
         '
     )
-    rendered=$(printf '%s\n' "$rendered" | firewall_compact_rendered_lines "$chain")
 
     echo -e "${YELLOW}${title}:${PLAIN}"
     if [[ -z "$rendered" ]]; then
@@ -11521,7 +13808,7 @@ port_jump_set() {
     fi
 
     local user_interface
-    read -r -p "$(echo -e "${YELLOW}请输入网卡名称(默认:${interface}): ${PLAIN}")" user_interface
+    read -r -p "${YELLOW}请输入网卡名称(默认:${interface}): ${PLAIN}" user_interface
     user_interface=$(trim_input "$user_interface")
     user_interface=${user_interface:-$interface}
     if ! ip link show "$user_interface" >/dev/null 2>&1; then
@@ -11531,7 +13818,7 @@ port_jump_set() {
     fi
 
     local port_range start_port end_port
-    read -r -p "$(echo -e "${YELLOW}请输入 UDP 端口范围(默认18443:28444): ${PLAIN}")" port_range
+    read -r -p "${YELLOW}请输入 UDP 端口范围(默认18443:28444): ${PLAIN}" port_range
     port_range=$(trim_input "$port_range")
     port_range=${port_range:-18443:28444}
     if [[ "$port_range" =~ ^([0-9]{1,5}):([0-9]{1,5})$ ]]; then
@@ -11551,7 +13838,7 @@ port_jump_set() {
     port_range="$start_port:$end_port"
 
     local target_port
-    read -r -p "$(echo -e "${YELLOW}请输入目标 UDP 端口: ${PLAIN}")" target_port
+    read -r -p "${YELLOW}请输入目标 UDP 端口: ${PLAIN}" target_port
     target_port=$(trim_input "$target_port")
     if ! [[ "$target_port" =~ ^[1-9][0-9]{0,4}$ ]] || (( target_port < 1 || target_port > 65535 )); then
         echo -e "${RED}无效的目标端口,请输入 1-65535${PLAIN}"
@@ -11853,15 +14140,22 @@ handle_firewall_action_choice() {
 }
 
 configure_firewall() {
-    local action_choice current_ssh_port has_iptables has_ip6tables
-    local -a firewall_runtime_status
+    local action_choice current_ssh_port has_iptables=false has_ip6tables=false init_ok=0
 
     if ! firewall_prepare_tools; then
         press_any_key_to_continue
         return 1
     fi
 
-    if ! firewall_prepare_input_chain_for_cmd "iptables" 2>/dev/null && ! firewall_prepare_input_chain_for_cmd "ip6tables" 2>/dev/null; then
+    if firewall_prepare_input_chain_for_cmd "iptables" 2>/dev/null; then
+        has_iptables=true
+        init_ok=1
+    fi
+    if firewall_prepare_input_chain_for_cmd "ip6tables" 2>/dev/null; then
+        has_ip6tables=true
+        init_ok=1
+    fi
+    if (( init_ok == 0 )); then
         echo -e "${RED}[!] 无法初始化防火墙管理链${PLAIN}"
         press_any_key_to_continue
         return 1
@@ -11870,10 +14164,7 @@ configure_firewall() {
     firewall_setup_persistence || true
 
     while true; do
-        mapfile -t firewall_runtime_status < <(firewall_read_runtime_status)
-        current_ssh_port="${firewall_runtime_status[0]}"
-        has_iptables="${firewall_runtime_status[1]}"
-        has_ip6tables="${firewall_runtime_status[2]}"
+        current_ssh_port=$(firewall_current_ssh_port)
         firewall_show_menu "$current_ssh_port" "$has_iptables" "$has_ip6tables"
         action_choice=$(read_menu_choice "请输入选项 [0-6]: ") || return 1
         handle_firewall_action_choice "$action_choice" "$current_ssh_port" || return
