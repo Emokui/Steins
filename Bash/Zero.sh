@@ -1504,6 +1504,8 @@ cat >> /etc/network/interfaces <<EOF_IPV6
 ${auto_header}iface \$iface6 inet6 dhcp
     accept_ra 2
     pre-up echo 2 > /proc/sys/net/ipv6/conf/\\\$IFACE/accept_ra 2>/dev/null || true
+    pre-up ip link set dev \\\$IFACE up 2>/dev/null || true
+    pre-up for i in 1 2 3 4 5 6; do ip -6 addr show dev \\\$IFACE scope link 2>/dev/null | grep -q 'inet6 ' && ! ip -6 addr show dev \\\$IFACE scope link 2>/dev/null | grep -q 'tentative' && break; sleep 1; done
     dns-nameservers ${dns_line}
 EOF_IPV6
 EOF
@@ -1519,7 +1521,7 @@ ${auto_header}iface \$iface6 inet6 static
     dns-nameservers ${dns_line}
 EOF_IPV6
 EOF
-            elif [[ "$(printf '%s' "$REINSTALL_IPV6_GATE" | tr '[:upper:]' '[:lower:]')" == fe80:* ]] ||
+            elif [[ "$REINSTALL_IPV6_GATE" == [Ff][Ee]80:* ]] ||
                  reinstall_ipv6_in_same_subnet "$REINSTALL_IPV6_ADDR" "$REINSTALL_IPV6_PREFIX" "$REINSTALL_IPV6_GATE"; then
                 cat <<EOF
 cat >> /etc/network/interfaces <<EOF_IPV6
