@@ -44,7 +44,7 @@ fi
 check_supported_system || exit 1
 
 get_root_home() {
-    local line home=""
+    local user uid dir home=""
     if [[ -r /etc/passwd ]]; then
         while IFS=: read -r user _ uid _ _ dir _; do
             if [[ "$user" == "root" ]]; then
@@ -143,7 +143,7 @@ get_default_interface() {
     iface=$(ip -4 route show default 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i + 1); exit}}')
     [[ -z "$iface" ]] && iface=$(ip -6 route show default 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i + 1); exit}}')
     [[ -z "$iface" ]] && iface=$(ip -o link show 2>/dev/null | awk -F': ' '$2 != "lo" {print $2; exit}')
-    echo "$iface"
+    echo "${iface%%@*}"
 }
 
 zero_get_arch() {
@@ -2206,22 +2206,26 @@ update_sshd_option() {
         for f in /etc/ssh/sshd_config.d/*.conf; do
             [ -f "\$f" ] || continue
             awk -v k="\$key" '
-                BEGIN { lk = tolower(k) }
-                tolower(\$0) ~ ("^[#[:space:]]*" lk "([[:space:]]+|=)") { next }
+                BEGIN { lk = tolower(k); in_match = 0 }
+                tolower(\$1) == "match" { in_match = 1 }
+                !in_match && tolower(\$0) ~ ("^[#[:space:]]*" lk "([[:space:]]+|=)") { next }
                 { print }
             ' "\$f" > "\${f}.tmp" && mv -f "\${f}.tmp" "\$f"
         done
     fi
     if [ -f /etc/ssh/sshd_config ]; then
         awk -v k="\$key" -v v="\$value" '
-            BEGIN { inserted = 0; lk = tolower(k) }
+            BEGIN { inserted = 0; lk = tolower(k); in_match = 0 }
             {
                 low = tolower(\$0)
-                if (low ~ ("^[#[:space:]]*" lk "([[:space:]]+|=)")) next
-                if (!inserted && low ~ "^[[:space:]]*match[[:space:]]+") {
-                    print k " " v
-                    inserted = 1
+                if (!in_match && low ~ "^[[:space:]]*match[[:space:]]+") {
+                    if (!inserted) {
+                        print k " " v
+                        inserted = 1
+                    }
+                    in_match = 1
                 }
+                if (!in_match && low ~ ("^[#[:space:]]*" lk "([[:space:]]+|=)")) next
                 print
             }
             END {
@@ -3675,6 +3679,7 @@ bbr_ensure_speedtest() {
 }
 
 bbr_detect_bandwidth() {
+    local bw_choice="" preset_choice="" manual_bandwidth=""
     echo -e "${BLUE}======== BBR调优 ========${PLAIN}" >&2
     echo -e "${GREEN}1.${PLAIN}自动检测    ${GREEN}2.${PLAIN}预设档位" >&2
     echo -e "${GREEN}3.${PLAIN}恢复网络    ${YELLOW}0.${PLAIN}返回上级" >&2
@@ -3892,7 +3897,7 @@ bbr_eligible_ifaces() {
         [[ -e "$path" ]] || continue
         dev=$(basename "$path")
         case "$dev" in
-            lo|docker*|veth*|br-*|virbr*|zt*|tailscale*|wg*|tun*|tap*) continue ;;
+            lo|docker*|veth*|br-*|virbr*|zt*|tailscale*|wg*|warp*|CloudflareWARP*|tun*|tap*) continue ;;
         esac
         echo "$dev"
     done
@@ -4060,7 +4065,7 @@ if command -v tc >/dev/null 2>&1; then
         [ -e "$d" ] || continue
         dev=$(basename "$d")
         case "$dev" in
-            lo|docker*|veth*|br-*|virbr*|zt*|tailscale*|wg*|tun*|tap*) continue ;;
+            lo|docker*|veth*|br-*|virbr*|zt*|tailscale*|wg*|warp*|CloudflareWARP*|tun*|tap*) continue ;;
         esac
         tc qdisc replace dev "$dev" root fq 2>/dev/null
     done
@@ -4374,6 +4379,10 @@ DNS_DHCLIENT_HOOK_DIR="/etc/dhcp/dhclient-enter-hooks.d"
 DNS_DHCLIENT_HOOK_FILE="$DNS_DHCLIENT_HOOK_DIR/zz-zero-dns"
 DNS_DHCPCD_CONF="/etc/dhcpcd.conf"
 DNS_DHCPCD_BACKUP="/etc/dhcpcd.conf.zero.bak"
+DNS_OCI_CONF="/etc/oci-hostname.conf"
+DNS_NETWORKD_DIR="/etc/systemd/network"
+DNS_NETWORKD_RUN_DIR="/run/systemd/network"
+DNS_NM_DROPIN="/etc/NetworkManager/conf.d/90-zero-dns.conf"
 DNS_RESOLVED_DROPIN_DIR="/etc/systemd/resolved.conf.d"
 DNS_RESOLVED_DROPIN_FILE="$DNS_RESOLVED_DROPIN_DIR/zz-zero-dns.conf"
 DNS_RESOLVED_PREVIOUS_FILE="$DNS_RESOLVED_DROPIN_DIR/90-zero-dns.conf"
@@ -4719,14 +4728,18 @@ dns_sync_dhclient() {
     {
         printf '# Managed by Zero.sh\n'
         printf 'make_resolv_conf() {\n'
-        printf "    local r='%s' t\n" "$esc_resolv"
-        printf '    t="${r}.dhclient.$$"\n'
+        printf "    if [ -L '%s' ] && command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet systemd-resolved 2>/dev/null; then\n" "$esc_resolv"
+        printf '        return 0\n'
+        printf '    fi\n'
+        printf "    _zero_r='%s'\n" "$esc_resolv"
+        printf '    _zero_t="${_zero_r}.dhclient.$$"\n'
         printf '    {\n'
         printf "        printf '# Managed by Zero.sh\\n'\n"
         for ns in "$@"; do
             printf "        printf 'nameserver %s\\n'\n" "$ns"
         done
-        printf '    } > "$t" 2>/dev/null && chmod 644 "$t" 2>/dev/null && mv -f "$t" "$r" 2>/dev/null || rm -f "$t" 2>/dev/null\n'
+        printf '    } > "$_zero_t" 2>/dev/null && chmod 644 "$_zero_t" 2>/dev/null && mv -f "$_zero_t" "$_zero_r" 2>/dev/null || rm -f "$_zero_t" 2>/dev/null\n'
+        printf '    unset _zero_r _zero_t\n'
         printf '    return 0\n'
         printf '}\n'
     } > "$tmp_hook" || { rm -f "$tmp_conf" "$tmp_hook"; return 1; }
@@ -4850,6 +4863,144 @@ dns_unsync_dhcpcd() {
     return 0
 }
 
+dns_should_sync_oci() {
+    [[ -n "${DNS_OCI_CONF:-}" ]] || return 1
+    [[ "$DNS_OCI_CONF" == "/etc/oci-hostname.conf" && "$DNS_RESOLV_CONF" != "/etc/resolv.conf" ]] && return 1
+    [[ -e "$DNS_OCI_CONF" || -L "$DNS_OCI_CONF" || -e "${DNS_OCI_CONF}.zero.bak" || "$DNS_OCI_CONF" != "/etc/oci-hostname.conf" ]] && return 0
+    grep -qi 'oraclecloud' /sys/devices/virtual/dmi/id/chassis_asset_tag /sys/devices/virtual/dmi/id/board_vendor 2>/dev/null
+}
+
+dns_sync_oci() {
+    dns_should_sync_oci || return 0
+    local backup="${DNS_OCI_CONF}.zero.bak" tmp src="/dev/null" created=0
+    [[ ! -L "$DNS_OCI_CONF" && ! -L "$backup" ]] || return 1
+    mkdir -p "$(dns_parent_dir "$DNS_OCI_CONF")" || return 1
+    if [[ -f "$DNS_OCI_CONF" ]]; then
+        src="$DNS_OCI_CONF"
+        if LC_ALL=C grep -Eq '^[[:space:]]*# Created by Zero\.sh[[:space:]]*$' "$DNS_OCI_CONF" 2>/dev/null; then
+            created=1
+        elif [[ ! -f "$backup" ]]; then
+            dns_copy_preserve "$DNS_OCI_CONF" "$backup" || return 1
+        fi
+    else
+        created=1
+    fi
+    tmp=$(mktemp "${DNS_OCI_CONF}.zero.XXXXXX") || return 1
+    chmod 644 "$tmp"
+    LC_ALL=C awk -v created="$created" '
+        BEGIN { if (created) print "# Created by Zero.sh" }
+        /^[[:space:]]*# Created by Zero\.sh[[:space:]]*$/ { next }
+        /^[[:space:]]*PRESERVE_HOSTINFO[[:space:]]*=/ {
+            val = $0; sub(/^[^=]*=[[:space:]]*/, "", val); sub(/[[:space:]#].*$/, "", val)
+            print (val == "1" || val == "3") ? "PRESERVE_HOSTINFO=3" : "PRESERVE_HOSTINFO=2"
+            done_p = 1
+            next
+        }
+        { print }
+        END { if (!done_p) print "PRESERVE_HOSTINFO=2" }
+    ' "$src" > "$tmp" && mv -f "$tmp" "$DNS_OCI_CONF" || { rm -f "$tmp"; return 1; }
+}
+
+dns_unsync_oci() {
+    [[ -n "${DNS_OCI_CONF:-}" ]] || return 0
+    [[ "$DNS_OCI_CONF" == "/etc/oci-hostname.conf" && "$DNS_RESOLV_CONF" != "/etc/resolv.conf" ]] && return 0
+    local backup="${DNS_OCI_CONF}.zero.bak"
+    if [[ -f "$backup" ]]; then
+        dns_copy_preserve "$backup" "$DNS_OCI_CONF" || return 1
+        rm -f "$backup"
+        DNS_SUB_RESTORED=1
+    elif [[ -f "$DNS_OCI_CONF" ]] && LC_ALL=C grep -Eq '^[[:space:]]*# Created by Zero\.sh[[:space:]]*$' "$DNS_OCI_CONF" 2>/dev/null; then
+        rm -f "$DNS_OCI_CONF"
+        DNS_SUB_RESTORED=1
+    fi
+    return 0
+}
+
+dns_networkd_active() {
+    if [[ "$DNS_NETWORKD_DIR" != "/etc/systemd/network" ]]; then
+        [[ -d "$DNS_NETWORKD_DIR" || -d "$DNS_NETWORKD_RUN_DIR" ]]
+        return $?
+    fi
+    [[ "$DNS_RESOLV_CONF" == "/etc/resolv.conf" ]] &&
+        command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet systemd-networkd 2>/dev/null
+}
+
+dns_sync_networkd() {
+    dns_networkd_active || return 0
+    local net_file base drop_dir drop_file wrote=0
+    for net_file in "$DNS_NETWORKD_DIR"/*.network "$DNS_NETWORKD_RUN_DIR"/*.network; do
+        [[ -f "$net_file" ]] || continue
+        base="${net_file##*/}"
+        drop_dir="${DNS_NETWORKD_DIR}/${base}.d"
+        drop_file="${drop_dir}/zz-zero-dns.conf"
+        mkdir -p "$drop_dir" || return 1
+        cat > "$drop_file" <<'EOF' || return 1
+# Managed by Zero.sh
+[Network]
+DNS=
+Domains=
+[DHCPv4]
+UseDNS=false
+UseDomains=false
+[DHCPv6]
+UseDNS=false
+UseDomains=false
+[IPv6AcceptRA]
+UseDNS=false
+UseDomains=false
+EOF
+        chmod 644 "$drop_file"
+        wrote=1
+    done
+    if (( wrote == 1 )) && command -v networkctl >/dev/null 2>&1; then
+        networkctl reload >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
+dns_unsync_networkd() {
+    [[ "$DNS_NETWORKD_DIR" == "/etc/systemd/network" && "$DNS_RESOLV_CONF" != "/etc/resolv.conf" ]] && return 0
+    local drop_file drop_dir removed=0
+    for drop_file in "$DNS_NETWORKD_DIR"/*.network.d/zz-zero-dns.conf; do
+        [[ -f "$drop_file" ]] || continue
+        LC_ALL=C grep -qx '# Managed by Zero.sh' "$drop_file" 2>/dev/null || continue
+        drop_dir="${drop_file%/*}"
+        rm -f "$drop_file"
+        rmdir "$drop_dir" 2>/dev/null || true
+        removed=1
+    done
+    if (( removed == 1 )); then
+        DNS_SUB_RESTORED=1
+        command -v networkctl >/dev/null 2>&1 && networkctl reload >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
+dns_sync_nm() {
+    local active=0
+    if [[ "$DNS_NM_DROPIN" != "/etc/NetworkManager/conf.d/90-zero-dns.conf" ]]; then
+        [[ -d "$(dns_parent_dir "$DNS_NM_DROPIN")" ]] && active=1
+    elif [[ "$DNS_RESOLV_CONF" == "/etc/resolv.conf" ]] && command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager 2>/dev/null; then
+        active=1
+    fi
+    (( active == 1 )) || return 0
+    mkdir -p "$(dns_parent_dir "$DNS_NM_DROPIN")" || return 1
+    printf '# Managed by Zero.sh\n[main]\ndns=none\nsystemd-resolved=false\n' > "$DNS_NM_DROPIN" || return 1
+    chmod 644 "$DNS_NM_DROPIN"
+    command -v systemctl >/dev/null 2>&1 && systemctl reload NetworkManager >/dev/null 2>&1 || true
+    return 0
+}
+
+dns_unsync_nm() {
+    [[ "$DNS_NM_DROPIN" == "/etc/NetworkManager/conf.d/90-zero-dns.conf" && "$DNS_RESOLV_CONF" != "/etc/resolv.conf" ]] && return 0
+    if [[ -f "$DNS_NM_DROPIN" ]] && LC_ALL=C grep -qx '# Managed by Zero.sh' "$DNS_NM_DROPIN" 2>/dev/null; then
+        rm -f "$DNS_NM_DROPIN"
+        DNS_SUB_RESTORED=1
+        command -v systemctl >/dev/null 2>&1 && systemctl reload NetworkManager >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
 dns_migrate_resolved_config() {
     if [[ -e "$DNS_RESOLVED_PREVIOUS_FILE" || -L "$DNS_RESOLVED_PREVIOUS_FILE" ]]; then
         if [[ -L "$DNS_RESOLVED_PREVIOUS_FILE" || -e "$DNS_RESOLVED_DROPIN_FILE" || -L "$DNS_RESOLVED_DROPIN_FILE" ]] ||
@@ -4911,7 +5062,8 @@ dns_apply_static() {
     fi
 
     if { dns_should_sync_dhclient && ! dns_sync_dhclient "$v4_csv" "$v6_csv" "$@"; } ||
-       { dns_should_sync_dhcpcd && ! dns_sync_dhcpcd; }; then
+       { dns_should_sync_dhcpcd && ! dns_sync_dhcpcd; } ||
+       ! dns_sync_oci || ! dns_sync_networkd || ! dns_sync_nm; then
         if (( had_existing == 1 )); then
             dns_replace_resolv "$prev_copy" 2>/dev/null || true
         else
@@ -4927,25 +5079,83 @@ dns_apply_static() {
 }
 
 dns_apply_resolved() {
-    local temp_dropin
+    local resolv_backup resolved_backup temp_dropin link_target="" ip v4_csv="" v6_csv=""
+    local primary_dns="" fallback_dns=""
+    local -a v4_arr=() v6_arr=()
     [[ $# -gt 0 ]] || return 1
 
+    for ip in "$@"; do
+        if dns_is_valid_ipv4 "$ip"; then
+            v4_arr+=("$ip")
+            v4_csv+="${v4_csv:+, }$ip"
+        else
+            v6_arr+=("$ip")
+            v6_csv+="${v6_csv:+, }$ip"
+        fi
+    done
+    if (( ${#v4_arr[@]} > 0 && ${#v6_arr[@]} > 0 )); then
+        primary_dns="${v4_arr[*]}"
+        fallback_dns="${v6_arr[*]}"
+    else
+        primary_dns="$*"
+    fi
+
     dns_migrate_resolved_config || return 1
+    dns_unlock_resolv_if_needed "$DNS_RESOLV_CONF" || return 1
     mkdir -p "$DNS_RESOLVED_DROPIN_DIR" || return 1
 
     temp_dropin=$(mktemp "$DNS_RESOLVED_DROPIN_DIR/.zz-zero-dns.XXXXXX") || return 1
     chmod 644 "$temp_dropin"
     {
-        printf '# Managed by Zero.sh\n[Resolve]\nDNS=%s\nFallbackDNS=\nDomains=~.\n' "$*"
+        printf '# Managed by Zero.sh\n[Resolve]\nDNS=%s\nFallbackDNS=%s\nDomains=~.\nDNSSEC=no\n' "$primary_dns" "$fallback_dns"
     } > "$temp_dropin" && mv -f "$temp_dropin" "$DNS_RESOLVED_DROPIN_FILE" || {
         rm -f "$temp_dropin"
         return 1
     }
 
+    dns_sync_oci || return 1
+    dns_sync_networkd || return 1
+    dns_sync_nm || return 1
+    if dns_should_sync_dhclient; then
+        dns_sync_dhclient "$v4_csv" "$v6_csv" "$@" || return 1
+    fi
+    if dns_should_sync_dhcpcd; then
+        dns_sync_dhcpcd || return 1
+    fi
+
     if ! systemctl restart systemd-resolved 2>/dev/null || ! dns_systemd_resolved_active; then
         echo -e "${RED}systemd-resolved 重启失败${PLAIN}" >&2
         return 1
     fi
+
+    resolv_backup=$(dns_resolv_backup_path)
+    resolved_backup=$(dns_resolved_resolv_backup_path)
+    local target_resolv="$DNS_RESOLVED_STUB" resolved_run_dir stub_disabled=0
+    resolved_run_dir=$(dns_parent_dir "$DNS_RESOLVED_STUB")
+    if LC_ALL=C grep -REqs '^[[:space:]]*DNSStubListener[[:space:]]*=[[:space:]]*(no|false|0)[[:space:]]*(#.*)?$' \
+        "$(dns_parent_dir "$DNS_RESOLVED_DROPIN_DIR")/resolved.conf" "$DNS_RESOLVED_DROPIN_DIR" 2>/dev/null &&
+       [[ -e "${resolved_run_dir}/resolv.conf" ]]; then
+        target_resolv="${resolved_run_dir}/resolv.conf"
+        stub_disabled=1
+    elif [[ ! -e "$target_resolv" && -e "${resolved_run_dir}/resolv.conf" ]]; then
+        target_resolv="${resolved_run_dir}/resolv.conf"
+    fi
+    if [[ -e "$target_resolv" ]]; then
+        link_target=$(readlink "$DNS_RESOLV_CONF" 2>/dev/null || true)
+        if [[ ( $stub_disabled -eq 1 && "$link_target" == *"systemd/resolve/stub-resolv.conf" ) ||
+              ( "$link_target" != *"systemd/resolve/stub-resolv.conf" && "$link_target" != *"systemd/resolve/resolv.conf" ) ]]; then
+            if [[ ! -L "$resolved_backup" && ! -f "$resolved_backup" ]]; then
+                if [[ -L "$resolv_backup" || -f "$resolv_backup" ]]; then
+                    mv -f "$resolv_backup" "$resolved_backup" || return 1
+                elif [[ -L "$DNS_RESOLV_CONF" || -f "$DNS_RESOLV_CONF" ]] &&
+                     ! LC_ALL=C grep -Eq '^[[:space:]]*# (Managed|Created) by Zero\.sh[[:space:]]*$' "$DNS_RESOLV_CONF" 2>/dev/null; then
+                    dns_copy_preserve "$DNS_RESOLV_CONF" "$resolved_backup" || return 1
+                fi
+            fi
+            ln -sfn "$target_resolv" "$DNS_RESOLV_CONF" || return 1
+        fi
+    fi
+
     command -v resolvectl >/dev/null 2>&1 && resolvectl flush-caches >/dev/null 2>&1 || true
     return 0
 }
@@ -4971,20 +5181,20 @@ dns_apply() {
         return 1
     fi
 
-    if (( ${#ok[@]} > 3 )); then
-        echo -e "${YELLOW}提示: glibc 静态解析最多使用前 3 个 DNS (MAXNS=3)${PLAIN}"
+    if ! dns_systemd_resolved_active && (( ${#ok[@]} > 3 )); then
+        echo -e "${YELLOW}提示: 当前为静态 resolv.conf 模式，glibc 最多使用前 3 个 DNS (MAXNS=3)${PLAIN}"
     fi
 
-    dns_apply_static "${ok[@]}" || return 1
     if dns_systemd_resolved_active; then
-        dns_apply_resolved "${ok[@]}" || return 1
+        dns_apply_resolved "${ok[@]}"
+    else
+        dns_apply_static "${ok[@]}"
     fi
-    return 0
 }
 
 dns_restore() {
     local changed=0 resolv_backup resolved_backup dhclient_conf dhclient_backup dhcpcd_conf dhcpcd_backup
-    local has_resolv_backup=0 has_resolv_created=0 restored_resolved=0
+    local has_resolv_backup=0 has_resolv_created=0 restored_resolved=0 need_restart_resolved=0
 
     dns_migrate_resolved_config || return 1
     resolv_backup=$(dns_resolv_backup_path)
@@ -5021,15 +5231,13 @@ dns_restore() {
     fi
 
     if [[ -f "$DNS_RESOLVED_DROPIN_FILE" || -L "$resolved_backup" || -f "$resolved_backup" ]]; then
+        need_restart_resolved=1
         dns_unlock_resolv_if_needed "$DNS_RESOLV_CONF" || return 1
         rm -f "$DNS_RESOLVED_DROPIN_FILE" || return 1
         if [[ -L "$resolved_backup" || -f "$resolved_backup" ]]; then
             dns_replace_resolv "$resolved_backup" || return 1
             rm -f "$resolved_backup"
             restored_resolved=1
-        fi
-        if dns_systemd_resolved_active; then
-            systemctl restart systemd-resolved 2>/dev/null || return 1
         fi
         changed=1
     fi
@@ -5055,7 +5263,14 @@ dns_restore() {
     DNS_SUB_RESTORED=0
     dns_unsync_dhclient || return 1
     dns_unsync_dhcpcd || return 1
+    dns_unsync_oci || return 1
+    dns_unsync_networkd || return 1
+    dns_unsync_nm || return 1
     (( DNS_SUB_RESTORED == 1 )) && changed=1
+
+    if (( ${need_restart_resolved:-0} == 1 )) && dns_systemd_resolved_active; then
+        systemctl restart systemd-resolved 2>/dev/null || return 1
+    fi
 
     if (( changed == 0 )); then
         echo -e "${YELLOW}未找到 Zero.sh 创建的 DNS 配置或备份${PLAIN}"
@@ -5118,6 +5333,19 @@ dns_zero_persistence_summary() {
             components+=("dhcpcd")
         fi
         [[ -f "$dhcpcd_backup" ]] && has_backup=1
+    fi
+    if [[ "$DNS_NETWORKD_DIR" != "/etc/systemd/network" || "$DNS_RESOLV_CONF" == "/etc/resolv.conf" ]] &&
+       compgen -G "$DNS_NETWORKD_DIR/*.network.d/zz-zero-dns.conf" >/dev/null 2>&1; then
+        components+=("networkd")
+    fi
+    if [[ "$DNS_NM_DROPIN" != "/etc/NetworkManager/conf.d/90-zero-dns.conf" || "$DNS_RESOLV_CONF" == "/etc/resolv.conf" ]] &&
+       [[ -f "$DNS_NM_DROPIN" ]] && LC_ALL=C grep -qx '# Managed by Zero.sh' "$DNS_NM_DROPIN" 2>/dev/null; then
+        components+=("NetworkManager")
+    fi
+    if [[ -n "${DNS_OCI_CONF:-}" && ( "$DNS_OCI_CONF" != "/etc/oci-hostname.conf" || "$DNS_RESOLV_CONF" == "/etc/resolv.conf" ) ]] &&
+       { [[ -f "${DNS_OCI_CONF}.zero.bak" ]] || { [[ -f "$DNS_OCI_CONF" ]] && LC_ALL=C grep -Eq '^[[:space:]]*# Created by Zero\.sh[[:space:]]*$' "$DNS_OCI_CONF" 2>/dev/null; }; }; then
+        components+=("OCI防还原")
+        has_backup=1
     fi
     [[ -L "$resolv_backup" || -f "$resolv_backup" || -L "$resolved_backup" || -f "$resolved_backup" ]] && has_backup=1
 
@@ -5879,6 +6107,7 @@ ACME_CF_ZONE_NAME=""
 ACME_CF_ACCOUNT_ID=""
 ACME_CF_CREDENTIAL_BACKUP=""
 ACME_CF_CREDENTIALS_REMOVED=0
+ACME_PROMPT_DOMAIN=""
 
 acme_exec() {
     [[ -f "$ACME_BIN" ]] || return 1
@@ -6094,7 +6323,7 @@ acme_display_cert_list() {
     printf "${GREEN}%-4s${PLAIN} | ${GREEN}%-40s${PLAIN} | ${GREEN}%-15s${PLAIN}\n" "序号" "域名" "计划续期"
     echo -e "${BLUE}------------------------------------------------------------------${PLAIN}"
 
-    local index=1
+    local index=1 line
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
 
@@ -6645,7 +6874,7 @@ acme_issue_cf_wildcard() {
 }
 
 acme_revoke_cert() {
-    local cert_list choice confirm selected_domain base_domain
+    local cert_list choice confirm selected_domain base_domain line
     local -a domains=()
 
     acme_require_installed || return
@@ -6840,6 +7069,8 @@ MIHOMO_CONFIG_PATH="${MIHOMO_CONFIG_DIR}/config.yaml"
 MIHOMO_SERVICE_NAME="mihomo"
 MIHOMO_SERVICE_FILE="/etc/systemd/system/mihomo.service"
 MIHOMO_ALPHA_TAG="Prerelease-Alpha"
+mihomo_cert_path=""
+mihomo_key_path=""
 
 mihomo_pause_and_return() {
     pause_enter_and_clear "按回车返回..."
@@ -6880,7 +7111,7 @@ mihomo_channel_label() {
 }
 
 mihomo_get_current_version_label() {
-    local version_line current_version
+    local version_line
     version_line=$("$MIHOMO_EXEC_PATH" -v 2>/dev/null | head -1)
     if [[ "$version_line" =~ (alpha-[0-9a-f]+) ]]; then
         printf '%s\n' "${BASH_REMATCH[1]}"
@@ -7064,6 +7295,8 @@ mihomo_select_cert() {
         if [[ "$opt" == "0" ]]; then
             read -r -p "${BLUE}证书路径: ${PLAIN}" mihomo_cert_path || return 1
             read -r -p "${BLUE}私钥路径: ${PLAIN}" mihomo_key_path || return 1
+            mihomo_cert_path=$(trim_input "$mihomo_cert_path")
+            mihomo_key_path=$(trim_input "$mihomo_key_path")
             if [[ -f "$mihomo_cert_path" && -f "$mihomo_key_path" ]]; then
                 return 0
             else
@@ -7412,6 +7645,7 @@ mihomo_install() {
         clear
         echo -e "${BLUE}===== AnyTLS 配置 =====${PLAIN}"
         read -r -p "${BLUE}端口(默认:8443): ${PLAIN}" anytls_port || return 1
+        anytls_port=$(trim_input "$anytls_port")
         anytls_port=${anytls_port:-8443}
         if ! mihomo_validate_port "$anytls_port"; then
             echo -e "${RED}AnyTLS 端口无效${PLAIN}"
@@ -7433,6 +7667,7 @@ mihomo_install() {
         clear
         echo -e "${BLUE}===== Trojan 配置 =====${PLAIN}"
         read -r -p "${BLUE}端口(默认:10819): ${PLAIN}" trojan_port || return 1
+        trojan_port=$(trim_input "$trojan_port")
         trojan_port=${trojan_port:-10819}
         if ! mihomo_validate_port "$trojan_port"; then
             echo -e "${RED}Trojan 端口无效${PLAIN}"
@@ -7454,6 +7689,7 @@ mihomo_install() {
         clear
         echo -e "${BLUE}===== Snell v5 配置 =====${PLAIN}"
         read -r -p "${BLUE}端口(默认:10815): ${PLAIN}" snell_port || return 1
+        snell_port=$(trim_input "$snell_port")
         snell_port=${snell_port:-10815}
         if ! mihomo_validate_port "$snell_port"; then
             echo -e "${RED}Snell v5 端口无效${PLAIN}"
@@ -7470,6 +7706,7 @@ mihomo_install() {
         if [[ "$snell_obfs" =~ ^[Yy]$ ]]; then
             snell_obfs="y"
             read -r -p "${BLUE}OBFS Host(默认:icloud.com.cn): ${PLAIN}" snell_obfs_host || return 1
+            snell_obfs_host=$(trim_input "$snell_obfs_host")
             snell_obfs_host=${snell_obfs_host:-icloud.com.cn}
         else
             snell_obfs="n"
@@ -7481,6 +7718,7 @@ mihomo_install() {
         clear
         echo -e "${BLUE}===== TUIC 配置 =====${PLAIN}"
         read -r -p "${BLUE}端口(默认:28443): ${PLAIN}" tuic_port || return 1
+        tuic_port=$(trim_input "$tuic_port")
         tuic_port=${tuic_port:-28443}
         if ! mihomo_validate_port "$tuic_port"; then
             echo -e "${RED}TUIC 端口无效${PLAIN}"
@@ -7488,6 +7726,7 @@ mihomo_install() {
             return
         fi
         read -r -p "${BLUE}UUID(回车随机): ${PLAIN}" tuic_uuid || return 1
+        tuic_uuid=$(trim_input "$tuic_uuid")
         if [[ -z "$tuic_uuid" ]]; then
             tuic_uuid=$(cat /proc/sys/kernel/random/uuid)
             [[ -n "$random_summary" ]] && random_summary+=$'\n'
@@ -7513,6 +7752,7 @@ mihomo_install() {
         clear
         echo -e "${BLUE}===== Hysteria2 配置 =====${PLAIN}"
         read -r -p "${BLUE}端口(默认:18443): ${PLAIN}" hy2_port || return 1
+        hy2_port=$(trim_input "$hy2_port")
         hy2_port=${hy2_port:-18443}
         if ! mihomo_validate_port "$hy2_port"; then
             echo -e "${RED}Hysteria2 端口无效${PLAIN}"
@@ -7683,7 +7923,7 @@ mihomo_toggle_or_modify_listener() {
 
     while true; do
         local is_enabled="n"
-        grep -q "name: $name" "$MIHOMO_CONFIG_PATH" && is_enabled="y"
+        grep -Eq "^- name: ${name}([[:space:]]|$)" "$MIHOMO_CONFIG_PATH" && is_enabled="y"
 
         clear
         echo -e "${BLUE}✦ ${display_name}_Conf ✦${PLAIN}"
@@ -7742,6 +7982,7 @@ mihomo_add_listener() {
     clear
     echo -e "${BLUE}===== 添加 ${display_name} =====${PLAIN}"
     read -r -p "${BLUE}端口(默认:${default_port}): ${PLAIN}" port || return 1
+    port=$(trim_input "$port")
     port=${port:-$default_port}
     if ! mihomo_validate_port "$port"; then
         echo -e "${RED}端口无效${PLAIN}"
@@ -7752,6 +7993,7 @@ mihomo_add_listener() {
     local uuid="" uuid_random="n" pass_random="n" snell_obfs="n" snell_obfs_host="icloud.com.cn"
     if [[ "$name" == "tuicv5-in" ]]; then
         read -r -p "${BLUE}UUID(回车随机): ${PLAIN}" uuid || return 1
+        uuid=$(trim_input "$uuid")
         if [[ -z "$uuid" ]]; then
             uuid=$(cat /proc/sys/kernel/random/uuid)
             uuid_random="y"
@@ -7778,6 +8020,7 @@ mihomo_add_listener() {
         if [[ "$snell_obfs" =~ ^[Yy]$ ]]; then
             snell_obfs="y"
             read -r -p "${BLUE}OBFS Host(默认:icloud.com.cn): ${PLAIN}" snell_obfs_host || return 1
+            snell_obfs_host=$(trim_input "$snell_obfs_host")
             snell_obfs_host=${snell_obfs_host:-icloud.com.cn}
         else
             snell_obfs="n"
@@ -7855,7 +8098,7 @@ mihomo_snell_obfs_enabled() {
 }
 
 mihomo_toggle_snell_obfs() {
-    local backup host
+    local backup host confirm
 
     if mihomo_snell_obfs_enabled; then
         echo -e "${BLUE}当前OBFS: 开启${PLAIN}"
@@ -7884,6 +8127,7 @@ mihomo_toggle_snell_obfs() {
 
     echo -e "${BLUE}当前OBFS: 关闭${PLAIN}"
     read -r -p "${BLUE}OBFS Host(默认:icloud.com.cn): ${PLAIN}" host
+    host=$(trim_input "$host")
     host=${host:-icloud.com.cn}
 
     backup=$(mihomo_make_config_backup) || {
@@ -7941,6 +8185,7 @@ mihomo_disable_listener() {
 mihomo_modify_listener_port() {
     local name="$1" new_port
     read -r -p "${BLUE}新端口: ${PLAIN}" new_port
+    new_port=$(trim_input "$new_port")
     if mihomo_validate_port "$new_port"; then
         local backup
         backup=$(mihomo_make_config_backup) || {
@@ -8496,6 +8741,8 @@ singbox_select_cert() {
         if [[ "$opt" == "0" ]]; then
             read -r -p "${BLUE}证书路径: ${PLAIN}" cert_path || return 1
             read -r -p "${BLUE}私钥路径: ${PLAIN}" key_path || return 1
+            cert_path=$(trim_input "$cert_path")
+            key_path=$(trim_input "$key_path")
         elif valid_list_index "$opt" "${#cert_files[@]}"; then
             cert_path="${cert_files[$((opt-1))]}"
             key_path="${cert_path%.crt}.key"
@@ -10827,7 +11074,7 @@ wireproxy_modify_config() {
             ${EDITOR:-nano} "$WIREPROXY_WG_WARP_CONF" || { wireproxy_warn "配置修改失败；备份保留在 $backup_file"; return 1; }
             wireproxy_restart_service_with_backup "$backup_file" "$WIREPROXY_WG_WARP_CONF"
             ;;
-        0) return 1 ;;
+        0) return 2 ;;
         *) wireproxy_warn "无效选择" ;;
     esac
 }
@@ -10843,6 +11090,7 @@ wireproxy_show_ip() {
 }
 
 wireproxy_uninstall() {
+    local yn=""
     clear
     wireproxy_menu_divider
     echo -e "  ${RED}删除 WARP SOCKS 服务${NC}"
@@ -10904,7 +11152,7 @@ wireproxy_menu() {
         case "$choice" in
             1) wireproxy_install_free; wireproxy_pause ;;
             2) wireproxy_install_team; wireproxy_pause ;;
-            3) wireproxy_modify_config && wireproxy_pause ;;
+            3) wireproxy_modify_config; [[ $? -eq 2 ]] || wireproxy_pause ;;
             4) wireproxy_uninstall && wireproxy_pause ;;
             5) wireproxy_show_ip; wireproxy_pause ;;
             0) return 0 ;;
@@ -10921,6 +11169,9 @@ warpstack_err()   { log_prefixed "$RED" "[ERROR]" "$*"; exit 1; }
 WARPSTACK_WG_CONF="/etc/wireguard/wg0.conf"
 WARPSTACK_WGCF_REPO="ViRb3/wgcf"
 WARPSTACK_WGCF_MIRROR_URL="https://cdn-wgcf.pages.dev/ViRb3/wgcf"
+WARPSTACK_WGCF_ARCH=""
+WARPSTACK_NET_MODE=""
+WARPSTACK_INSTALL_MODE=""
 WARPSTACK_APT_UPDATED=0
 WARPSTACK_AUTOSTART_STATUS="未设置"
 WARPSTACK_V4_ADDR=false
@@ -11559,7 +11810,7 @@ warpstack_modify_config() {
                 warpstack_restart_wg_with_backup "$backup_file" || true
             fi
             ;;
-        0) return 1 ;;
+        0) return 2 ;;
         *) warpstack_warn "无效选择" ;;
     esac
 }
@@ -11602,7 +11853,7 @@ warpstack_manage_service() {
         sub=$(read_menu_choice "  请选择 [0-3]: ") || return 1
 
         case "$sub" in
-            1) warpstack_modify_config && warpstack_pause ;;
+            1) warpstack_modify_config; [[ $? -eq 2 ]] || warpstack_pause ;;
             2) warpstack_stop_wg; warpstack_pause ;;
             3) warpstack_restart_wg; warpstack_pause ;;
             0) return 0 ;;
@@ -13408,6 +13659,7 @@ firewall_chain_allows_tcp_port_for_ssh_change() {
         [[ "$line" == *"-m conntrack --ctstate ESTABLISHED,RELATED"* ]] && continue
         [[ "$line" == *"-m conntrack --ctstate RELATED,ESTABLISHED"* ]] && continue
         [[ "$line" == *"-i lo"* ]] && continue
+        [[ "$line" == *"zero-acme-http01"* ]] && continue
 
         proto=""
         dport=""
@@ -13493,6 +13745,7 @@ firewall_should_hide_rule_in_view() {
             [[ "$rule" == *"-m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"* ]] && return 0
             [[ "$rule" == *"-i lo -j ACCEPT"* ]] && return 0
             [[ "$rule" == *"-p ipv6-icmp -j ACCEPT"* ]] && return 0
+            [[ "$rule" == *"--sport 547 --dport 546 -j ACCEPT"* ]] && return 0
             ;;
     esac
 
@@ -13610,7 +13863,7 @@ firewall_render_merged_chain() {
                 for (i=1; i<=count; i++) {
                     rule=order[i]
                     scope = (seen4[rule] && seen6[rule]) ? "both" : (seen4[rule] ? "v4" : "v6")
-                    if (compact) {
+                    if (compact && rule !~ /(^|[ \t])(-s|-d|-i|-o|--sport|--comment)([ \t]|$)/) {
                         proto = tok_after(rule, "-p")
                         port  = tok_after(rule, "--dport")
                         tgt   = tok_after(rule, "-j")
