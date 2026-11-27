@@ -808,6 +808,7 @@ reinstall_is_candidate_nic() {
             return 1
             ;;
     esac
+    [[ -e "${sys_net}/${iface}/master" ]] && return 1
     if [[ -r "${sys_net}/${iface}/type" ]]; then
         nic_type=$(cat "${sys_net}/${iface}/type" 2>/dev/null || true)
         [[ "$nic_type" == "1" ]] || return 1
@@ -1597,7 +1598,7 @@ resolve_iface() {
             [ -r "$p" ] || continue
             dev="${p#"${SYS_NET}/"}"
             dev="${dev%/address}"
-            [ "$dev" = "lo" ] && continue
+            [ "$dev" = "lo" ] || [ -e "${SYS_NET}/${dev}/master" ] && continue
             if [ -r "${SYS_NET}/${dev}/type" ]; then
                 ntype=$(cat "${SYS_NET}/${dev}/type" 2>/dev/null || true)
                 [ "$ntype" = "1" ] || continue
@@ -1612,7 +1613,7 @@ resolve_iface() {
     for p in "${SYS_NET}"/*; do
         [ -e "$p" ] || continue
         dev="${p#"${SYS_NET}/"}"
-        [ "$dev" = "lo" ] && continue
+        [ "$dev" = "lo" ] || [ -e "${SYS_NET}/${dev}/master" ] && continue
         if [ -r "${SYS_NET}/${dev}/type" ]; then
             ntype=$(cat "${SYS_NET}/${dev}/type" 2>/dev/null || true)
             [ "$ntype" = "1" ] || continue
@@ -2173,7 +2174,7 @@ resolve_nic() {
             [ -r "\$p" ] || continue
             dev="\${p#/sys/class/net/}"
             dev="\${dev%/address}"
-            [ "\$dev" = "lo" ] && continue
+            [ "\$dev" = "lo" ] || [ -e "/sys/class/net/\${dev}/master" ] && continue
             if [ -r "/sys/class/net/\${dev}/type" ]; then
                 ntype=\$(cat "/sys/class/net/\${dev}/type" 2>/dev/null || true)
                 [ "\$ntype" = "1" ] || continue
@@ -2417,6 +2418,11 @@ reinstall_install_target_system() (
         echo -e "${RED}未检测到目标磁盘。${PLAIN}"
         exit 1
     }
+    if [[ "$(lsblk -ndo TRAN "$target_disk" 2>/dev/null | tr '[:upper:]' '[:lower:]')" == "iscsi" ]]; then
+        echo -e "${RED}检测到目标根磁盘 (${target_disk}) 为 iSCSI 挂载卷（常见于部分 Oracle Cloud 实例）。${PLAIN}"
+        echo -e "${YELLOW}标准 netboot 镜像不支持重装 iSCSI 引导卷，请先在云控制台将引导卷连接类型切换为半虚拟化 (Paravirtualized) 后重试。${PLAIN}"
+        exit 1
+    fi
 
     grub=$(reinstall_get_grub "$boot_root") || {
         echo -e "${RED}未找到 GRUB 配置。${PLAIN}"
