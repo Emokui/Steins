@@ -323,6 +323,16 @@ ssh_status_label() {
     fi
 }
 
+ssh_pubkey_status_label() {
+    if [[ "$1" != "yes" ]]; then
+        echo "${RED}关闭${PLAIN}"
+    elif [[ "${2:-}" == "1" ]] || { [[ -z "${2:-}" ]] && ssh_root_has_authorized_key; }; then
+        echo "${GREEN}开启${PLAIN}"
+    else
+        echo "${YELLOW}开启(无公钥)${PLAIN}"
+    fi
+}
+
 ssh_root_login_label() {
     local permit_root_login="$1"
     case "$permit_root_login" in
@@ -858,10 +868,6 @@ reinstall_find_family_iface() {
             fi
         fi
     done < <(reinstall_get_default_routes "$family" | awk '{for (i = 1; i < NF; i++) if ($i == "dev") print $(i + 1)}')
-    if [[ -n "$fallback_routed" ]]; then
-        printf '%s\n' "$fallback_routed"
-        return 0
-    fi
 
     while IFS= read -r cand; do
         cand="${cand%%@*}"
@@ -878,6 +884,11 @@ reinstall_find_family_iface() {
             fi
         fi
     done < <(ip "$family" -o addr show scope global 2>/dev/null | awk '{print $2}')
+
+    if [[ -n "$fallback_routed" ]]; then
+        printf '%s\n' "$fallback_routed"
+        return 0
+    fi
 
     while IFS= read -r cand; do
         cand="${cand%%@*}"
@@ -1100,7 +1111,7 @@ reinstall_pick_ipv4_line() {
         v4_src=$(ip -4 route get 1.1.1.1 oif "$iface" 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") {print $(i + 1); exit}}')
     fi
 
-    if [[ -n "$v4_src" ]] && reinstall_ipv4_to_uint "$v4_src" >/dev/null 2>&1; then
+    if [[ -n "$v4_src" && ! "$v4_src" =~ ^(0\.|127\.|169\.254\.) ]] && reinstall_ipv4_to_uint "$v4_src" >/dev/null 2>&1; then
         for line in "${addr_lines[@]}"; do
             [[ "$line" =~ (^|[[:space:]])inet[[:space:]]+([^[:space:]]+) ]] || continue
             addr_tok="${BASH_REMATCH[2]}"
@@ -1117,7 +1128,7 @@ reinstall_pick_ipv4_line() {
         addr_tok="${BASH_REMATCH[2]}"
         addr_ip="${addr_tok%%/*}"
         case "$addr_ip" in
-            127.*|169.254.*|'') continue ;;
+            0.*|127.*|169.254.*|'') continue ;;
         esac
         reinstall_ipv4_to_uint "$addr_ip" >/dev/null 2>&1 || continue
         if reinstall_is_public_ipv4 "$addr_ip"; then
@@ -1491,6 +1502,7 @@ cat >> /etc/network/interfaces <<EOF_IPV6
 
 ${auto_header}iface \$iface6 inet6 dhcp
     accept_ra 2
+    pre-up echo 2 > /proc/sys/net/ipv6/conf/\\\$IFACE/accept_ra 2>/dev/null || true
     dns-nameservers ${dns_line}
 EOF_IPV6
 EOF
@@ -1913,6 +1925,9 @@ else
         dev="${p#"${SYS_NET}/"}"
         [ "$dev" = "lo" ] || [ "$dev" = "$iface" ] && continue
         flush_ipv4_iface "$dev"
+    done
+    for k in "${IPV6_CONF_DIR}/all/accept_ra" "${IPV6_CONF_DIR}/default/accept_ra" "${IPV6_CONF_DIR}/${iface}/accept_ra"; do
+        [ -w "$k" ] && echo 2 > "$k" 2>/dev/null || true
     done
     i=0
     while [ $i -lt 8 ]; do
@@ -4502,15 +4517,23 @@ dns_is_valid_ip() {
 
 dns_has_ipv4() {
     command -v ip >/dev/null 2>&1 || return 2
-    local route_out="" first_line="" def_v4=""
+    local route_out="" first_line="" src_ip="" def_v4=""
     route_out=$(ip -4 route get 1.1.1.1 2>/dev/null || true)
     if [[ -n "$route_out" ]]; then
         IFS= read -r first_line <<< "$route_out"
         [[ "$first_line" =~ (^|[[:space:]])(unreachable|prohibit|blackhole|throw|dev[[:space:]]+lo)([[:space:]]|$) ]] && return 1
-        return 0
+        if [[ "$first_line" =~ (^|[[:space:]])src[[:space:]]+([^[:space:]]+) ]]; then
+            src_ip="${BASH_REMATCH[2]}"
+            case "$src_ip" in
+                0.*|127.*|169.254.*) return 1 ;;
+            esac
+            return 0
+        fi
+        ip -4 -o addr show scope global 2>/dev/null | grep -Evq 'inet[[:space:]]+(0\.|127\.|169\.254\.)'
+        return $?
     fi
     def_v4=$(ip -4 route show default 2>/dev/null | grep -Ev '^[[:space:]]*(unreachable|prohibit|blackhole|throw)|(^|[[:space:]])dev[[:space:]]+lo([[:space:]]|$)' || true)
-    [[ -n "$def_v4" ]] && ip -4 -o addr show scope global 2>/dev/null | grep -q .
+    [[ -n "$def_v4" ]] && ip -4 -o addr show scope global 2>/dev/null | grep -Evq 'inet[[:space:]]+(0\.|127\.|169\.254\.)'
 }
 
 dns_has_ipv6() {
@@ -4896,40 +4919,20 @@ dns_apply_static() {
 }
 
 dns_apply_resolved() {
-    local resolv_backup resolved_backup temp_dropin link_target=""
+    local temp_dropin
     [[ $# -gt 0 ]] || return 1
 
     dns_migrate_resolved_config || return 1
-    dns_unlock_resolv_if_needed "$DNS_RESOLV_CONF" || return 1
     mkdir -p "$DNS_RESOLVED_DROPIN_DIR" || return 1
 
     temp_dropin=$(mktemp "$DNS_RESOLVED_DROPIN_DIR/.zz-zero-dns.XXXXXX") || return 1
     chmod 644 "$temp_dropin"
     {
-        printf '# Managed by Zero.sh\n[Resolve]\nDNS=%s\nFallbackDNS=\n' "$*"
+        printf '# Managed by Zero.sh\n[Resolve]\nDNS=%s\nFallbackDNS=\nDomains=~.\n' "$*"
     } > "$temp_dropin" && mv -f "$temp_dropin" "$DNS_RESOLVED_DROPIN_FILE" || {
         rm -f "$temp_dropin"
         return 1
     }
-
-    resolv_backup=$(dns_resolv_backup_path)
-    resolved_backup=$(dns_resolved_resolv_backup_path)
-    if [[ -e "$DNS_RESOLVED_STUB" ]]; then
-        link_target=$(readlink "$DNS_RESOLV_CONF" 2>/dev/null || true)
-        if [[ "$link_target" != *"systemd/resolve/stub-resolv.conf" && "$link_target" != *"systemd/resolve/resolv.conf" ]]; then
-            if [[ ! -L "$resolved_backup" && ! -f "$resolved_backup" ]]; then
-                if [[ -L "$resolv_backup" || -f "$resolv_backup" ]]; then
-                    mv -f "$resolv_backup" "$resolved_backup" || return 1
-                elif [[ -L "$DNS_RESOLV_CONF" || -f "$DNS_RESOLV_CONF" ]]; then
-                    dns_copy_preserve "$DNS_RESOLV_CONF" "$resolved_backup" || return 1
-                fi
-            fi
-            ln -sfn "$DNS_RESOLVED_STUB" "$DNS_RESOLV_CONF" || return 1
-        fi
-    fi
-
-    dns_unsync_dhclient || true
-    dns_unsync_dhcpcd || true
 
     if ! systemctl restart systemd-resolved 2>/dev/null || ! dns_systemd_resolved_active; then
         echo -e "${RED}systemd-resolved 重启失败${PLAIN}" >&2
@@ -4960,15 +4963,15 @@ dns_apply() {
         return 1
     fi
 
-    if ! dns_systemd_resolved_active && (( ${#ok[@]} > 3 )); then
-        echo -e "${YELLOW}提示: 当前为静态 resolv.conf 模式，glibc 最多使用前 3 个 DNS (MAXNS=3)${PLAIN}"
+    if (( ${#ok[@]} > 3 )); then
+        echo -e "${YELLOW}提示: glibc 静态解析最多使用前 3 个 DNS (MAXNS=3)${PLAIN}"
     fi
 
+    dns_apply_static "${ok[@]}" || return 1
     if dns_systemd_resolved_active; then
-        dns_apply_resolved "${ok[@]}"
-    else
-        dns_apply_static "${ok[@]}"
+        dns_apply_resolved "${ok[@]}" || return 1
     fi
+    return 0
 }
 
 dns_restore() {
@@ -5224,13 +5227,8 @@ dns_apply_public() {
             dns_apply_with_feedback "2001:4860:4860::8888" "2606:4700:4700::1111"
             ;;
         dual)
-            if dns_systemd_resolved_active; then
-                echo -e "${BLUE}检测到双栈网络 (systemd-resolved)，选用双栈公共 DNS${PLAIN}"
-                dns_apply_with_feedback "8.8.8.8" "1.1.1.1" "2001:4860:4860::8888" "2606:4700:4700::1111"
-            else
-                echo -e "${BLUE}检测到双栈网络，选用双栈公共 DNS: ${GREEN}8.8.8.8 / 1.1.1.1 / 2001:4860:4860::8888${PLAIN}"
-                dns_apply_with_feedback "8.8.8.8" "1.1.1.1" "2001:4860:4860::8888"
-            fi
+            echo -e "${BLUE}检测到双栈网络，选用双栈公共 DNS: ${GREEN}8.8.8.8 / 1.1.1.1 / 2001:4860:4860::8888${PLAIN}"
+            dns_apply_with_feedback "8.8.8.8" "1.1.1.1" "2001:4860:4860::8888"
             ;;
         *)
             dns_apply_with_feedback "8.8.8.8" "1.1.1.1"
@@ -5391,7 +5389,7 @@ ssh_config_menu() {
 
         root_login_text=$(ssh_root_login_label "$permit_root_login")
         password_login_text=$(ssh_status_label "$pass_auth")
-        pubkey_login_text=$(ssh_status_label "$pubkey_auth")
+        pubkey_login_text=$(ssh_pubkey_status_label "$pubkey_auth")
 
         ssh_show_config_menu "$current_port" "$root_login_text" "$password_login_text" "$pubkey_login_text"
         ssh_choice=$(read_menu_choice "请输入选项 [0-4]: ") || return 1
@@ -5477,12 +5475,25 @@ enable_or_change_root_password() {
 }
 
 ssh_root_has_authorized_key() {
-    local f
-    for f in "$ROOT_HOME/.ssh/authorized_keys" "$ROOT_HOME/.ssh/authorized_keys2"; do
-        [[ -r "$f" ]] || continue
-        grep -Eq '^[[:space:]]*[^#[:space:]]' "$f" 2>/dev/null && return 0
+    local tok extra=""
+    if command -v sshd >/dev/null 2>&1; then
+        extra=$(sshd -T -f "$SSHD_CONFIG" 2>/dev/null | awk 'tolower($1) == "authorizedkeysfile" { $1 = ""; print; exit }')
+    fi
+    for tok in $extra "$ROOT_HOME/.ssh/authorized_keys" "$ROOT_HOME/.ssh/authorized_keys2"; do
+        [[ -n "$tok" && "$tok" != "none" ]] || continue
+        tok="${tok//%%/__ZERO_PCT__}"
+        tok="${tok//%h/$ROOT_HOME}"
+        tok="${tok//%u/root}"
+        tok="${tok//__ZERO_PCT__/%}"
+        [[ "$tok" == /* ]] || tok="$ROOT_HOME/$tok"
+        [[ -r "$tok" ]] && grep -Eq '^[[:space:]]*[^#[:space:]]' "$tok" 2>/dev/null && return 0
     done
     return 1
+}
+
+ssh_root_has_password() {
+    [[ -r /etc/shadow ]] || return 0
+    awk -F: '$1 == "root" { found = 1; ok = ($2 != "" && $2 !~ /^[!*]/); exit } END { exit(found ? !ok : 0) }' /etc/shadow 2>/dev/null
 }
 
 enable_root_key_login() {
@@ -5565,86 +5576,88 @@ enable_root_key_login() {
 }
 
 disable_ssh_login_menu() {
-    clear
-    local has_password=0
-    local has_pubkey=0
-    local has_auth_key=0
-    local pass_auth pubkey_auth permit_root_login disable_choice
-    local password_login_text pubkey_login_text
+    local has_password has_pubkey has_auth_key has_root_pw
+    local pass_auth pubkey_auth permit_root_login choice
+    local password_login_text pubkey_login_text pass_action key_action
     local -a ssh_status
 
-    mapfile -t ssh_status < <(ssh_read_status)
-    permit_root_login="${ssh_status[1]}"
-    pass_auth="${ssh_status[2]}"
-    pubkey_auth="${ssh_status[3]}"
+    while true; do
+        clear
+        has_password=0; has_pubkey=0; has_auth_key=0; has_root_pw=0
+        mapfile -t ssh_status < <(ssh_read_status)
+        permit_root_login="${ssh_status[1]}"
+        pass_auth="${ssh_status[2]}"
+        pubkey_auth="${ssh_status[3]}"
 
-    ssh_root_has_authorized_key && has_auth_key=1
-    [[ "$permit_root_login" == "yes" && "$pass_auth" == "yes" ]] && has_password=1
-    [[ "$permit_root_login" =~ ^(yes|prohibit-password|without-password)$ && "$pubkey_auth" == "yes" && $has_auth_key -eq 1 ]] && has_pubkey=1
+        ssh_root_has_authorized_key && has_auth_key=1
+        ssh_root_has_password && has_root_pw=1
+        [[ "$permit_root_login" == "yes" && "$pass_auth" == "yes" && $has_root_pw -eq 1 ]] && has_password=1
+        [[ "$permit_root_login" =~ ^(yes|prohibit-password|without-password)$ && "$pubkey_auth" == "yes" && $has_auth_key -eq 1 ]] && has_pubkey=1
 
-    password_login_text=$(ssh_status_label "$pass_auth")
-    pubkey_login_text=$(ssh_status_label "$pubkey_auth")
+        password_login_text=$(ssh_status_label "$pass_auth")
+        pubkey_login_text=$(ssh_pubkey_status_label "$pubkey_auth" "$has_auth_key")
+        [[ "$pass_auth" == "yes" ]] && pass_action="${RED}关闭密码登录${PLAIN}" || pass_action="${GREEN}开启密码登录${PLAIN}"
+        [[ "$pubkey_auth" == "yes" ]] && key_action="${RED}关闭密钥登录${PLAIN}" || key_action="${GREEN}开启密钥登录${PLAIN}"
 
-    local enabled_count=$((has_password + has_pubkey))
-
-    echo -e "${BLUE}==== 登录方式 ====${PLAIN}"
-    echo -e "${BLUE}密码 ${password_login_text} | 密钥 ${pubkey_login_text}"
-    echo
-
-    if [[ $enabled_count -le 1 ]]; then
+        echo -e "${BLUE}==== 登录方式 ====${PLAIN}"
+        echo -e "${BLUE}密码 ${password_login_text} | 密钥 ${pubkey_login_text}"
         if [[ "$pubkey_auth" == "yes" && $has_auth_key -eq 0 ]]; then
             echo -e "${YELLOW}提示: 未检测到已写入的公钥 (${ROOT_HOME}/.ssh/authorized_keys 为空)${PLAIN}"
         fi
-        echo -e "${RED}当前仅剩一种可用登录方式,禁止关闭全部登录方式${PLAIN}"
-        press_any_key_to_continue
-        return
-    fi
-
-    echo -e "${GREEN}1.关闭密码登录${PLAIN}"
-    echo -e "${GREEN}2.关闭密钥登录${PLAIN}"
-    echo -e "${YELLOW}0.返回上级${PLAIN}"
-    disable_choice=$(read_menu_choice "请输入选项 [0-2]: ") || return 1
-    case "$disable_choice" in
-        1)
-            if [[ "$pass_auth" == "yes" ]]; then
-                if [[ $has_pubkey -ne 1 ]]; then
-                    echo -e "${RED}关闭密码登录后将没有可用的 root 密钥登录方式,已取消${PLAIN}"
-                    press_any_key_to_continue
-                    return
+        echo
+        echo -e "${GREEN}1.${PLAIN}${pass_action}"
+        echo -e "${GREEN}2.${PLAIN}${key_action}"
+        echo -e "${YELLOW}0.返回上级${PLAIN}"
+        choice=$(read_menu_choice "请输入选项 [0-2]: ") || return 1
+        case "$choice" in
+            1)
+                if [[ "$pass_auth" == "yes" ]]; then
+                    if (( has_pubkey != 1 )); then
+                        echo -e "${RED}未检测到可用的 root 密钥登录(需开启密钥且已写入公钥),禁止关闭密码登录${PLAIN}"
+                        press_any_key_to_continue
+                        continue
+                    fi
+                    update_sshd_option "PasswordAuthentication" "no" || return 1
+                    restart_sshd_safe && echo -e "${GREEN}[✓]密码登录已关闭${PLAIN}"
+                else
+                    if (( has_root_pw != 1 )); then
+                        echo -e "${YELLOW}检测到 root 尚未设置密码,请先通过「1.设置密码」设置密码${PLAIN}"
+                        press_any_key_to_continue
+                        continue
+                    fi
+                    update_sshd_option "PermitRootLogin" "yes" || return 1
+                    update_sshd_option "PasswordAuthentication" "yes" || return 1
+                    restart_sshd_safe && echo -e "${GREEN}[✓]密码登录已开启${PLAIN}"
                 fi
-                update_sshd_option "PasswordAuthentication" "no" || return 1
-                if restart_sshd_safe; then
-                    echo -e "${GREEN}[✓]密码登录已关闭${PLAIN}"
+                press_any_key_to_continue
+                ;;
+            2)
+                if [[ "$pubkey_auth" == "yes" ]]; then
+                    if (( has_password != 1 )); then
+                        echo -e "${RED}未检测到可用的 root 密码登录,禁止关闭密钥登录${PLAIN}"
+                        press_any_key_to_continue
+                        continue
+                    fi
+                    update_sshd_option "PubkeyAuthentication" "no" || return 1
+                    restart_sshd_safe && echo -e "${GREEN}[✓]密钥登录已关闭${PLAIN}"
+                else
+                    [[ "$permit_root_login" == "no" ]] && { update_sshd_option "PermitRootLogin" "prohibit-password" || return 1; }
+                    update_sshd_option "PubkeyAuthentication" "yes" || return 1
+                    if restart_sshd_safe; then
+                        echo -e "${GREEN}[✓]密钥登录已开启${PLAIN}"
+                        (( has_auth_key == 0 )) && echo -e "${YELLOW}提示: 当前尚未写入公钥,可通过「2.设置密钥」生成或手动写入 authorized_keys${PLAIN}"
+                    fi
                 fi
-            else
-                echo -e "${YELLOW}密码登录本就已关闭,无需操作${PLAIN}"
-            fi
-            press_any_key_to_continue
-            ;;
-        2)
-            if [[ "$pubkey_auth" == "yes" ]]; then
-                if [[ $has_password -ne 1 ]]; then
-                    echo -e "${RED}关闭密钥登录后将没有可确认的 root 登录方式,已取消${PLAIN}"
-                    press_any_key_to_continue
-                    return
-                fi
-                update_sshd_option "PubkeyAuthentication" "no" || return 1
-                if restart_sshd_safe; then
-                    echo -e "${GREEN}[✓]密钥登录已关闭${PLAIN}"
-                fi
-            else
-                echo -e "${YELLOW}密钥登录本就已关闭,无需操作${PLAIN}"
-            fi
-            press_any_key_to_continue
-            ;;
-        0)
-            return
-            ;;
-        *)
-            echo -e "${RED}无效选项${PLAIN}"
-            press_any_key_to_continue
-            ;;
-    esac
+                press_any_key_to_continue
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                show_invalid_option "无效选项" "0.4"
+                ;;
+        esac
+    done
 }
 
 reboot_vps() {
@@ -11053,8 +11066,8 @@ warpstack_show_network_status() {
         net_mode="v6_only"
     elif $has_v4; then
         net_mode="v4_only"
-    elif ip -4 addr show scope global 2>/dev/null | grep -q inet ||
-         ip -6 addr show scope global 2>/dev/null | grep -q inet6; then
+    elif ip -4 -o addr show scope global 2>/dev/null | grep -Evq 'inet[[:space:]]+(0\.|127\.|169\.254\.)' ||
+         ip -6 -o addr show scope global 2>/dev/null | grep -q inet6; then
         net_mode="uncertain"
     fi
     case "$net_mode" in
@@ -12074,7 +12087,7 @@ validate_settings() {
 detect_endpoint() {
     local address url try_v4=1 try_v6=1
     if command -v ip >/dev/null 2>&1; then
-        ip -4 route get 1.1.1.1 2>/dev/null | grep -Evq 'unreachable|prohibit|blackhole|throw|dev lo' || try_v4=0
+        ip -4 route get 1.1.1.1 2>/dev/null | grep -Evq 'unreachable|prohibit|blackhole|throw|dev lo|src (0\.|127\.|169\.254\.)' || try_v4=0
         ip -6 route get 2001:4860:4860::8888 2>/dev/null | grep -Evq 'unreachable|prohibit|blackhole|throw|dev lo' || try_v6=0
     fi
     if (( try_v4 )); then
